@@ -3,6 +3,7 @@ import os
 import json
 import html
 import logging
+import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
@@ -193,10 +194,12 @@ class FirebaseClient:
             logger.error(f"Error updating sheet {sheet_name}: {e}")
             return False
 
-    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str, report_id: str) -> bool:
+    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str, report_id: str, quantity: int = 1) -> bool:
         """Optimistic Firestore concurrency control for a single credit."""
         if sheet_name not in ("fractionrp", "praise"):
             raise ValueError("Unknown sheet")
+        if not isinstance(quantity, int) or not 1 <= quantity <= 20:
+            raise ValueError("Quantity must be between 1 and 20")
         token = await self.get_token()
         if not token:
             raise RuntimeError("Firebase authentication unavailable")
@@ -219,13 +222,13 @@ class FirebaseClient:
                 existing = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
                 proof = {"text": reason, "links": [{"text": reason, "url": proof_url}]}
                 if existing:
-                    existing["qty"] = int(existing.get("qty") or 0) + 1
+                    existing["qty"] = int(existing.get("qty") or 0) + quantity
                     existing["status"] = "На выдаче"
                     existing["proof"] = proof
                 else:
                     rows.append({"id": str(int(datetime.now().timestamp() * 1000000)),
                                  "fullName": f"{nick} ({rank})", "nick": nick,
-                                 "rank": rank, "status": "На выдаче", "qty": 1, "proof": proof})
+                                 "rank": rank, "status": "На выдаче", "qty": quantity, "proof": proof})
                 payload = {"fields": {"rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
                                       "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()},
                                       "appliedReportIds": {"arrayValue": {"values": [{"stringValue": report} for report in [*applied_ids, report_id]]}}}}
@@ -237,6 +240,50 @@ class FirebaseClient:
                         raise RuntimeError(f"Firestore write failed: {response.status}")
             await asyncio.sleep(0.1 * (attempt + 1))
         raise RuntimeError("Concurrent modifications: retry limit reached")
+
+    async def debit_one(self, sheet_name: str, nick: str) -> int:
+        """Consume one point with an updateTime precondition; return remaining points."""
+        if sheet_name not in ("fractionrp", "praise"):
+            raise ValueError("Unknown sheet")
+        token = await self.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/sheets/{sheet_name}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        for attempt in range(5):
+            async with ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Firestore read failed: {response.status}")
+                    data = await response.json()
+                    revision = data.get("updateTime")
+                    if not revision:
+                        raise RuntimeError("Firestore version missing")
+                    rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                item = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
+                if not item:
+                    raise ValueError("Player not found")
+                remaining = int(item.get("qty") or 0)
+                if remaining <= 0:
+                    return 0
+                remaining -= 1
+                item["qty"] = remaining
+                if remaining == 0:
+                    item["status"] = "Выдано"
+                payload = {"fields": {
+                    "rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
+                    "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}
+                }}
+                # Keep appliedReportIds and any other metadata untouched.
+                params = [("currentDocument.updateTime", revision),
+                          ("updateMask.fieldPaths", "rows"), ("updateMask.fieldPaths", "updatedAt")]
+                async with session.patch(url, headers=headers, params=params, json=payload) as response:
+                    if response.status == 200:
+                        return remaining
+                    if response.status not in (409, 412):
+                        raise RuntimeError(f"Firestore write failed: {response.status}")
+            await asyncio.sleep(0.1 * (attempt + 1))
+        raise RuntimeError("Concurrent changes, try again")
 
     def _parse_firestore_rows(self, values: list) -> List[Dict[str, Any]]:
         rows = []
