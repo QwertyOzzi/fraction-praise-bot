@@ -1,0 +1,16 @@
+name: Render 24/7 Keep Alive
+
+on:
+  schedule:
+    # Запуск каждые 10 минут
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep_alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Service
+        run: |
+          echo "Pinging FractionRp Render Service..."
+          curl -f -s https://fraction-praise-bot-1.onrender.com/health || echo "Ping attempted"
