@@ -42,6 +42,10 @@ class Callback:
         self.answers.append(text)
 
 
+async def get_current_chat(uid):
+    return types.SimpleNamespace(username="Known_User" if uid == 101 else "")
+
+
 def load_functions(names, other=None):
     nodes = []
     for node in TREE.body:
@@ -57,6 +61,7 @@ def load_functions(names, other=None):
         "OWNER_TELEGRAM_IDS": {6060562962},
         "users_db": {"101": {"nick": "Test_User", "rank": "9", "telegram_username": "Known_User"}},
         "pending_admin_requests": {}, "admins_db": [],
+        "bot": types.SimpleNamespace(get_chat=lambda uid: get_current_chat(uid)),
     }
     if other:
         env.update(other)
