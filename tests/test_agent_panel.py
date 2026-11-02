@@ -124,6 +124,52 @@ class TestBulkGrantParser(unittest.TestCase):
                 self.parse(f"frp user1,user2 {amount}")
 
 
+class TestBulkGrantExecution(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.db = FakeFirebase()
+        self.env = load_functions({"parse_grant_args", "perform_manual_grant"}, {
+            "firebase_client": self.db, "users_db": {"123": {"nick": "Nick_One", "rank": "7"}}
+        })
+
+    async def test_grant_three_players(self):
+        msg = Message()
+        await self.env["perform_manual_grant"](msg, "frp Nick_One,Nick_Two,Nick_Three 2")
+        self.assertEqual(len(self.db.credits), 3)
+        self.assertEqual([call[0][1] for call in self.db.credits],
+                         ["Nick_One", "Nick_Two", "Nick_Three"])
+        self.assertEqual([call[0][2] for call in self.db.credits], ["7", "8", "8"])
+        self.assertTrue(all(call[1]["quantity"] == 2 for call in self.db.credits))
+        self.assertIn("Nick_Three", msg.answers[-1])
+
+    async def test_invalid_list_does_not_partially_grant(self):
+        msg = Message()
+        await self.env["perform_manual_grant"](msg, "praise Nick_One,Nick_One 2")
+        self.assertEqual(len(self.db.credits), 0)
+
+    async def test_non_admin_cannot_grant(self):
+        msg = Message(uid=3333)
+        await self.env["perform_manual_grant"](msg, "frp Nick_One,Nick_Two 2")
+        self.assertEqual(len(self.db.credits), 0)
+
+
+class TestAgentDirectory(unittest.IsolatedAsyncioTestCase):
+    async def test_include_registered_and_sheet_agents(self):
+        class Firebase:
+            async def get_sheet(self, sheet):
+                if sheet == "fractionrp":
+                    return [{"nick": "Nick_One", "qty": 2, "status": "На выдаче"}]
+                return [{"nick": "Nick_Two", "qty": 3, "status": "На выдаче"}]
+        env = load_functions({"fetch_agent_directory"}, {
+            "firebase_client": Firebase(),
+            "users_db": {"123": {"nick": "Nick_One", "rank": "7"},
+                         "456": {"nick": "Nick_Three", "rank": "5"}}
+        })
+        rows = await env["fetch_agent_directory"]()
+        self.assertEqual([r["nick"] for r in rows], ["Nick_One", "Nick_Three", "Nick_Two"])
+        self.assertEqual(rows[0]["frp"], 2)
+        self.assertEqual(rows[2]["praise"], 3)
+
+
 class TestAgentRendering(unittest.TestCase):
     def setUp(self):
         env = load_functions({"agent_hash", "agent_list_markup", "agent_detail_markup"})
