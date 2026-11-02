@@ -39,6 +39,24 @@ class BotSecurityChecks(unittest.TestCase):
         self.assertIn('"appliedReportIds"', SOURCE)
         self.assertIn('req["proof"], req_id', SOURCE)
 
+    def test_report_quantities_and_pins(self):
+        self.assertIn("waiting_for_quantity = State()", SOURCE)
+        self.assertIn("quantity=int(req.get(", SOURCE)
+        self.assertIn("pin_chat_message", SOURCE)
+        self.assertIn("unpin_chat_message", SOURCE)
+        self.assertIn("async def adjust_report_quantity(", SOURCE)
+
+    def test_manual_grants_are_restricted(self):
+        section = SOURCE.split("async def perform_manual_grant(", 1)[1].split("@dp.message(Command", 1)[0]
+        self.assertIn("if not is_admin(", section)
+        self.assertIn("firebase_client.credit_report(", section)
+
+    def test_issue_queue_reloads_after_debit(self):
+        section = SOURCE.split("async def process_issue_one(", 1)[1].split("# ╔", 1)[0]
+        self.assertIn('firebase_client.debit_one("fractionrp", nick)', section)
+        self.assertIn("render_queue(rows)", section)
+        self.assertIn("callback.message.edit_text", section)
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 
