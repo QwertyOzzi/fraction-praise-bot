@@ -29,7 +29,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-RELEASE_TAG = "quantity-frp-praise-v2"
+RELEASE_TAG = "bulk-grants-agent-panel-v3"
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
@@ -601,7 +601,7 @@ async def cmd_version(message: types.Message):
     commit = os.getenv("RENDER_GIT_COMMIT", "").strip()
     version_text = f"Версия бота: {RELEASE_TAG}"
     if commit:
-        version_text += f"\\nRender commit: {commit[:12]}"
+        version_text += f"\nRender commit: {commit[:12]}"
     await message.answer(version_text)
 
 
