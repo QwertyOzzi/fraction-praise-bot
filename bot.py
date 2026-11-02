@@ -193,6 +193,46 @@ class FirebaseClient:
             logger.error(f"Error updating sheet {sheet_name}: {e}")
             return False
 
+    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str) -> bool:
+        """Optimistic Firestore concurrency control for a single credit."""
+        if sheet_name not in ("fractionrp", "praise"):
+            raise ValueError("Unknown sheet")
+        token = await self.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/sheets/{sheet_name}"
+        headers = {"Authorization": f"Bearer {token}"}
+        for attempt in range(5):
+            async with ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Firestore read failed: {response.status}")
+                    data = await response.json()
+                    revision = data.get("updateTime")
+                    if not revision:
+                        raise RuntimeError("Firestore version missing")
+                    rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                existing = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
+                proof = {"text": reason, "links": [{"text": reason, "url": proof_url}]}
+                if existing:
+                    existing["qty"] = int(existing.get("qty") or 0) + 1
+                    existing["status"] = "На выдаче"
+                    existing["proof"] = proof
+                else:
+                    rows.append({"id": str(int(datetime.now().timestamp() * 1000000)),
+                                 "fullName": f"{nick} ({rank})", "nick": nick,
+                                 "rank": rank, "status": "На выдаче", "qty": 1, "proof": proof})
+                payload = {"fields": {"rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
+                                      "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}}}
+                async with session.patch(url, headers={**headers, "Content-Type": "application/json"},
+                                         params={"currentDocument.updateTime": revision}, json=payload) as response:
+                    if response.status == 200:
+                        return True
+                    if response.status not in (409, 412):
+                        raise RuntimeError(f"Firestore write failed: {response.status}")
+            await asyncio.sleep(0.1 * (attempt + 1))
+        raise RuntimeError("Concurrent modifications: retry limit reached")
+
     def _parse_firestore_rows(self, values: list) -> List[Dict[str, Any]]:
         rows = []
         for v in values:
@@ -811,38 +851,10 @@ async def approve_report(callback: types.CallbackQuery):
         await callback.answer("Заявка уже была обработана ранее!", show_alert=True)
         return
 
-    # Обновляем таблицу в Firestore
-    sheet_name = req["rep_type"]
-    nick = req["nick"]
-    rank = req.get("rank", "8")
-    proof_url = req["proof"]
-
     try:
-        rows = await firebase_client.get_sheet(sheet_name)
-        existing = next((r for r in rows if r.get("nick", "").lower() == nick.lower()), None)
-
-        if existing:
-            existing["qty"] = (existing.get("qty") or 0) + 1
-            existing["status"] = "На выдаче"
-            existing["proof"] = {
-                "text": req["reason"],
-                "links": [{"text": req["reason"], "url": proof_url}]
-            }
-        else:
-            rows.append({
-                "id": str(int(datetime.now().timestamp())),
-                "fullName": f"{nick} ({rank})",
-                "nick": nick,
-                "rank": rank,
-                "status": "На выдаче",
-                "qty": 1,
-                "proof": {
-                    "text": req["reason"],
-                    "links": [{"text": req["reason"], "url": proof_url}]
-                }
-            })
-
-        success = await firebase_client.update_sheet(sheet_name, rows)
+        success = await firebase_client.credit_report(
+            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"]
+        )
         if success:
             req["status"] = "approved"
             req["approved_by"] = callback.from_user.full_name
