@@ -1234,75 +1234,61 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await message.answer("Действие отменено.", reply_markup=get_main_menu(message.from_user.id))
 
 # Очередь на выдачу
+def render_queue(rows: List[Dict[str, Any]]):
+    pending = [r for r in rows if int(r.get("qty") or 0) > 0]
+    if not pending:
+        return "🎉 Очередь пуста! Все FRP выданы.", None
+
+    text = f"📋 <b>Очередь на выдачу (/fractionrp) — {len(pending)} чел.:</b>\n\n"
+    buttons = []
+    for i, r in enumerate(pending[:15], 1):
+        nick = str(r.get("nick", "Noname"))
+        qty = int(r.get("qty") or 0)
+        rank = str(r.get("rank", ""))
+        rank_text = f" [{rank}]" if rank else ""
+        text += (f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_text)} — <b>{qty} шт.</b>\n"
+                 f"Команда: <code>/fractionrp {html.escape(nick)}</code>\n\n")
+        buttons.append([InlineKeyboardButton(text=f"✓ Выдать 1 для {nick}", callback_data=f"issue_1_{nick}")])
+    if len(pending) > 15:
+        text += f"…Ещё {len(pending) - 15} игроков.\n"
+    text += "<i>Список обновляется после каждого списания.</i>"
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
 @dp.message(Command("queue"))
 async def cmd_queue(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("Доступно только руководству.")
         return
-
-    await message.answer("🔄 Загружаю очередь из таблицы...")
     try:
         rows = await firebase_client.get_sheet("fractionrp")
+        text, keyboard = render_queue(rows)
+        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Error fetching queue: {e}")
-        rows = []
+        logger.error(f"Could not load issue queue: {e}")
+        await message.answer("⚠️ Не удалось загрузить очередь из Firebase.")
 
-    pending = [r for r in rows if r.get("status") == "На выдаче" or (r.get("qty") or 0) > 0]
 
-    if not pending:
-        await message.answer("🎉 Очередь пуста! Нет игроков со статусом «На выдаче».")
-        return
-
-    text = f"📋 <b>Очередь на выдачу (/fractionrp) — {len(pending)} чел.:</b>\n\n"
-    keyboard_buttons = []
-
-    for i, r in enumerate(pending[:15], 1):
-        nick = r.get("nick", "Noname")
-        qty = r.get("qty", 0)
-        rank = r.get("rank", "")
-        rank_str = f" [{rank}]" if rank else ""
-        cmd = f"/fractionrp {nick}"
-        text += f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_str)} — <b>{qty} шт.</b>\nКоманда: <code>{cmd}</code>\n\n"
-
-        keyboard_buttons.append([
-            InlineKeyboardButton(text=f"✓ Выдать 1 для {nick}", callback_data=f"issue_1_{nick}")
-        ])
-
-    text += "<i>(Кликните по команде выше, чтобы скопировать её в игре)</i>"
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
-# Быстрое списание 1 балла админом прямо из Telegram
 @dp.callback_query(F.data.startswith("issue_1_"))
 async def process_issue_one(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("У вас нет прав!", show_alert=True)
         return
-
-    nick = callback.data.replace("issue_1_", "")
+    nick = callback.data[len("issue_1_"):]
     try:
+        remaining = await firebase_client.debit_one("fractionrp", nick)
+        await callback.answer(
+            f"✓ {nick}: осталось {remaining}" if remaining else f"{nick}: баллы закончились",
+            show_alert=False
+        )
+        # Refresh original message; zero-quantity rows disappear completely.
         rows = await firebase_client.get_sheet("fractionrp")
-        item = next((r for r in rows if r.get("nick", "").lower() == nick.lower()), None)
-
-        if not item:
-            await callback.answer("Игрок не найден в таблице!", show_alert=True)
-            return
-
-        cur_qty = item.get("qty", 0)
-        new_qty = max(0, cur_qty - 1)
-        item["qty"] = new_qty
-        if new_qty == 0:
-            item["status"] = "Выдано"
-
-        success = await firebase_client.update_sheet("fractionrp", rows)
-        if success:
-            await callback.answer(f"✓ Списан 1 балл у {nick}! Осталось: {new_qty}", show_alert=True)
-        else:
-            await callback.answer("⚠️ Ошибка сохранения в Firebase!", show_alert=True)
+        new_text, new_keyboard = render_queue(rows)
+        await callback.message.edit_text(new_text, reply_markup=new_keyboard, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error issuing point: {e}")
-        await callback.answer(f"⚠️ Ошибка: {e}", show_alert=True)
+        await callback.answer("⚠️ Списание не подтверждено. Обновите /queue.", show_alert=True)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  СЛУЖБА ПОДДЕРЖКИ И БАГ-ТРЕКЕР В БОТЕ                            ║
