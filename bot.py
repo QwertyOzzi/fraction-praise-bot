@@ -1043,27 +1043,42 @@ async def approve_report(callback: types.CallbackQuery):
         await callback.answer("Заявка уже была обработана ранее!", show_alert=True)
         return
 
+    quantity = int(req.get("quantity", 1))
+    # Lock this request before the first network await so other callbacks cannot
+    # approve/reject or change quantity while the credit is being applied.
+    req["status"] = "processing"
     try:
         success = await firebase_client.credit_report(
-            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"], req_id,
-            quantity=int(req.get("quantity", 1))
+            req["rep_type"], req["nick"], req.get("rank", "8"),
+            req["reason"], req["proof"], req_id, quantity=quantity
         )
-        if success:
-            req["status"] = "approved"
-            req["approved_by"] = callback.from_user.full_name
-            save_json(REQUESTS_FILE, requests_db)
-            notify_state_changed()
-            await callback.answer("✅ База данных обновлена!", show_alert=False)
-            await close_pending_report_messages(req_id, req, f"✅ ОДОБРЕНО: +{req.get('quantity', 1)} ({callback.from_user.full_name})")
-            try:
-                await bot.send_message(int(req["user_id"]), f"✅ Отчет #{req_id} одобрен. Начислено +{req.get('quantity', 1)} балл(ов).")
-            except Exception as exc:
-                logger.warning(f"Could not notify reporter: {exc}")
-        else:
-            await callback.answer("⚠️ Firebase не обновился. Заявка остаётся ожидающей.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error updating sheet on approve: {e}")
-        await callback.answer(f"⚠️ Ошибка базы данных: {e}", show_alert=True)
+    except Exception as exc:
+        req["status"] = "pending"
+        logger.error(f"Error updating sheet on approve: {exc}")
+        await callback.answer("⚠️ Нет подтверждения Firebase; проверьте таблицу и повторите.", show_alert=True)
+        return
+    if not success:
+        req["status"] = "pending"
+        await callback.answer("⚠️ Firebase не обновился. Заявка остаётся ожидающей.", show_alert=True)
+        return
+
+    req["status"] = "approved"
+    req["approved_by"] = callback.from_user.full_name
+    save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
+    try:
+        await callback.answer("✅ База данных обновлена!", show_alert=False)
+    except Exception as exc:
+        logger.info(f"Could not answer approval callback: {exc}")
+    await close_pending_report_messages(
+        req_id, req, f"✅ ОДОБРЕНО: +{quantity} ({callback.from_user.full_name})"
+    )
+    try:
+        await bot.send_message(int(req["user_id"]),
+                               f"✅ Отчет #{req_id} одобрен. Начислено +{quantity} балл(ов).")
+    except Exception as exc:
+        logger.warning(f"Could not notify reporter: {exc}")
+
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_report(callback: types.CallbackQuery):
