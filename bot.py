@@ -252,6 +252,15 @@ class ReportStates(StatesGroup):
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  KEYBOARDS                                                       ║
 # ╚══════════════════════════════════════════════════════════════════╝
+MENU_BUTTONS = [
+    "📝 Подать отчет на FRP / Похвалу",
+    "📊 Мой статус",
+    "🌐 Открыть таблицу",
+    "⚙️ Мой никнейм",
+    "📋 Очередь на выдачу (Админ)",
+    "👥 Список админов"
+]
+
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     is_admin = user_id in admins_db
     buttons = [
@@ -296,22 +305,46 @@ async def cmd_start(message: types.Message, state: FSMContext):
 # Регистрация ника
 @dp.message(RegistrationStates.waiting_for_nick)
 async def process_nick(message: types.Message, state: FSMContext):
-    if message.text.startswith("/"):
+    text = (message.text or "").strip()
+
+    # 1. Если нажали кнопку меню или команду - сбрасываем состояние и выполняем нужную команду!
+    if text.startswith("/") or text in MENU_BUTTONS or any(text.startswith(b[:2]) for b in MENU_BUTTONS):
         await state.clear()
-        if message.text.startswith("/admin"):
+        if text.startswith("/admin"):
             await cmd_admin_auth(message, state)
-            return
-        elif message.text.startswith("/start"):
+        elif text.startswith("/start"):
             await cmd_start(message, state)
-            return
+        elif text.startswith("/setpass"):
+            await cmd_set_firebase_pass(message)
+        elif text == "📊 Мой статус":
+            await cmd_my_status(message)
+        elif text == "📝 Подать отчет на FRP / Похвалу":
+            await start_report(message, state)
+        elif text == "📋 Очередь на выдачу (Админ)":
+            await cmd_queue(message)
+        elif text == "👥 Список админов":
+            await cmd_list_admins(message)
+        elif text == "⚙️ Мой никнейм":
+            await cmd_change_nick(message, state)
         return
 
-    nick = message.text.strip().replace(" ", "_")
-    if len(nick) < 3 or "_" not in nick:
-        await message.answer("⚠️ Введите корректный ник в формате `Имя_Фамилия` (например, `Samuel_Norton`):", parse_mode="Markdown")
+    # 2. Строгая проверка формата ника SA-MP (Имя_Фамилия)
+    clean_nick = text.replace(" ", "_")
+    invalid_chars = set("()[]{}<>!@#$%^&*+=?.,/'\"|:;0123456789")
+    # Проверяем, что нет спецсимволов/цифр/эмодзи и есть одно подчеркивание
+    has_bad_chars = any(c in invalid_chars for c in clean_nick)
+    is_emoji = any(ord(c) > 127 and ord(c) not in range(1040, 1104) for c in clean_nick)
+
+    if "_" not in clean_nick or len(clean_nick) < 4 or has_bad_chars or is_emoji:
+        await message.answer(
+            "⚠️ **Некорректный игровой никнейм!**\n\n"
+            "Игровой ник должен быть в формате `Имя_Фамилия` (например: `Gomez_Addams` или `Samuel_Norton`).\n\n"
+            "Пожалуйста, введите правильный ник или отправьте /cancel для отмены:",
+            parse_mode="Markdown"
+        )
         return
 
-    await state.update_data(nick=nick)
+    await state.update_data(nick=clean_nick)
     
     # Клавиатура выбора ранга
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -345,17 +378,27 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
 # Смена ника
 @dp.message(F.text == "⚙️ Мой никнейм")
 async def cmd_change_nick(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id, {})
     current_nick = user_data.get("nick", "Не указан")
     current_rank = user_data.get("rank", "Не указан")
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_nick_change")]
+    ])
     await message.answer(
         f"Ваш текущий профиль:\n👤 **Ник:** `{current_nick}`\n🎖️ **Ранг:** `{current_rank}`\n\n"
         "Если хотите изменить ник, напишите новый (в формате `Имя_Фамилия`):",
+        reply_markup=kb,
         parse_mode="Markdown"
     )
     await state.set_state(RegistrationStates.waiting_for_nick)
+
+@dp.callback_query(F.data == "cancel_nick_change")
+async def cancel_nick_change(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Изменение ника отменено.")
 
 # Просмотр своего статуса
 @dp.message(F.text == "📊 Мой статус")
@@ -712,6 +755,68 @@ async def cmd_set_firebase_pass(message: types.Message):
             "Проверьте, что в Firebase Console ➔ Authentication ➔ Users у пользователя `goponos12@gmail.com` задан именно этот пароль.",
             parse_mode="Markdown"
         )
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  СПИСОК АДМИНИСТРАТОРОВ / ЗАМЕСТИТЕЛЕЙ                           ║
+# ╚══════════════════════════════════════════════════════════════════╝
+@dp.message(F.text == "👥 Список админов")
+@dp.message(Command("admins"))
+async def cmd_list_admins(message: types.Message):
+    if message.from_user.id not in admins_db:
+        await message.answer("Доступно только руководству фракции.")
+        return
+
+    text = f"👥 **Список администраторов и заместителей в боте ({len(admins_db)} чел.):**\n\n"
+    kb_rows = []
+
+    for i, adm_id in enumerate(admins_db, 1):
+        adm_user = users_db.get(str(adm_id), {})
+        nick = adm_user.get("nick", "Ник не привязан")
+        rank = adm_user.get("rank", "")
+        rank_str = f" [{rank}]" if rank else ""
+        username = f"(@{adm_user.get('telegram_username')})" if adm_user.get("telegram_username") else ""
+        is_me = (adm_id == message.from_user.id)
+        me_label = " *(Вы)*" if is_me else ""
+
+        text += f"{i}. **{nick}**{rank_str} {username}{me_label}\n   ID: `{adm_id}`\n\n"
+
+        if not is_me:
+            kb_rows.append([InlineKeyboardButton(text=f"❌ Снять {nick}", callback_data=f"remove_admin_{adm_id}")])
+
+    text += (
+        "💡 **Как добавить нового заместителя:**\n"
+        "Попросите его зайти в бота @frporp_bot и отправить команду:\n"
+        f"`/admin {ADMIN_KEY}`\n"
+        "После этого он сразу появится в этом списке и сможет одобрять отчеты."
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("remove_admin_"))
+async def process_remove_admin(callback: types.CallbackQuery):
+    if callback.from_user.id not in admins_db:
+        await callback.answer("У вас нет прав!", show_alert=True)
+        return
+
+    target_id = int(callback.data.replace("remove_admin_", ""))
+    if target_id == callback.from_user.id:
+        await callback.answer("Нельзя снять самого себя!", show_alert=True)
+        return
+
+    if target_id in admins_db:
+        admins_db.remove(target_id)
+        save_json(ADMINS_FILE, admins_db)
+        await callback.answer("Администратор успешно снят!", show_alert=True)
+        await callback.message.delete()
+        await cmd_list_admins(callback.message)
+    else:
+        await callback.answer("Администратор не найден в списке.", show_alert=True)
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=get_main_menu(message.from_user.id))
 
 # Очередь на выдачу
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
