@@ -1651,7 +1651,17 @@ async def fetch_agent_directory() -> List[Dict[str, Any]]:
             if item["rank"] == "?" and row.get("rank"):
                 item["rank"] = str(row["rank"])
 
-    return sorted(directory.values(), key=lambda item: item["nick"].casefold())
+    def rank_priority(item: Dict[str, Any]):
+        raw = str(item.get("rank") or "").strip().upper()
+        # Registration stores leader rank as X, while the website can use 10 or "10 (Лидер)".
+        if raw == "X":
+            rank = 10
+        else:
+            matched = re.match(r"^(10|[1-9])(?:[^0-9]|$)", raw)
+            rank = int(matched.group(1)) if matched else 0
+        return (-rank, str(item["nick"]).casefold())
+
+    return sorted(directory.values(), key=rank_priority)
 
 
 def agent_list_markup(agents: List[Dict[str, Any]], page: int):

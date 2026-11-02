@@ -169,6 +169,26 @@ class TestAgentDirectory(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["frp"], 2)
         self.assertEqual(rows[2]["praise"], 3)
 
+    async def test_sort_descending_rank_with_x_leader_and_unknown_last(self):
+        class Firebase:
+            async def get_sheet(self, sheet):
+                return [] if sheet == "praise" else [
+                    {"nick": "Unknown", "qty": 1},
+                    {"nick": "Lider_Z", "rank": "10 (Лидер)", "qty": 1}
+                ]
+        env = load_functions({"fetch_agent_directory"}, {
+            "firebase_client": Firebase(),
+            "users_db": {
+                "1": {"nick": "A_Deputy", "rank": "9"},
+                "2": {"nick": "X_Leader", "rank": "X"},
+                "3": {"nick": "B_Deputy", "rank": "9"},
+                "4": {"nick": "Junior", "rank": "2"}
+            }
+        })
+        items = await env["fetch_agent_directory"]()
+        self.assertEqual([x["nick"] for x in items],
+                         ["Lider_Z", "X_Leader", "A_Deputy", "B_Deputy", "Junior", "Unknown"])
+
 
 class TestAgentRendering(unittest.TestCase):
     def setUp(self):
