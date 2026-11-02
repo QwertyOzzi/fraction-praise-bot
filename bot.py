@@ -85,6 +85,7 @@ logger = logging.getLogger(__name__)
 
 users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
+pending_admin_requests: Dict[int, Dict[str, Any]] = {}
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 
@@ -609,6 +610,12 @@ async def cmd_version(message: types.Message):
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
+    if isinstance(user_data, dict) and user_data.get("nick"):
+        new_username = message.from_user.username or ""
+        if user_data.get("telegram_username", "") != new_username:
+            user_data["telegram_username"] = new_username
+            save_json(USERS_FILE, users_db)
+            notify_state_changed()
 
     if not user_data or not user_data.get("nick"):
         await message.answer(
@@ -1151,7 +1158,51 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     nick = user_data.get("nick", message.from_user.full_name)
     rank = user_data.get("rank", "?")
 
-    args = message.text.split(maxsplit=1)
+    args = (message.text or "").split(maxsplit=1)
+    # Direct admin invite is available ONLY to the owner and only for known users.
+    # The Telegram Bot API cannot resolve arbitrary @usernames to user IDs.
+    if len(args) > 1 and args[1].strip().startswith("@"):
+        if not is_owner(uid):
+            await message.answer("⛔ Назначать администраторов по @username может только владелец.")
+            return
+        if getattr(message.chat, "type", "") != "private":
+            await message.answer("⚠️ Используйте эту команду в личном чате с ботом.")
+            return
+        handle = args[1].strip()[1:]
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", handle):
+            await message.answer("⚠️ Укажите Telegram-юзернейм: /admin @username")
+            return
+        candidates = [(int(user_id), entry) for user_id, entry in users_db.items()
+                      if str(user_id).isdigit() and isinstance(entry, dict)
+                      and (entry.get("telegram_username") or "").casefold() == handle.casefold()]
+        if len(candidates) != 1:
+            await message.answer(
+                "⚠️ Пользователь не найден или ник неоднозначен. "
+                "Попросите его открыть бота и отправить /start, затем повторите."
+            )
+            return
+        target_id, target_profile = candidates[0]
+        if target_id == uid or is_admin(target_id):
+            await message.answer("ℹ️ У этого пользователя уже есть права администратора.")
+            return
+        nonce = uuid.uuid4().hex[:16]
+        pending_admin_requests[target_id] = {
+            "expires": datetime.now(timezone.utc).timestamp() + 600,
+            "nonce": nonce, "source": "owner"
+        }
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Назначить", callback_data=f"adm_grant_{target_id}_{nonce}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_deny_{target_id}_{nonce}")
+        ]])
+        await message.answer(
+            f"👤 <b>Назначить администратором?</b>\n"
+            f"Telegram: @{html.escape(handle)}\n"
+            f"Игровой ник: {html.escape(str(target_profile.get('nick', '—')))}\n"
+            f"ID: <code>{target_id}</code>\n\n"
+            "Права будут выданы только после подтверждения.",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        return
     if len(args) < 2 and uid not in OWNER_TELEGRAM_IDS:
         await message.answer(
             "ℹ️ <b>Авторизация в системе руководства:</b>\n\n"
@@ -1201,6 +1252,11 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             )
             return
 
+        # Only a fresh request backed by the deputy key can be confirmed.
+        nonce = uuid.uuid4().hex[:16]
+        pending_admin_requests[uid] = {"expires": datetime.now(timezone.utc).timestamp() + 600,
+                                       "nonce": nonce, "source": "deputy"}
+
         # Уведомляем заместителя о том, что запрос отправлен
         await message.answer(
             "⏳ <b>Ключ заместителя принят! Запрос отправлен Главному Лидеру.</b>\n\n"
@@ -1209,10 +1265,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
 
         # Кому слать запрос: владельцам или существующим админам
-        recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
-        if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
-            recipients.append(int(ADMIN_CHAT_ID))
-        recipients = list(set(recipients))
+        recipients = list(OWNER_TELEGRAM_IDS)
 
         if not recipients:
             await message.answer(
@@ -1224,8 +1277,8 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Одобрить доступ", callback_data=f"adm_grant_{uid}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_deny_{uid}")
+                InlineKeyboardButton(text="✅ Одобрить доступ", callback_data=f"adm_grant_{uid}_{nonce}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_deny_{uid}_{nonce}")
             ]
         ])
 
@@ -1255,73 +1308,73 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     )
 
 # Обработка одобрения доступа заму владельцем
+def verify_admin_request(data: str, prefix: str):
+    parts = data.removeprefix(prefix).split("_")
+    if len(parts) != 2:
+        return None
+    raw_id, nonce = parts
+    if not raw_id.isdecimal() or not re.fullmatch(r"[a-f0-9]{16}", nonce):
+        return None
+    target_id = int(raw_id)
+    pending = pending_admin_requests.get(target_id)
+    if (not pending or pending.get("nonce") != nonce or
+            pending.get("expires", 0) < datetime.now(timezone.utc).timestamp()):
+        pending_admin_requests.pop(target_id, None)
+        return None
+    return target_id
+
+
 @dp.callback_query(F.data.startswith("adm_grant_"))
 async def callback_admin_grant(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("У вас нет прав для подтверждения!", show_alert=True)
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только владелец может выдавать права!", show_alert=True)
         return
-
-    target_id = int(callback.data.replace("adm_grant_", ""))
-    target_user = users_db.get(str(target_id), {})
-    target_nick = target_user.get("nick", f"ID {target_id}")
-
+    target_id = verify_admin_request(callback.data, "adm_grant_")
+    if target_id is None:
+        await callback.answer("Запрос недействителен или истёк.", show_alert=True)
+        return
+    pending_admin_requests.pop(target_id, None)
     if target_id not in admins_db:
         admins_db.append(target_id)
         save_json(ADMINS_FILE, admins_db)
     notify_state_changed()
-
-    # Обновляем карточку у владельца
-    await callback.message.edit_text(
-        callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> руководителем {callback.from_user.mention_html()}! Права успешно выданы.",
-        parse_mode="HTML"
-    )
-
-    # Уведомляем зама
+    target_user = users_db.get(str(target_id), {})
+    try:
+        await callback.message.edit_text(
+            callback.message.text + "\n\n✅ <b>ПРАВА ВЫДАНЫ</b>",
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.warning(f"Could not refresh admin grant message: {exc}")
     try:
         await bot.send_message(
             target_id,
-            "🎉 <b>Главный Лидер одобрил ваш доступ!</b>\n\n"
-            "Вам успешно выданы права Администратора / Заместителя.\n"
-            "Теперь вам доступны:\n"
-            "• Уведомления о новых отчетах агентов с кнопками Одобрить/Отклонить\n"
-            "• Очередь на выдачу в игре (<code>/queue</code>)\n"
-            "• Просмотр списка админов\n\n"
-            "Меню бота обновлено ниже:",
-            reply_markup=get_main_menu(target_id),
-            parse_mode="HTML"
+            "🎉 <b>Владелец выдал вам права администратора.</b>\n"
+            "Откройте /start для обновления меню.",
+            reply_markup=get_main_menu(target_id), parse_mode="HTML"
         )
-    except Exception as e:
-        logger.warning(f"Could not notify new admin {target_id}: {e}")
+    except Exception as exc:
+        logger.warning(f"Could not notify new admin {target_id}: {exc}")
+    await callback.answer(f"✅ Доступ для {html.escape(str(target_user.get('nick', target_id)))} выдан.")
 
-    await callback.answer(f"✅ Доступ для {target_nick} успешно выдан!", show_alert=False)
 
-# Обработка отклонения доступа заму владельцем
 @dp.callback_query(F.data.startswith("adm_deny_"))
 async def callback_admin_deny(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("У вас нет прав!", show_alert=True)
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только владелец может отклонять заявки!", show_alert=True)
         return
-
-    target_id = int(callback.data.replace("adm_deny_", ""))
-    target_user = users_db.get(str(target_id), {})
-    target_nick = target_user.get("nick", f"ID {target_id}")
-
-    await callback.message.edit_text(
-        callback.message.text + f"\n\n❌ <b>ОТКЛОНЕНО</b> руководителем {callback.from_user.mention_html()}.",
-        parse_mode="HTML"
-    )
-
+    target_id = verify_admin_request(callback.data, "adm_deny_")
+    if target_id is None:
+        await callback.answer("Запрос недействителен или истёк.", show_alert=True)
+        return
+    pending_admin_requests.pop(target_id, None)
     try:
-        await bot.send_message(
-            target_id,
-            "❌ <b>Главный Руководитель отклонил ваш запрос на получение прав администратора.</b>\n"
-            "Если произошла ошибка, обратитесь к лидеру напрямую.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.warning(f"Could not notify denied user {target_id}: {e}")
+        await callback.message.edit_text(callback.message.text + "\n\n❌ <b>ОТКЛОНЕНО</b>",
+                                         parse_mode="HTML")
+    except Exception as exc:
+        logger.warning(f"Could not refresh rejected admin request: {exc}")
+    await callback.answer("Запрос отклонён.")
 
-    await callback.answer(f"Запрос от {target_nick} отклонён.", show_alert=False)
 
 # Команда настройки пароля Firebase прямо из Telegram
 @dp.message(Command("setpass"))
