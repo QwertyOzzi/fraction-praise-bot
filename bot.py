@@ -347,9 +347,7 @@ async def sync_state_from_cloud():
                         users_db[str(uid)] = udata
 
                     cloud_admins = cloud_data.get("admins", [])
-                    for aid in cloud_admins:
-                        if int(aid) not in admins_db:
-                            admins_db.append(int(aid))
+                    # Cloud-stored admins are not a source of authorization.\n                    # Only previously approved local admins remain trusted.
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
 
@@ -365,16 +363,15 @@ async def sync_state_from_cloud():
 
         # Также загружаем настройки системы (Лидер, назначенный через сайт, и ключ замов)
         settings_url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
+        settings_token = await firebase_client.get_token()
+        settings_headers = {"Authorization": f"Bearer {settings_token}"} if settings_token else {}
         async with ClientSession() as session:
-            async with session.get(settings_url) as resp:
+            async with session.get(settings_url, headers=settings_headers) as resp:
                 if resp.status == 200:
                     s_data = await resp.json()
                     fields = s_data.get("fields", {})
                     global DEPUTY_KEY, LEADER_INFO
-                    if "deputyKey" in fields:
-                        custom_key = fields["deputyKey"].get("stringValue", "").strip()
-                        if custom_key:
-                            DEPUTY_KEY = custom_key
+                    # Never load shared administrator credentials from client-readable Firestore documents.
                     if "leaderNick" in fields:
                         LEADER_INFO["nick"] = fields["leaderNick"].get("stringValue", "").strip()
                     if "leaderRank" in fields:
@@ -922,7 +919,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     rank = user_data.get("rank", "?")
 
     args = message.text.split(maxsplit=1)
-    if len(args) < 2:
+    if len(args) < 2 and uid not in OWNER_TELEGRAM_IDS:
         await message.answer(
             "ℹ️ <b>Авторизация в системе руководства:</b>\n\n"
             "• <b>Для заместителей и лидеров:</b>\n"
@@ -938,9 +935,6 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     
     # 1. Мастер-ключи Владельца (мгновенный вход без подтверждений)
     if uid in OWNER_TELEGRAM_IDS:
-        if uid not in OWNER_TELEGRAM_IDS:
-            owner_cfg.setdefault("owner_ids", []).append(uid)
-            save_json(OWNER_FILE, owner_cfg)
         if uid not in admins_db:
             admins_db.append(uid)
             save_json(ADMINS_FILE, admins_db)
