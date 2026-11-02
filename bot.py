@@ -181,7 +181,7 @@ class FirebaseClient:
 
         try:
             async with ClientSession() as session:
-                async with session.patch(url, headers=headers, json=body) as resp:
+                async with session.patch(url, headers=headers, params=[("updateMask.fieldPaths", "rows"), ("updateMask.fieldPaths", "updatedAt")], json=body) as resp:
                     if resp.status == 200:
                         logger.info(f"Successfully updated {sheet_name} in Firestore")
                         return True
