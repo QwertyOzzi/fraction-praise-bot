@@ -1363,6 +1363,8 @@ async def handle_ping(request):
     }
     return web.json_response(data, headers=headers)
 
+_support_rate_history: Dict[str, List[float]] = {}
+
 async def handle_api_support(request):
     headers = {
         "Access-Control-Allow-Origin": "*",
@@ -1372,8 +1374,25 @@ async def handle_api_support(request):
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=headers)
 
+    client_ip = request.remote or "unknown"
+    now = datetime.now(timezone.utc).timestamp()
+    # Small bounded in-process limiter; add provider-level rate limiting for multi-instance hosting.
+    for ip, timestamps in list(_support_rate_history.items()):
+        recent = [t for t in timestamps if now - t < 60]
+        if recent:
+            _support_rate_history[ip] = recent
+        else:
+            del _support_rate_history[ip]
+    attempts = _support_rate_history.setdefault(client_ip, [])
+    if len(attempts) >= 5:
+        return web.json_response({"error": "Too many requests"}, status=429, headers=headers)
+    attempts.append(now)
+    if request.content_length is None or request.content_length > 12000:
+        return web.json_response({"error": "Invalid request size"}, status=413, headers=headers)
     try:
         data = await request.json()
+        if not isinstance(data, dict):
+            return web.json_response({"error": "Invalid payload"}, status=400, headers=headers)
         nick = str(data.get("nick", "Аноним")).strip()
         contact = str(data.get("contact", "Не указан")).strip()
         category = str(data.get("category", "Баг / Ошибка")).strip()
