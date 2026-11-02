@@ -459,6 +459,14 @@ async def sync_state_from_cloud():
                     for uid, udata in cloud_users.items():
                         users_db[str(uid)] = udata
 
+                    cloud_roles = cloud_data.get("admin_roles", {})
+                    # Role labels are not grants: they apply only to IDs approved locally.
+                    if isinstance(cloud_roles, dict):
+                        for role_id, role in cloud_roles.items():
+                            if str(role_id).isdigit() and int(role_id) in admins_db and role in ("leader", "deputy"):
+                                admin_roles[str(role_id)] = role
+                        save_json("admin_roles.json", admin_roles)
+
                     cloud_admins = cloud_data.get("admins", [])
                     # Cloud-stored admins are not a source of authorization.\n                    # Only previously approved local admins remain trusted.
 
@@ -1205,8 +1213,8 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         if (getattr(live_chat, "username", "") or "").casefold() != handle.casefold():
             await message.answer("⚠️ Telegram-юзернейм изменился. Попросите человека написать /start.")
             return
-        if target_id == uid or is_admin(target_id):
-            await message.answer("ℹ️ У этого пользователя уже есть права администратора.")
+        if target_id == uid:
+            await message.answer("ℹ️ Владельца нельзя переназначить.")
             return
         nonce = uuid.uuid4().hex[:16]
         pending_admin_requests[target_id] = {
