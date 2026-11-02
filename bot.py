@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
-owner_cfg: Dict[str, Any] = load_json(OWNER_FILE, {"owner_ids": []})
+owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
@@ -94,7 +94,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
 
 def is_owner(user_id: int) -> bool:
-    return user_id in owner_cfg.get("owner_ids", [])
+    return user_id in OWNER_TELEGRAM_IDS
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FIREBASE REST CLIENT                                            ║
@@ -351,10 +351,7 @@ async def sync_state_from_cloud():
                         if int(aid) not in admins_db:
                             admins_db.append(int(aid))
 
-                    cloud_owners = cloud_data.get("owners", [])
-                    for oid in cloud_owners:
-                        if int(oid) not in owner_cfg.setdefault("owner_ids", []):
-                            owner_cfg["owner_ids"].append(int(oid))
+                    owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
 
                     cloud_requests = cloud_data.get("requests", {})
                     for rid, rdata in cloud_requests.items():
@@ -941,7 +938,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     
     # 1. Мастер-ключи Владельца (мгновенный вход без подтверждений)
     if uid in OWNER_TELEGRAM_IDS:
-        if uid not in owner_cfg.get("owner_ids", []):
+        if uid not in OWNER_TELEGRAM_IDS:
             owner_cfg.setdefault("owner_ids", []).append(uid)
             save_json(OWNER_FILE, owner_cfg)
         if uid not in admins_db:
@@ -1102,49 +1099,8 @@ async def callback_admin_deny(callback: types.CallbackQuery):
 # Команда настройки пароля Firebase прямо из Telegram
 @dp.message(Command("setpass"))
 async def cmd_set_firebase_pass(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступно только администраторам.")
-        return
+    await message.answer("Настройте FIREBASE_PASSWORD в Render Environment. Передавать пароль боту запрещено.")
 
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "ℹ️ <b>Привязка пароля Firebase к боту:</b>\n\n"
-            "Использование: <code>/setpass ваш_пароль_от_Firebase</code>\n\n"
-            "<i>(Введите пароль, который вы задали для <code>goponos12@gmail.com</code> в Firebase Console)</i>",
-            parse_mode="HTML"
-        )
-        return
-
-    new_pass = args[1].strip()
-    await message.answer("🔄 Проверяю подключение к Firebase с этим паролем...")
-
-    # Тестируем авторизацию
-    firebase_client.password = new_pass
-    token = await firebase_client.get_token()
-
-    if token:
-        # Сохраняем в конфиг
-        cfg = load_json("firebase_config.json", {})
-        cfg["FIREBASE_PASSWORD"] = new_pass
-        save_json("firebase_config.json", cfg)
-
-        await message.answer(
-            "✅ <b>Связь с Firebase успешно установлена!</b>\n\n"
-            "Токен доступа получен. Теперь все одобрения в боте будут мгновенно появляться в таблице на сайте!",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            "❌ <b>Ошибка авторизации в Firebase!</b>\n\n"
-            "Firebase отклонил этот пароль для почты <code>goponos12@gmail.com</code>.\n\n"
-            "Проверьте, что в Firebase Console ➔ Authentication ➔ Users у пользователя <code>goponos12@gmail.com</code> задан именно этот пароль.",
-            parse_mode="HTML"
-        )
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  СПИСОК АДМИНИСТРАТОРОВ / ЗАМЕСТИТЕЛЕЙ                           ║
-# ╚══════════════════════════════════════════════════════════════════╝
 @dp.message(F.text == "👥 Список админов")
 @dp.message(Command("admins"))
 async def cmd_list_admins(message: types.Message):
