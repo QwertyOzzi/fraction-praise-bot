@@ -4,7 +4,7 @@ import json
 import html
 import logging
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from aiohttp import web, ClientSession
 from dotenv import load_dotenv
@@ -286,6 +286,92 @@ class FirebaseClient:
 firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD)
 
 # ╔══════════════════════════════════════════════════════════════════╗
+# ║  CLOUD STATE PERSISTENCE (FIRESTORE SYNC ДЛЯ RENDER)             ║
+# ╚══════════════════════════════════════════════════════════════════╝
+async def sync_state_from_cloud():
+    """Загрузка сохранённого состояния бота из Firestore при запуске."""
+    try:
+        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
+        async with ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    raw = data.get("fields", {}).get("data", {}).get("stringValue", "{}")
+                    cloud_data = json.loads(raw)
+
+                    cloud_users = cloud_data.get("users", {})
+                    for uid, udata in cloud_users.items():
+                        users_db[str(uid)] = udata
+
+                    cloud_admins = cloud_data.get("admins", [])
+                    for aid in cloud_admins:
+                        if int(aid) not in admins_db:
+                            admins_db.append(int(aid))
+
+                    cloud_owners = cloud_data.get("owners", [])
+                    for oid in cloud_owners:
+                        if int(oid) not in owner_cfg.setdefault("owner_ids", []):
+                            owner_cfg["owner_ids"].append(int(oid))
+
+                    cloud_requests = cloud_data.get("requests", {})
+                    for rid, rdata in cloud_requests.items():
+                        requests_db[str(rid)] = rdata
+
+                    save_json(USERS_FILE, users_db)
+                    save_json(ADMINS_FILE, admins_db)
+                    save_json(OWNER_FILE, owner_cfg)
+                    save_json(REQUESTS_FILE, requests_db)
+                    logger.info(f"Loaded cloud bot state: {len(users_db)} users, {len(admins_db)} admins, {len(owner_cfg.get('owner_ids', []))} owners")
+    except Exception as e:
+        logger.warning(f"Could not load state from Firestore: {e}")
+
+def notify_state_changed():
+    """Безопасная фоновая синхронизация с облаком Firestore."""
+    try:
+        loop = asyncio.get_running_loop()
+        if loop and loop.is_running():
+            loop.create_task(sync_state_to_cloud())
+    except RuntimeError:
+        pass
+
+async def sync_state_to_cloud():
+    """Сохранение состояния бота в Firestore при любых изменениях."""
+    try:
+        token = await firebase_client.get_token()
+        if not token:
+            return
+
+        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        payload_data = {
+            "users": users_db,
+            "admins": admins_db,
+            "owners": owner_cfg.get("owner_ids", []),
+            "requests": requests_db
+        }
+
+        body = {
+            "fields": {
+                "data": {
+                    "stringValue": json.dumps(payload_data, ensure_ascii=False)
+                },
+                "updatedAt": {
+                    "timestampValue": datetime.now(timezone.utc).isoformat()
+                }
+            }
+        }
+
+        async with ClientSession() as session:
+            async with session.patch(url, headers=headers, json=body) as resp:
+                if resp.status == 200:
+                    logger.info("Bot state successfully synced to cloud Firestore")
+                else:
+                    logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
+    except Exception as e:
+        logger.warning(f"Error syncing bot state to cloud: {e}")
+
+# ╔══════════════════════════════════════════════════════════════════╗
 # ║  FSM STATES                                                      ║
 # ╚══════════════════════════════════════════════════════════════════╝
 class RegistrationStates(StatesGroup):
@@ -428,6 +514,7 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
         "registered_at": datetime.now().isoformat()
     }
     save_json(USERS_FILE, users_db)
+    notify_state_changed()
 
     await state.clear()
     await callback.message.edit_text(f"✅ Профиль успешно настроен!\n\n👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n🎖️ <b>Ранг:</b> {html.escape(rank)}", parse_mode="HTML")
@@ -607,6 +694,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         "created_at": datetime.now().isoformat()
     }
     save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
 
     await callback.message.edit_text(
         f"✅ <b>Отчет #{req_id} успешно отправлен руководству!</b>\n\n"
@@ -657,6 +745,7 @@ async def approve_report(callback: types.CallbackQuery):
     req["status"] = "approved"
     req["approved_by"] = callback.from_user.full_name
     save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
 
     # Обновляем сообщение у админа
     await callback.message.edit_text(
@@ -730,6 +819,7 @@ async def reject_report(callback: types.CallbackQuery):
     req["status"] = "rejected"
     req["rejected_by"] = callback.from_user.full_name
     save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
 
     await callback.message.edit_text(
         callback.message.text + f"\n\n❌ <b>ОТКЛОНЕНО</b> лидером {callback.from_user.mention_html()}",
@@ -789,6 +879,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         if uid not in admins_db:
             admins_db.append(uid)
             save_json(ADMINS_FILE, admins_db)
+        notify_state_changed()
 
         await message.answer(
             "👑 <b>Вы успешно авторизованы как ГЛАВНЫЙ РУКОВОДИТЕЛЬ (Владелец)!</b>\n\n"
@@ -882,6 +973,7 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     if target_id not in admins_db:
         admins_db.append(target_id)
         save_json(ADMINS_FILE, admins_db)
+    notify_state_changed()
 
     # Обновляем карточку у владельца
     await callback.message.edit_text(
@@ -1039,6 +1131,7 @@ async def process_remove_admin(callback: types.CallbackQuery):
     if target_id in admins_db:
         admins_db.remove(target_id)
         save_json(ADMINS_FILE, admins_db)
+        notify_state_changed()
         await callback.answer("Заместитель успешно снят!", show_alert=True)
         try:
             await callback.message.delete()
@@ -1147,6 +1240,9 @@ async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN is not configured!")
         return
+
+    # Загружаем сохранённое состояние (все юзеры, админы, замы) из Firestore
+    await sync_state_from_cloud()
 
     # Запускаем фоновый web-сервер для Render
     await start_web_server()
