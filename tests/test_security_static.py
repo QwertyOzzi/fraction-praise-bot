@@ -57,6 +57,19 @@ class BotSecurityChecks(unittest.TestCase):
         self.assertIn("render_queue(rows)", section)
         self.assertIn("callback.message.edit_text", section)
 
+    def test_both_report_types_have_quantity_selection(self):
+        section = SOURCE.split("async def process_report_type(", 1)[1].split("async def process_report_quantity_button(", 1)[0]
+        self.assertIn("await state.set_state(ReportStates.waiting_for_quantity)", section)
+        self.assertNotIn('if rep_type == "praise":', section)
+        adjustment = SOURCE.split("async def adjust_report_quantity(", 1)[1].split("async def send_report_confirmed(", 1)[0]
+        self.assertIn('("fractionrp", "praise")', adjustment)
+
+    def test_http_port_before_bounded_cloud_sync(self):
+        section = SOURCE.split("async def main():", 1)[1]
+        self.assertLess(section.index("await start_web_server()"), section.index("await asyncio.wait_for(sync_state_from_cloud(), timeout=20)"))
+        self.assertIn('headers = {"Authorization": f"Bearer {token}"}', SOURCE)
+        self.assertIn('RELEASE_TAG = "quantity-frp-praise-v2"', SOURCE)
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 

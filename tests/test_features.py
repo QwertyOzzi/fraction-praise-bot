@@ -60,6 +60,15 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(len(keyboard.inline_keyboard), 1)
         self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "issue_1_Alice_River")
 
+    def test_frp_approval_has_quantity_controls(self):
+        req = {"rep_type": "fractionrp", "quantity": 4}
+        keyboard = env["pending_report_keyboard"]("frp123", req)
+        labels = [b.text for row in keyboard.inline_keyboard for b in row]
+        self.assertIn("🎖️ 4", labels)
+        self.assertIn("✅ Одобрить (+4)", labels)
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "qtyminus_frp123")
+        self.assertEqual(keyboard.inline_keyboard[0][2].callback_data, "qtyplus_frp123")
+
     def test_praise_approval_has_quantity_controls(self):
         req = {"rep_type": "praise", "quantity": 3}
         keyboard = env["pending_report_keyboard"]("abcd", req)

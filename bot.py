@@ -27,6 +27,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+RELEASE_TAG = "quantity-frp-praise-v2"
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
@@ -428,8 +429,13 @@ async def sync_state_from_cloud():
     """Загрузка сохранённого состояния бота из Firestore при запуске."""
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
+        token = await firebase_client.get_token()
+        if not token:
+            logger.warning("Firebase authentication unavailable; cannot load cloud state")
+            return
+        headers = {"Authorization": f"Bearer {token}"}
         async with ClientSession() as session:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     raw = data.get("fields", {}).get("data", {}).get("stringValue", "{}")
@@ -585,6 +591,15 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 # ╚══════════════════════════════════════════════════════════════════╝
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+@dp.message(Command("version"))
+async def cmd_version(message: types.Message):
+    commit = os.getenv("RENDER_GIT_COMMIT", "").strip()
+    version_text = f"Версия бота: {RELEASE_TAG}"
+    if commit:
+        version_text += f"\\nRender commit: {commit[:12]}"
+    await message.answer(version_text)
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -813,23 +828,27 @@ async def show_report_reason_menu(message: types.Message, state: FSMContext, edi
 async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
     rep_type = "fractionrp" if callback.data == "type_fractionrp" else "praise"
     await state.update_data(rep_type=rep_type, quantity=1)
-    if rep_type == "praise":
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=str(n), callback_data=f"repqty_{n}") for n in (1, 2, 3, 5, 10)],
-            [InlineKeyboardButton(text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
-        ])
-        await callback.message.edit_text("🌟 Сколько похвал в заявке? Выберите число или введите от 1 до 20:", reply_markup=kb)
-        await state.set_state(ReportStates.waiting_for_quantity)
-    else:
-        await show_report_reason_menu(callback.message, state, edit=True)
-
+    # Both FRP and praise support a configurable quantity.
+    label = "FRP" if rep_type == "fractionrp" else "похвал"
+    icon = "🎖️" if rep_type == "fractionrp" else "🌟"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(n), callback_data=f"repqty_{n}") for n in (1, 2, 3, 5, 10)],
+        [InlineKeyboardButton(text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
+    ])
+    await callback.message.edit_text(
+        f"{icon} Сколько {label} указать в заявке? Выберите число от 1 до 20:",
+        reply_markup=kb
+    )
+    await state.set_state(ReportStates.waiting_for_quantity)
 
 @dp.callback_query(ReportStates.waiting_for_quantity, F.data.startswith("repqty_"))
 async def process_report_quantity_button(callback: types.CallbackQuery, state: FSMContext):
     value = callback.data[len("repqty_"):]
     if value == "custom":
-        await callback.message.edit_text("Введите количество похвал числом от 1 до 20:")
+        report = await state.get_data()
+        label = "FRP" if report.get("rep_type") == "fractionrp" else "похвал"
+        await callback.message.edit_text(f"Введите количество {label} числом от 1 до 20:")
         await callback.answer()
         return
     if not value.isdecimal() or not 1 <= int(value) <= 20:
@@ -899,10 +918,10 @@ async def cancel_report(callback: types.CallbackQuery, state: FSMContext):
 def pending_report_keyboard(req_id: str, req: Dict[str, Any]) -> InlineKeyboardMarkup:
     qty = int(req.get("quantity", 1))
     controls = []
-    if req.get("rep_type") == "praise":
+    if req.get("rep_type") in ("fractionrp", "praise"):
         controls.append([
             InlineKeyboardButton(text="➖ 1", callback_data=f"qtyminus_{req_id}"),
-            InlineKeyboardButton(text=f"🌟 {qty}", callback_data=f"qtyshow_{req_id}"),
+            InlineKeyboardButton(text=f"{'🎖️' if req.get('rep_type') == 'fractionrp' else '🌟'} {qty}", callback_data=f"qtyshow_{req_id}"),
             InlineKeyboardButton(text="➕ 1", callback_data=f"qtyplus_{req_id}")
         ])
     controls.append([
@@ -921,9 +940,7 @@ def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
         f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
         f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
         f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
-        + ("Измените количество похвал кнопками ➖/➕, затем примите решение."
-         if req.get("rep_type") == "praise" else
-         "Одобрите или отклоните заявку.")
+        + "Измените количество кнопками ➖/➕, затем одобрите или отклоните заявку."
     )
 
 
@@ -982,7 +999,7 @@ async def adjust_report_quantity(callback: types.CallbackQuery):
     plus = callback.data.startswith("qtyplus_")
     req_id = callback.data.split("_", 1)[1]
     req = requests_db.get(req_id)
-    if not req or req.get("status") != "pending" or req.get("rep_type") != "praise":
+    if not req or req.get("status") != "pending" or req.get("rep_type") not in ("fractionrp", "praise"):
         await callback.answer("Заявка уже закрыта или не найдена.", show_alert=True)
         return
     new_qty = max(1, min(20, int(req.get("quantity", 1)) + (1 if plus else -1)))
@@ -990,7 +1007,7 @@ async def adjust_report_quantity(callback: types.CallbackQuery):
     save_json(REQUESTS_FILE, requests_db)
     notify_state_changed()
     await refresh_pending_report_messages(req_id, req)
-    await callback.answer(f"Количество похвал: {new_qty}")
+    await callback.answer(f"Новое количество: {new_qty}")
 
 
 @dp.callback_query(ReportStates.confirm, F.data == "send_report_confirm")
@@ -1651,6 +1668,8 @@ async def handle_ping(request):
         return web.Response(status=204, headers=headers)
     data = {
         "status": "online",
+        "release": RELEASE_TAG,
+        "commit": os.getenv("RENDER_GIT_COMMIT", "").strip()[:12],
         "service": "FractionRp Telegram Bot",
         "bot_username": "frporp_bot",
         "leader": LEADER_INFO.get("nick", "Не назначен"),
@@ -1758,13 +1777,15 @@ async def main():
         logger.error("Required credentials are not configured!")
         return
 
-    # Загружаем сохранённое состояние (все юзеры, админы, замы) из Firestore
-    await sync_state_from_cloud()
-
-    # Запускаем фоновый web-сервер для Render
+    # Render must see an open HTTP port even when Firebase is responding slowly.
     await start_web_server()
 
-    # Запускаем polling бота
+    # Do not let an unavailable Firestore dependency block the entire deployment.
+    try:
+        await asyncio.wait_for(sync_state_from_cloud(), timeout=20)
+    except asyncio.TimeoutError:
+        logger.error("Initial Firebase sync timed out after 20 seconds")
+
     logger.info("Bot polling starting...")
     await dp.start_polling(bot)
 
