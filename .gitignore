@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+users_db.json
+admins_db.json
+requests_db.json
+.venv/
+venv/
