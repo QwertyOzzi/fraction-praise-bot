@@ -4,6 +4,8 @@ import json
 import html
 import logging
 import uuid
+import hashlib
+import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
@@ -564,7 +566,8 @@ MENU_BUTTONS = [
     "📋 Очередь на выдачу (Админ)",
     "👥 Список админов",
     "📌 Ожидающие заявки",
-    "➕ Начислить FRP / Похвалу"
+    "➕ Начислить FRP / Похвалу",
+    "🧑‍💼 Управление агентами"
 ]
 
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
@@ -583,6 +586,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     if admin_mode:
         buttons.append([KeyboardButton(text="📋 Очередь на выдачу (Админ)"), KeyboardButton(text="👥 Список админов")])
         buttons.append([KeyboardButton(text="📌 Ожидающие заявки"), KeyboardButton(text="➕ Начислить FRP / Похвалу")])
+        buttons.append([KeyboardButton(text="🧑‍💼 Управление агентами")])
 
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -1432,47 +1436,70 @@ async def cmd_pending(message: types.Message):
         await message.answer("⚠️ Показаны первые 30 заявок. Остальные доступны после их обработки.")
 
 
+def parse_grant_args(raw: str):
+    """Parse 'frp nick1,nick2 2'; refuse duplicates or partially invalid batches."""
+    parts = raw.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError("Формат: /grant frp Nick_One,Nick_Two 2")
+    kind, rest = parts
+    sheet = {"frp": "fractionrp", "fractionrp": "fractionrp",
+             "praise": "praise"}.get(kind.casefold())
+    if not sheet:
+        raise ValueError("Тип должен быть frp или praise.")
+    try:
+        nick_text, amount_text = rest.rsplit(maxsplit=1)
+    except ValueError as exc:
+        raise ValueError("Укажите никнеймы и количество, например: /grant frp Nick_One,Nick_Two 2") from exc
+    if not amount_text.isdecimal() or not 1 <= int(amount_text) <= 20:
+        raise ValueError("Количество для каждого агента должно быть от 1 до 20.")
+    nicks = [name.strip() for name in nick_text.split(",")]
+    if not 1 <= len(nicks) <= 10:
+        raise ValueError("Можно указать от 1 до 10 агентов.")
+    if any(not re.fullmatch(r"[A-Za-z0-9_]{2,30}", name) for name in nicks):
+        raise ValueError("Неверный ник: используйте 2–30 латинских букв, цифр или _.")
+    if len({name.casefold() for name in nicks}) != len(nicks):
+        raise ValueError("Одинаковые ники в одной команде повторять нельзя.")
+    return sheet, nicks, int(amount_text)
+
+
 async def perform_manual_grant(message: types.Message, raw: str):
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Только лидер или заместитель может начислять баллы.")
         return
-    args = raw.strip().split()
-    if len(args) != 3:
-        await message.answer("Формат: <code>/grant frp Nick_Name 2</code> или "
-                             "<code>/grant praise Nick_Name 3</code>.",
-                             parse_mode="HTML")
-        return
-    kind, nick, qty_raw = args
-    sheet = {"frp": "fractionrp", "fractionrp": "fractionrp",
-             "praise": "praise"}.get(kind.lower())
-    if not sheet or not qty_raw.isdecimal() or not 1 <= int(qty_raw) <= 20:
-        await message.answer("Укажите frp или praise и количество от 1 до 20.")
-        return
-    if len(nick) > 30 or "_" not in nick or not all(c.isalnum() or c == "_" for c in nick):
-        await message.answer("Укажите игровой ник в формате Name_Surname.")
-        return
-    user_entry = next((u for u in users_db.values()
-                       if u.get("nick", "").casefold() == nick.casefold()), None)
-    rank = str(user_entry.get("rank", "8")) if user_entry else "8"
-    qty = int(qty_raw)
-    grant_id = "manual-" + uuid.uuid4().hex
     try:
-        success = await firebase_client.credit_report(
-            sheet, nick, rank, f"Ручная выдача администратором {message.from_user.id}",
-            "", grant_id, quantity=qty
-        )
-        if success:
-            await message.answer(
-                f"✅ Начислено <b>+{qty}</b> /{sheet} игроку <code>{html.escape(nick)}</code>. "
-                "Баллы доступны в очереди на выдачу.",
-                parse_mode="HTML"
-            )
-    except Exception as exc:
-        logger.error(f"Manual grant failed ({grant_id}): {exc}")
-        await message.answer(
-            "⚠️ Нет подтверждения начисления. Проверьте таблицу перед повторением команды."
-        )
+        sheet, nicks, qty = parse_grant_args(raw)
+    except ValueError as exc:
+        await message.answer("⚠️ " + html.escape(str(exc)))
+        return
 
+    results = []
+    for nick in nicks:
+        registered = next(
+            (u for u in users_db.values() if isinstance(u, dict)
+             and str(u.get("nick", "")).casefold() == nick.casefold()), None
+        )
+        rank = str(registered.get("rank", "8")) if registered else "8"
+        grant_id = "manual-" + uuid.uuid4().hex
+        try:
+            success = await firebase_client.credit_report(
+                sheet, nick, rank, f"Ручное начисление администратором {message.from_user.id}",
+                "", grant_id, quantity=qty
+            )
+            if success:
+                results.append(f"✅ {html.escape(nick)}: +{qty}")
+            else:
+                results.append(f"⚠️ {html.escape(nick)}: не подтверждено")
+        except Exception as exc:
+            logger.error(f"Manual grant {grant_id} failed for {nick}: {exc}")
+            results.append(f"⚠️ {html.escape(nick)}: проверьте баланс перед повтором")
+
+    await message.answer(
+        f"📊 <b>Начисление /{sheet} ({len(nicks)} агентов):</b>\n\n"
+        + "\n".join(results)
+        + "\n\n<i>Если запись не подтверждена, сначала проверьте таблицу, "
+          "чтобы избежать двойного начисления.</i>",
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("grant"))
 async def cmd_grant(message: types.Message):
