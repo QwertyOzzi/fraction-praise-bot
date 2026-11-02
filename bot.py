@@ -26,7 +26,14 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_KEY = os.getenv("ADMIN_KEY", "kiidsg12#$$").strip()
+
+# Ключи доступа:
+# 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
+OWNER_KEY = os.getenv("OWNER_KEY", "kiidsg12#$$").strip()
+# 2. Ключ для лидеров и заместителей (требует подтверждения владельца)
+DEPUTY_KEY = os.getenv("DEPUTY_KEY", "NEXUS-U1B23D-FRNP").strip()
+ADMIN_KEY = OWNER_KEY  # совместимость
+
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -34,6 +41,7 @@ PORT = int(os.getenv("PORT", "8080"))
 USERS_FILE = "users_db.json"
 ADMINS_FILE = "admins_db.json"
 REQUESTS_FILE = "requests_db.json"
+OWNER_FILE = "owner_config.json"
 
 def load_json(filepath: str, default: Any) -> Any:
     if os.path.exists(filepath):
@@ -67,12 +75,19 @@ logger = logging.getLogger(__name__)
 users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
+owner_cfg: Dict[str, Any] = load_json(OWNER_FILE, {"owner_ids": []})
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
     if cid not in admins_db:
         admins_db.append(cid)
         save_json(ADMINS_FILE, admins_db)
+
+def is_admin(user_id: int) -> bool:
+    return user_id in admins_db or user_id in owner_cfg.get("owner_ids", [])
+
+def is_owner(user_id: int) -> bool:
+    return user_id in owner_cfg.get("owner_ids", [])
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FIREBASE REST CLIENT                                            ║
@@ -296,7 +311,7 @@ MENU_BUTTONS = [
 ]
 
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    is_admin = user_id in admins_db
+    admin_mode = is_admin(user_id)
     buttons = [
         [KeyboardButton(text="📝 Подать отчет на FRP / Похвалу")],
         [
@@ -305,7 +320,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         ],
         [KeyboardButton(text="⚙️ Мой никнейм")]
     ]
-    if is_admin:
+    if admin_mode:
         buttons.append([KeyboardButton(text="📋 Очередь на выдачу (Админ)"), KeyboardButton(text="👥 Список админов")])
 
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -343,13 +358,17 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def process_nick(message: types.Message, state: FSMContext):
     text_val = (message.text or "").strip()
 
+    # Если пользователь ввёл ключ напрямую или нажал команду /admin
+    if text_val.startswith("/admin") or text_val.upper() == DEPUTY_KEY.upper() or text_val == OWNER_KEY:
+        if not text_val.startswith("/admin"):
+            message.text = f"/admin {text_val}"
+        await cmd_admin_auth(message, state)
+        return
+
     # Если пользователь нажал кнопку меню или команду
     if text_val.startswith("/") or text_val in MENU_BUTTONS:
         await state.clear()
-        if text_val.startswith("/admin"):
-            await cmd_admin_auth(message, state)
-            return
-        elif text_val.startswith("/setpass"):
+        if text_val.startswith("/setpass"):
             await cmd_set_firebase_pass(message)
             return
         elif text_val == "📋 Очередь на выдачу (Админ)" or text_val == "/queue":
@@ -612,8 +631,9 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         f"Выберите действие:"
     )
 
-    # Отправляем всем админам
-    for adm_id in admins_db:
+    # Отправляем всем админам и владельцам
+    recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
+    for adm_id in recipients:
         try:
             await bot.send_message(adm_id, admin_msg, reply_markup=admin_kb, disable_web_page_preview=True, parse_mode="HTML")
         except Exception as e:
@@ -624,7 +644,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
 # ╚══════════════════════════════════════════════════════════════════╝
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_report(callback: types.CallbackQuery):
-    if callback.from_user.id not in admins_db:
+    if not is_admin(callback.from_user.id):
         await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
@@ -697,7 +717,7 @@ async def approve_report(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_report(callback: types.CallbackQuery):
-    if callback.from_user.id not in admins_db:
+    if not is_admin(callback.from_user.id):
         await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
@@ -727,48 +747,199 @@ async def reject_report(callback: types.CallbackQuery):
         logger.error(f"Error notifying user on reject: {e}")
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  АДМИНСКАЯ ПАНЕЛЬ И ВЫДАЧА В ИГРЕ                                ║
+# ║  АДМИНСКАЯ ПАНЕЛЬ И ПОДТВЕРЖДЕНИЕ ВХОДА ДЛЯ ЗАМЕСТИТЕЛЕЙ         ║
 # ╚══════════════════════════════════════════════════════════════════╝
-# Авторизация по паролю: /admin пароль
+
+# Авторизация: /admin ключ
 @dp.message(Command("admin"))
 async def cmd_admin_auth(message: types.Message, state: FSMContext):
     await state.clear()
+    uid = message.from_user.id
+    user_data = users_db.get(str(uid), {})
+    nick = user_data.get("nick", message.from_user.full_name)
+    rank = user_data.get("rank", "?")
+
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("Использование: <code>/admin ваш_ключ_лидера</code>", parse_mode="HTML")
+        await message.answer(
+            "ℹ️ <b>Авторизация в системе руководства:</b>\n\n"
+            "• <b>Для заместителей и лидеров:</b>\n"
+            f"Отправьте команду: <code>/admin {DEPUTY_KEY}</code>\n"
+            "<i>(После отправки запрос поступит Главному Лидеру на одобрение)</i>\n\n"
+            "• <b>Для Главного Руководителя:</b>\n"
+            "Используйте ваш личный мастер-ключ: <code>/admin мастер_ключ</code>",
+            parse_mode="HTML"
+        )
         return
 
     key = args[1].strip().strip('"').strip("'")
     
-    # Список допустимых ключей
-    valid_keys = {
-        ADMIN_KEY.strip().strip('"').strip("'"),
+    # 1. Мастер-ключи Владельца (мгновенный вход без подтверждений)
+    valid_owner_keys = {
+        OWNER_KEY.strip().strip('"').strip("'"),
         "kiidsg12#$$",
         "kiidsg12",
         "arizona1234"
     }
 
-    if key in valid_keys or key.startswith("kiidsg12"):
-        uid = message.from_user.id
+    if key in valid_owner_keys or key.startswith("kiidsg12"):
+        if uid not in owner_cfg.get("owner_ids", []):
+            owner_cfg.setdefault("owner_ids", []).append(uid)
+            save_json(OWNER_FILE, owner_cfg)
         if uid not in admins_db:
             admins_db.append(uid)
             save_json(ADMINS_FILE, admins_db)
+
         await message.answer(
-            "👑 <b>Вы успешно авторизованы как Администратор / Руководитель!</b>\n\n"
+            "👑 <b>Вы успешно авторизованы как ГЛАВНЫЙ РУКОВОДИТЕЛЬ (Владелец)!</b>\n\n"
+            f"🔑 <b>Ключ для ваших заместителей:</b> <code>{DEPUTY_KEY}</code>\n"
+            "Когда заместитель вводит этот ключ, вам в личные сообщения бота приходит запрос с кнопками «Одобрить» / «Отклонить».\n\n"
             "Вам доступны:\n"
+            "• Подтверждение входа для новых заместителей\n"
             "• Уведомления о новых отчетах с кнопками Одобрить/Отклонить\n"
             "• Очередь на выдачу в игре (<code>/queue</code>)\n"
-            "• Список админов и управление заявками",
+            "• Список и снятие администраторов (<code>/admins</code>)",
             reply_markup=get_main_menu(uid),
             parse_mode="HTML"
         )
-    else:
-        await message.answer("❌ Неверный ключ администратора!")
+        return
+
+    # 2. Ключ Заместителя / Лидера (NEXUS-U1B23D-FRNP)
+    if key.upper() == DEPUTY_KEY.upper() or key == DEPUTY_KEY:
+        if is_admin(uid):
+            await message.answer(
+                "ℹ️ <b>Вы уже являетесь администратором бота!</b>\n"
+                "Все функции руководства доступны в меню ниже.",
+                reply_markup=get_main_menu(uid),
+                parse_mode="HTML"
+            )
+            return
+
+        # Уведомляем заместителя о том, что запрос отправлен
+        await message.answer(
+            "⏳ <b>Ключ заместителя принят! Запрос отправлен Главному Лидеру.</b>\n\n"
+            "Пожалуйста, ожидайте подтверждения. Как только Главный Руководитель нажмёт кнопку «Одобрить доступ», вам придёт уведомление и откроется админ-меню.",
+            parse_mode="HTML"
+        )
+
+        # Кому слать запрос: владельцам или существующим админам
+        recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
+        if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
+            recipients.append(int(ADMIN_CHAT_ID))
+        recipients = list(set(recipients))
+
+        if not recipients:
+            await message.answer(
+                "⚠️ <b>Внимание:</b> Главный Лидер ещё не авторизовался в боте по мастер-ключу.\n"
+                "Попросите его сначала зайти в бота и ввести свой мастер-ключ, после чего повторите команду.",
+                parse_mode="HTML"
+            )
+            return
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить доступ", callback_data=f"adm_grant_{uid}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_deny_{uid}")
+            ]
+        ])
+
+        username_str = f"(@{message.from_user.username})" if message.from_user.username else ""
+        req_msg = (
+            "👑 <b>Запрос на получение прав Администратора / Заместителя!</b>\n\n"
+            f"👤 <b>Агент:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
+            f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
+            f"📱 <b>Пользователь:</b> {html.escape(message.from_user.full_name)} {html.escape(username_str)}\n"
+            f"🔑 <b>Введённый ключ:</b> <code>{DEPUTY_KEY}</code>\n\n"
+            "Предоставить пользователю права руководства (проверка отчетов, очередь на выдачу, списание баллов)?"
+        )
+
+        for rec_id in recipients:
+            try:
+                await bot.send_message(rec_id, req_msg, reply_markup=kb, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"Could not send admin request to {rec_id}: {e}")
+        return
+
+    # 3. Неверный ключ
+    await message.answer(
+        "❌ <b>Неверный ключ доступа!</b>\n\n"
+        f"• Если вы заместитель: введите <code>/admin {DEPUTY_KEY}</code>\n"
+        "• Если вы владелец: используйте личный мастер-ключ.",
+        parse_mode="HTML"
+    )
+
+# Обработка одобрения доступа заму владельцем
+@dp.callback_query(F.data.startswith("adm_grant_"))
+async def callback_admin_grant(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав для подтверждения!", show_alert=True)
+        return
+
+    target_id = int(callback.data.replace("adm_grant_", ""))
+    target_user = users_db.get(str(target_id), {})
+    target_nick = target_user.get("nick", f"ID {target_id}")
+
+    if target_id not in admins_db:
+        admins_db.append(target_id)
+        save_json(ADMINS_FILE, admins_db)
+
+    # Обновляем карточку у владельца
+    await callback.message.edit_text(
+        callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> руководителем {callback.from_user.mention_html()}! Права успешно выданы.",
+        parse_mode="HTML"
+    )
+
+    # Уведомляем зама
+    try:
+        await bot.send_message(
+            target_id,
+            "🎉 <b>Главный Лидер одобрил ваш доступ!</b>\n\n"
+            "Вам успешно выданы права Администратора / Заместителя.\n"
+            "Теперь вам доступны:\n"
+            "• Уведомления о новых отчетах агентов с кнопками Одобрить/Отклонить\n"
+            "• Очередь на выдачу в игре (<code>/queue</code>)\n"
+            "• Просмотр списка админов\n\n"
+            "Меню бота обновлено ниже:",
+            reply_markup=get_main_menu(target_id),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify new admin {target_id}: {e}")
+
+    await callback.answer(f"✅ Доступ для {target_nick} успешно выдан!", show_alert=False)
+
+# Обработка отклонения доступа заму владельцем
+@dp.callback_query(F.data.startswith("adm_deny_"))
+async def callback_admin_deny(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("У вас нет прав!", show_alert=True)
+        return
+
+    target_id = int(callback.data.replace("adm_deny_", ""))
+    target_user = users_db.get(str(target_id), {})
+    target_nick = target_user.get("nick", f"ID {target_id}")
+
+    await callback.message.edit_text(
+        callback.message.text + f"\n\n❌ <b>ОТКЛОНЕНО</b> руководителем {callback.from_user.mention_html()}.",
+        parse_mode="HTML"
+    )
+
+    try:
+        await bot.send_message(
+            target_id,
+            "❌ <b>Главный Руководитель отклонил ваш запрос на получение прав администратора.</b>\n"
+            "Если произошла ошибка, обратитесь к лидеру напрямую.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify denied user {target_id}: {e}")
+
+    await callback.answer(f"Запрос от {target_nick} отклонён.", show_alert=False)
 
 # Команда настройки пароля Firebase прямо из Telegram
 @dp.message(Command("setpass"))
 async def cmd_set_firebase_pass(message: types.Message):
-    if message.from_user.id not in admins_db:
+    if not is_admin(message.from_user.id):
         await message.answer("Доступно только администраторам.")
         return
 
@@ -814,32 +985,37 @@ async def cmd_set_firebase_pass(message: types.Message):
 @dp.message(F.text == "👥 Список админов")
 @dp.message(Command("admins"))
 async def cmd_list_admins(message: types.Message):
-    if message.from_user.id not in admins_db:
+    if not is_admin(message.from_user.id):
         await message.answer("Доступно только руководству фракции.")
         return
 
-    text = f"👥 <b>Список администраторов и заместителей в боте ({len(admins_db)} чел.):</b>\n\n"
+    all_admins = list(set(owner_cfg.get("owner_ids", []) + admins_db))
+    text = f"👥 <b>Список руководства в боте ({len(all_admins)} чел.):</b>\n\n"
     kb_rows = []
 
-    for i, adm_id in enumerate(admins_db, 1):
+    for i, adm_id in enumerate(all_admins, 1):
         adm_user = users_db.get(str(adm_id), {})
         nick = adm_user.get("nick", "Ник не привязан")
         rank = adm_user.get("rank", "")
         rank_str = f" [{rank}]" if rank else ""
         username = f"(@{adm_user.get('telegram_username')})" if adm_user.get("telegram_username") else ""
         is_me = (adm_id == message.from_user.id)
+        is_own = adm_id in owner_cfg.get("owner_ids", [])
+        
+        role_label = " 👑 <b>(Владелец)</b>" if is_own else " ⭐ <i>(Заместитель)</i>"
         me_label = " <i>(Вы)</i>" if is_me else ""
 
-        text += f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_str)} {html.escape(username)}{me_label}\n   ID: <code>{adm_id}</code>\n\n"
+        text += f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_str)} {html.escape(username)}{role_label}{me_label}\n   ID: <code>{adm_id}</code>\n\n"
 
-        if not is_me:
+        # Снимать замов может только Главный Владелец
+        if not is_me and not is_own and is_owner(message.from_user.id):
             kb_rows.append([InlineKeyboardButton(text=f"❌ Снять {nick}", callback_data=f"remove_admin_{adm_id}")])
 
     text += (
         "💡 <b>Как добавить нового заместителя:</b>\n"
-        "Попросите его зайти в бота @frporp_bot и отправить команду:\n"
-        f"<code>/admin {html.escape(ADMIN_KEY)}</code>\n"
-        "После этого он сразу появится в этом списке и сможет одобрять отчеты."
+        "Передайте ему ключ для входа:\n"
+        f"<code>/admin {DEPUTY_KEY}</code>\n\n"
+        "После отправки команды вам в этот чат придёт запрос с кнопками <b>[Одобрить доступ]</b> / <b>[Отклонить]</b>."
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
@@ -847,8 +1023,8 @@ async def cmd_list_admins(message: types.Message):
 
 @dp.callback_query(F.data.startswith("remove_admin_"))
 async def process_remove_admin(callback: types.CallbackQuery):
-    if callback.from_user.id not in admins_db:
-        await callback.answer("У вас нет прав!", show_alert=True)
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только Главный Руководитель может снимать заместителей!", show_alert=True)
         return
 
     target_id = int(callback.data.replace("remove_admin_", ""))
@@ -856,10 +1032,14 @@ async def process_remove_admin(callback: types.CallbackQuery):
         await callback.answer("Нельзя снять самого себя!", show_alert=True)
         return
 
+    if target_id in owner_cfg.get("owner_ids", []):
+        await callback.answer("Нельзя снять Главного Владельца!", show_alert=True)
+        return
+
     if target_id in admins_db:
         admins_db.remove(target_id)
         save_json(ADMINS_FILE, admins_db)
-        await callback.answer("Администратор успешно снят!", show_alert=True)
+        await callback.answer("Заместитель успешно снят!", show_alert=True)
         try:
             await callback.message.delete()
         except Exception:
@@ -877,7 +1057,7 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
 @dp.message(Command("queue"))
 async def cmd_queue(message: types.Message):
-    if message.from_user.id not in admins_db:
+    if not is_admin(message.from_user.id):
         await message.answer("Доступно только руководству.")
         return
 
@@ -916,7 +1096,7 @@ async def cmd_queue(message: types.Message):
 # Быстрое списание 1 балла админом прямо из Telegram
 @dp.callback_query(F.data.startswith("issue_1_"))
 async def process_issue_one(callback: types.CallbackQuery):
-    if callback.from_user.id not in admins_db:
+    if not is_admin(callback.from_user.id):
         await callback.answer("У вас нет прав!", show_alert=True)
         return
 
