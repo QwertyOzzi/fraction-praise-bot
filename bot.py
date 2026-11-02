@@ -880,6 +880,101 @@ async def cancel_report(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Подача отчета отменена.")
 
+def pending_report_keyboard(req_id: str, req: Dict[str, Any]) -> InlineKeyboardMarkup:
+    qty = int(req.get("quantity", 1))
+    controls = []
+    if req.get("rep_type") == "praise":
+        controls.append([
+            InlineKeyboardButton(text="➖ 1", callback_data=f"qtyminus_{req_id}"),
+            InlineKeyboardButton(text=f"🌟 {qty}", callback_data=f"qtyshow_{req_id}"),
+            InlineKeyboardButton(text="➕ 1", callback_data=f"qtyplus_{req_id}")
+        ])
+    controls.append([
+        InlineKeyboardButton(text=f"✅ Одобрить (+{qty})", callback_data=f"approve_{req_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=controls)
+
+
+def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
+    qty = int(req.get("quantity", 1))
+    return (
+        f"📨 <b>Заявка #{html.escape(req_id)} ожидает решения</b>\n\n"
+        f"👤 <b>Агент:</b> <code>{html.escape(str(req.get('nick') or ''))}</code> "
+        f"[{html.escape(str(req.get('rank') or '?'))}]\n"
+        f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
+        f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
+        f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
+        "Нажмите ➖/➕, чтобы изменить количество похвал, затем одобрите или отклоните."
+    )
+
+
+async def send_pending_report_to_admin(chat_id: int, req_id: str, req: Dict[str, Any]) -> None:
+    sent = await bot.send_message(chat_id, pending_report_text(req_id, req),
+                                  reply_markup=pending_report_keyboard(req_id, req),
+                                  disable_web_page_preview=True, parse_mode="HTML")
+    refs = req.setdefault("admin_messages", [])
+    refs.append({"chat_id": chat_id, "message_id": sent.message_id})
+    try:
+        await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id,
+                                   disable_notification=True)
+    except Exception as exc:
+        logger.info(f"Could not pin pending report in {chat_id}: {exc}")
+
+
+async def refresh_pending_report_messages(req_id: str, req: Dict[str, Any]) -> None:
+    for info in req.get("admin_messages", []):
+        try:
+            await bot.edit_message_text(
+                pending_report_text(req_id, req), chat_id=int(info["chat_id"]),
+                message_id=int(info["message_id"]),
+                reply_markup=pending_report_keyboard(req_id, req),
+                parse_mode="HTML", disable_web_page_preview=True
+            )
+        except Exception as exc:
+            logger.info(f"Could not refresh pending report: {exc}")
+
+
+async def close_pending_report_messages(req_id: str, req: Dict[str, Any], result: str) -> None:
+    text = pending_report_text(req_id, req) + f"\n\n{html.escape(result)}"
+    for info in req.get("admin_messages", []):
+        try:
+            await bot.edit_message_text(text, chat_id=int(info["chat_id"]),
+                                        message_id=int(info["message_id"]),
+                                        parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as exc:
+            logger.info(f"Could not close report notification: {exc}")
+        try:
+            await bot.unpin_chat_message(chat_id=int(info["chat_id"]),
+                                         message_id=int(info["message_id"]))
+        except Exception as exc:
+            logger.info(f"Could not unpin completed report: {exc}")
+
+
+@dp.callback_query(F.data.startswith("qtyshow_"))
+async def show_report_quantity(callback: types.CallbackQuery):
+    await callback.answer("Используйте ➖/➕, чтобы изменить количество.")
+
+
+@dp.callback_query(F.data.startswith("qtyplus_") | F.data.startswith("qtyminus_"))
+async def adjust_report_quantity(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    plus = callback.data.startswith("qtyplus_")
+    req_id = callback.data.split("_", 1)[1]
+    req = requests_db.get(req_id)
+    if not req or req.get("status") != "pending" or req.get("rep_type") != "praise":
+        await callback.answer("Заявка уже закрыта или не найдена.", show_alert=True)
+        return
+    new_qty = max(1, min(20, int(req.get("quantity", 1)) + (1 if plus else -1)))
+    req["quantity"] = new_qty
+    save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
+    await refresh_pending_report_messages(req_id, req)
+    await callback.answer(f"Количество похвал: {new_qty}")
+
+
 @dp.callback_query(ReportStates.confirm, F.data == "send_report_confirm")
 async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -910,30 +1005,15 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         parse_mode="HTML"
     )
 
-    # Уведомляем руководство
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить (+1)", callback_data=f"approve_{req_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
-        ]
-    ])
-
-    admin_msg = (
-        f"📨 <b>Новый отчет на выдачу #{req_id}</b>\n\n"
-        f"👤 <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
-        f"📌 <b>Тип:</b> <code>/{data['rep_type']}</code> (+1)\n"
-        f"📝 <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
-        f"🔗 <b>Доказательства:</b> {html.escape(data['proof'])}\n\n"
-        f"Выберите действие:"
-    )
-
-    # Отправляем всем админам и владельцам
-    recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
+    # Every pending request gets its own pinned administrator message.
+    recipients = set(owner_cfg.get("owner_ids", []) + admins_db)
     for adm_id in recipients:
         try:
-            await bot.send_message(adm_id, admin_msg, reply_markup=admin_kb, disable_web_page_preview=True, parse_mode="HTML")
-        except Exception as e:
-            logger.warning(f"Could not send to admin {adm_id}: {e}")
+            await send_pending_report_to_admin(adm_id, req_id, requests_db[req_id])
+        except Exception as exc:
+            logger.warning(f"Could not notify admin {adm_id}: {exc}")
+    save_json(REQUESTS_FILE, requests_db)
+    await sync_state_to_cloud()
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  ОДОБРЕНИЕ / ОТКЛОНЕНИЕ ОТЧЕТА АДМИНОМ                          ║
@@ -952,7 +1032,8 @@ async def approve_report(callback: types.CallbackQuery):
 
     try:
         success = await firebase_client.credit_report(
-            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"], req_id
+            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"], req_id,
+            quantity=int(req.get("quantity", 1))
         )
         if success:
             req["status"] = "approved"
@@ -960,12 +1041,9 @@ async def approve_report(callback: types.CallbackQuery):
             save_json(REQUESTS_FILE, requests_db)
             notify_state_changed()
             await callback.answer("✅ База данных обновлена!", show_alert=False)
-            await callback.message.edit_text(
-                callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> {callback.from_user.mention_html()}",
-                parse_mode="HTML"
-            )
+            await close_pending_report_messages(req_id, req, f"✅ ОДОБРЕНО: +{req.get('quantity', 1)} ({callback.from_user.full_name})")
             try:
-                await bot.send_message(int(req["user_id"]), f"✅ Отчет #{req_id} одобрен. Начислен +1 балл.")
+                await bot.send_message(int(req["user_id"]), f"✅ Отчет #{req_id} одобрен. Начислено +{req.get('quantity', 1)} балл(ов).")
             except Exception as exc:
                 logger.warning(f"Could not notify reporter: {exc}")
         else:
@@ -991,10 +1069,7 @@ async def reject_report(callback: types.CallbackQuery):
     save_json(REQUESTS_FILE, requests_db)
     notify_state_changed()
 
-    await callback.message.edit_text(
-        callback.message.text + f"\n\n❌ <b>ОТКЛОНЕНО</b> лидером {callback.from_user.mention_html()}",
-        parse_mode="HTML"
-    )
+    await close_pending_report_messages(req_id, req, f"❌ ОТКЛОНЕНО ({callback.from_user.full_name})")
 
     try:
         await bot.send_message(
