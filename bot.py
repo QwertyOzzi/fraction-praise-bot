@@ -29,10 +29,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
-OWNER_KEY = os.getenv("OWNER_KEY", "kiidsg12#$$").strip()
+OWNER_TELEGRAM_IDS = {6060562962}
 # 2. Ключ для лидеров и заместителей (требует подтверждения владельца)
-DEPUTY_KEY = os.getenv("DEPUTY_KEY", "NEXUS-U1B23D-FRNP").strip()
-ADMIN_KEY = OWNER_KEY  # совместимость
+DEPUTY_KEY = os.getenv("DEPUTY_KEY", "").strip()
+ADMIN_KEY = ""  # legacy compatibility; owner access is Telegram ID-based
 
 # Информация о Лидере (назначается Тех. Администратором через сайт)
 LEADER_INFO: Dict[str, str] = {
@@ -69,11 +69,10 @@ def save_json(filepath: str, data: Any):
 
 # Firebase credentials with reliable defaults & file persistence
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "fraction-praise").strip()
-FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "AIzaSyBX7JWz6ay-ozED5ZmKoC7Umn58ae2lvIE").strip()
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "").strip()
 FIREBASE_EMAIL = os.getenv("FIREBASE_EMAIL", "goponos12@gmail.com").strip()
 
-_saved_fb_cfg = load_json("firebase_config.json", {})
-FIREBASE_PASSWORD = os.getenv("FIREBASE_PASSWORD", _saved_fb_cfg.get("FIREBASE_PASSWORD", "sCeARB6ep98d2AQ")).strip()
+FIREBASE_PASSWORD = os.getenv("FIREBASE_PASSWORD", "").strip()
 
 WEBAPP_URL = "https://qwertyozzi.github.io/fraction-praise-tracker/"
 
@@ -83,7 +82,7 @@ logger = logging.getLogger(__name__)
 users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
-owner_cfg: Dict[str, Any] = load_json(OWNER_FILE, {"owner_ids": []})
+owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
@@ -92,10 +91,10 @@ if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
         save_json(ADMINS_FILE, admins_db)
 
 def is_admin(user_id: int) -> bool:
-    return user_id in admins_db or user_id in owner_cfg.get("owner_ids", [])
+    return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
 
 def is_owner(user_id: int) -> bool:
-    return user_id in owner_cfg.get("owner_ids", [])
+    return user_id in OWNER_TELEGRAM_IDS
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FIREBASE REST CLIENT                                            ║
@@ -106,9 +105,6 @@ class FirebaseClient:
         self.api_key = api_key
         self.email = email
         self.password = password
-        if not self.password:
-            saved_cfg = load_json("firebase_config.json", {})
-            self.password = saved_cfg.get("FIREBASE_PASSWORD", "sCeARB6ep98d2AQ")
         self.id_token: Optional[str] = None
         self.token_expiry = 0
 
@@ -136,10 +132,6 @@ class FirebaseClient:
                     else:
                         err_text = await resp.text()
                         logger.warning(f"Firebase Auth failed ({resp.status}): {err_text}")
-                        if self.password != "sCeARB6ep98d2AQ":
-                            logger.info("Retrying Firebase Auth with verified fallback password...")
-                            self.password = "sCeARB6ep98d2AQ"
-                            return await self.get_token()
                         return None
         except Exception as e:
             logger.error(f"Error getting Firebase token: {e}")
@@ -162,10 +154,10 @@ class FirebaseClient:
                         return self._parse_firestore_rows(rows_field)
                     else:
                         logger.warning(f"Failed to fetch {sheet_name} from Firestore: {resp.status}")
-                        return []
+                        raise RuntimeError(f"Firestore read failed: {resp.status}")
         except Exception as e:
             logger.error(f"Error fetching sheet {sheet_name}: {e}")
-            return []
+            raise
 
     async def update_sheet(self, sheet_name: str, rows: List[Dict[str, Any]]) -> bool:
         token = await self.get_token()
@@ -189,7 +181,7 @@ class FirebaseClient:
 
         try:
             async with ClientSession() as session:
-                async with session.patch(url, headers=headers, json=body) as resp:
+                async with session.patch(url, headers=headers, params=[("updateMask.fieldPaths", "rows"), ("updateMask.fieldPaths", "updatedAt")], json=body) as resp:
                     if resp.status == 200:
                         logger.info(f"Successfully updated {sheet_name} in Firestore")
                         return True
@@ -200,6 +192,51 @@ class FirebaseClient:
         except Exception as e:
             logger.error(f"Error updating sheet {sheet_name}: {e}")
             return False
+
+    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str, report_id: str) -> bool:
+        """Optimistic Firestore concurrency control for a single credit."""
+        if sheet_name not in ("fractionrp", "praise"):
+            raise ValueError("Unknown sheet")
+        token = await self.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/sheets/{sheet_name}"
+        headers = {"Authorization": f"Bearer {token}"}
+        for attempt in range(5):
+            async with ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Firestore read failed: {response.status}")
+                    data = await response.json()
+                    revision = data.get("updateTime")
+                    applied_field = data.get("fields", {}).get("appliedReportIds", {}).get("arrayValue", {}).get("values", [])
+                    applied_ids = [v["stringValue"] for v in applied_field if isinstance(v, dict) and isinstance(v.get("stringValue"), str)]
+                    if report_id in applied_ids:
+                        return True
+                    if not revision:
+                        raise RuntimeError("Firestore version missing")
+                    rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                existing = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
+                proof = {"text": reason, "links": [{"text": reason, "url": proof_url}]}
+                if existing:
+                    existing["qty"] = int(existing.get("qty") or 0) + 1
+                    existing["status"] = "На выдаче"
+                    existing["proof"] = proof
+                else:
+                    rows.append({"id": str(int(datetime.now().timestamp() * 1000000)),
+                                 "fullName": f"{nick} ({rank})", "nick": nick,
+                                 "rank": rank, "status": "На выдаче", "qty": 1, "proof": proof})
+                payload = {"fields": {"rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
+                                      "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()},
+                                      "appliedReportIds": {"arrayValue": {"values": [{"stringValue": report} for report in [*applied_ids, report_id]]}}}}
+                async with session.patch(url, headers={**headers, "Content-Type": "application/json"},
+                                         params={"currentDocument.updateTime": revision}, json=payload) as response:
+                    if response.status == 200:
+                        return True
+                    if response.status not in (409, 412):
+                        raise RuntimeError(f"Firestore write failed: {response.status}")
+            await asyncio.sleep(0.1 * (attempt + 1))
+        raise RuntimeError("Concurrent modifications: retry limit reached")
 
     def _parse_firestore_rows(self, values: list) -> List[Dict[str, Any]]:
         rows = []
@@ -355,14 +392,9 @@ async def sync_state_from_cloud():
                         users_db[str(uid)] = udata
 
                     cloud_admins = cloud_data.get("admins", [])
-                    for aid in cloud_admins:
-                        if int(aid) not in admins_db:
-                            admins_db.append(int(aid))
+                    # Cloud-stored admins are not a source of authorization.\n                    # Only previously approved local admins remain trusted.
 
-                    cloud_owners = cloud_data.get("owners", [])
-                    for oid in cloud_owners:
-                        if int(oid) not in owner_cfg.setdefault("owner_ids", []):
-                            owner_cfg["owner_ids"].append(int(oid))
+                    owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
 
                     cloud_requests = cloud_data.get("requests", {})
                     for rid, rdata in cloud_requests.items():
@@ -376,16 +408,15 @@ async def sync_state_from_cloud():
 
         # Также загружаем настройки системы (Лидер, назначенный через сайт, и ключ замов)
         settings_url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
+        settings_token = await firebase_client.get_token()
+        settings_headers = {"Authorization": f"Bearer {settings_token}"} if settings_token else {}
         async with ClientSession() as session:
-            async with session.get(settings_url) as resp:
+            async with session.get(settings_url, headers=settings_headers) as resp:
                 if resp.status == 200:
                     s_data = await resp.json()
                     fields = s_data.get("fields", {})
                     global DEPUTY_KEY, LEADER_INFO
-                    if "deputyKey" in fields:
-                        custom_key = fields["deputyKey"].get("stringValue", "").strip()
-                        if custom_key:
-                            DEPUTY_KEY = custom_key
+                    # Never load shared administrator credentials from client-readable Firestore documents.
                     if "leaderNick" in fields:
                         LEADER_INFO["nick"] = fields["leaderNick"].get("stringValue", "").strip()
                     if "leaderRank" in fields:
@@ -394,7 +425,7 @@ async def sync_state_from_cloud():
                         LEADER_INFO["contact"] = fields["leaderContact"].get("stringValue", "").strip()
                     if "techAdminNick" in fields:
                         LEADER_INFO["tech_nick"] = fields["techAdminNick"].get("stringValue", "").strip()
-                    logger.info(f"Loaded cloud settings: Leader={LEADER_INFO.get('nick')}, DeputyKey={DEPUTY_KEY}")
+                    logger.info("Loaded cloud settings")
     except Exception as e:
         logger.warning(f"Could not load state from Firestore: {e}")
 
@@ -525,7 +556,7 @@ async def process_nick(message: types.Message, state: FSMContext):
     text_val = (message.text or "").strip()
 
     # Если пользователь ввёл ключ напрямую или нажал команду /admin
-    if text_val.startswith("/admin") or text_val.upper() == DEPUTY_KEY.upper() or text_val == OWNER_KEY:
+    if text_val.startswith("/admin") or (DEPUTY_KEY and text_val == DEPUTY_KEY):
         if not text_val.startswith("/admin"):
             message.text = f"/admin {text_val}"
         await cmd_admin_auth(message, state)
@@ -825,64 +856,26 @@ async def approve_report(callback: types.CallbackQuery):
         await callback.answer("Заявка уже была обработана ранее!", show_alert=True)
         return
 
-    req["status"] = "approved"
-    req["approved_by"] = callback.from_user.full_name
-    save_json(REQUESTS_FILE, requests_db)
-    notify_state_changed()
-
-    # Обновляем сообщение у админа
-    await callback.message.edit_text(
-        callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> лидером {callback.from_user.mention_html()} (+1 балл добавлен в таблицу)",
-        parse_mode="HTML"
-    )
-
-    # Уведомляем игрока
     try:
-        await bot.send_message(
-            int(req["user_id"]),
-            f"🎉 <b>Ваш отчет #{req_id} на /{req['rep_type']} ОДОБРЕН!</b>\n\n"
-            f"Вам начислен <b>+1 балл</b> (статус «На выдаче»). Ожидайте выдачи в игре!",
-            parse_mode="HTML"
+        success = await firebase_client.credit_report(
+            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"], req_id
         )
-    except Exception as e:
-        logger.error(f"Error notifying user: {e}")
-
-    # Обновляем таблицу в Firestore
-    sheet_name = req["rep_type"]
-    nick = req["nick"]
-    rank = req.get("rank", "8")
-    proof_url = req["proof"]
-
-    try:
-        rows = await firebase_client.get_sheet(sheet_name)
-        existing = next((r for r in rows if r.get("nick", "").lower() == nick.lower()), None)
-
-        if existing:
-            existing["qty"] = (existing.get("qty") or 0) + 1
-            existing["status"] = "На выдаче"
-            existing["proof"] = {
-                "text": req["reason"],
-                "links": [{"text": req["reason"], "url": proof_url}]
-            }
-        else:
-            rows.append({
-                "id": str(int(datetime.now().timestamp())),
-                "fullName": f"{nick} ({rank})",
-                "nick": nick,
-                "rank": rank,
-                "status": "На выдаче",
-                "qty": 1,
-                "proof": {
-                    "text": req["reason"],
-                    "links": [{"text": req["reason"], "url": proof_url}]
-                }
-            })
-
-        success = await firebase_client.update_sheet(sheet_name, rows)
         if success:
+            req["status"] = "approved"
+            req["approved_by"] = callback.from_user.full_name
+            save_json(REQUESTS_FILE, requests_db)
+            notify_state_changed()
             await callback.answer("✅ База данных обновлена!", show_alert=False)
+            await callback.message.edit_text(
+                callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> {callback.from_user.mention_html()}",
+                parse_mode="HTML"
+            )
+            try:
+                await bot.send_message(int(req["user_id"]), f"✅ Отчет #{req_id} одобрен. Начислен +1 балл.")
+            except Exception as exc:
+                logger.warning(f"Could not notify reporter: {exc}")
         else:
-            await callback.answer("⚠️ Одобрено локально (проверьте пароль Firebase /setpass)", show_alert=True)
+            await callback.answer("⚠️ Firebase не обновился. Заявка остаётся ожидающей.", show_alert=True)
     except Exception as e:
         logger.error(f"Error updating sheet on approve: {e}")
         await callback.answer(f"⚠️ Ошибка базы данных: {e}", show_alert=True)
@@ -933,11 +926,11 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     rank = user_data.get("rank", "?")
 
     args = message.text.split(maxsplit=1)
-    if len(args) < 2:
+    if len(args) < 2 and uid not in OWNER_TELEGRAM_IDS:
         await message.answer(
             "ℹ️ <b>Авторизация в системе руководства:</b>\n\n"
             "• <b>Для заместителей и лидеров:</b>\n"
-            f"Отправьте команду: <code>/admin {DEPUTY_KEY}</code>\n"
+            "Используйте команду /admin с вашим персональным ключом.\n"
             "<i>(После отправки запрос поступит Главному Лидеру на одобрение)</i>\n\n"
             "• <b>Для Главного Руководителя:</b>\n"
             "Используйте ваш личный мастер-ключ: <code>/admin мастер_ключ</code>",
@@ -948,17 +941,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     key = args[1].strip().strip('"').strip("'")
     
     # 1. Мастер-ключи Владельца (мгновенный вход без подтверждений)
-    valid_owner_keys = {
-        OWNER_KEY.strip().strip('"').strip("'"),
-        "kiidsg12#$$",
-        "kiidsg12",
-        "arizona1234"
-    }
-
-    if key in valid_owner_keys or key.startswith("kiidsg12"):
-        if uid not in owner_cfg.get("owner_ids", []):
-            owner_cfg.setdefault("owner_ids", []).append(uid)
-            save_json(OWNER_FILE, owner_cfg)
+    if uid in OWNER_TELEGRAM_IDS:
         if uid not in admins_db:
             admins_db.append(uid)
             save_json(ADMINS_FILE, admins_db)
@@ -969,7 +952,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             "🛠️ <b>Вы успешно авторизованы как ГЛАВНЫЙ ТЕХНИЧЕСКИЙ АДМИНИСТРАТОР!</b>\n\n"
             f"👑 <b>Действующий Лидер фракции:</b> <code>{lead_nick}</code>\n"
             "<i>(Лидера вы можете в любой момент назначить или сменить через Панель управления на сайте)</i>\n\n"
-            f"🔑 <b>Текущий ключ для заместителей:</b> <code>{DEPUTY_KEY}</code>\n"
+            "🔑 Ключ заместителя задаётся только в настройках Render.\n"
             "Когда заместитель вводит этот ключ, вам в личные сообщения бота приходит запрос с кнопками «Одобрить» / «Отклонить».\n\n"
             "Вам доступны:\n"
             "• Подтверждение доступа для новых заместителей\n"
@@ -981,8 +964,8 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
         return
 
-    # 2. Ключ Заместителя / Лидера (NEXUS-U1B23D-FRNP)
-    if key.upper() == DEPUTY_KEY.upper() or key == DEPUTY_KEY:
+    # 2. Ключ Заместителя / Лидера ()
+    if DEPUTY_KEY and key == DEPUTY_KEY:
         if is_admin(uid):
             await message.answer(
                 "ℹ️ <b>Вы уже являетесь администратором бота!</b>\n"
@@ -1026,7 +1009,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             f"👤 <b>Агент:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
             f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
             f"📱 <b>Пользователь:</b> {html.escape(message.from_user.full_name)} {html.escape(username_str)}\n"
-            f"🔑 <b>Введённый ключ:</b> <code>{DEPUTY_KEY}</code>\n\n"
+            f"🔑 <b>Введённый ключ:</b> выданный ключ\n\n"
             "Предоставить пользователю права руководства (проверка отчетов, очередь на выдачу, списание баллов)?"
         )
 
@@ -1040,7 +1023,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     # 3. Неверный ключ
     await message.answer(
         "❌ <b>Неверный ключ доступа!</b>\n\n"
-        f"• Если вы заместитель: введите <code>/admin {DEPUTY_KEY}</code>\n"
+        f"• Если вы заместитель: введите <code>/admin [KEY REDACTED]</code>\n"
         "• Если вы владелец: используйте личный мастер-ключ.",
         parse_mode="HTML"
     )
@@ -1117,49 +1100,8 @@ async def callback_admin_deny(callback: types.CallbackQuery):
 # Команда настройки пароля Firebase прямо из Telegram
 @dp.message(Command("setpass"))
 async def cmd_set_firebase_pass(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступно только администраторам.")
-        return
+    await message.answer("Настройте FIREBASE_PASSWORD в Render Environment. Передавать пароль боту запрещено.")
 
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer(
-            "ℹ️ <b>Привязка пароля Firebase к боту:</b>\n\n"
-            "Использование: <code>/setpass ваш_пароль_от_Firebase</code>\n\n"
-            "<i>(Введите пароль, который вы задали для <code>goponos12@gmail.com</code> в Firebase Console)</i>",
-            parse_mode="HTML"
-        )
-        return
-
-    new_pass = args[1].strip()
-    await message.answer("🔄 Проверяю подключение к Firebase с этим паролем...")
-
-    # Тестируем авторизацию
-    firebase_client.password = new_pass
-    token = await firebase_client.get_token()
-
-    if token:
-        # Сохраняем в конфиг
-        cfg = load_json("firebase_config.json", {})
-        cfg["FIREBASE_PASSWORD"] = new_pass
-        save_json("firebase_config.json", cfg)
-
-        await message.answer(
-            "✅ <b>Связь с Firebase успешно установлена!</b>\n\n"
-            "Токен доступа получен. Теперь все одобрения в боте будут мгновенно появляться в таблице на сайте!",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            "❌ <b>Ошибка авторизации в Firebase!</b>\n\n"
-            "Firebase отклонил этот пароль для почты <code>goponos12@gmail.com</code>.\n\n"
-            "Проверьте, что в Firebase Console ➔ Authentication ➔ Users у пользователя <code>goponos12@gmail.com</code> задан именно этот пароль.",
-            parse_mode="HTML"
-        )
-
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║  СПИСОК АДМИНИСТРАТОРОВ / ЗАМЕСТИТЕЛЕЙ                           ║
-# ╚══════════════════════════════════════════════════════════════════╝
 @dp.message(F.text == "👥 Список админов")
 @dp.message(Command("admins"))
 async def cmd_list_admins(message: types.Message):
@@ -1204,7 +1146,7 @@ async def cmd_list_admins(message: types.Message):
     text += (
         "💡 <b>Как добавить нового заместителя:</b>\n"
         "Передайте ему ключ для входа:\n"
-        f"<code>/admin {DEPUTY_KEY}</code>\n\n"
+        f"<code>/admin [KEY REDACTED]</code>\n\n"
         "После отправки команды вам в этот чат придёт запрос с кнопками <b>[Одобрить доступ]</b> / <b>[Отклонить]</b>."
     )
 
@@ -1417,12 +1359,11 @@ async def handle_ping(request):
         "service": "FractionRp Telegram Bot",
         "bot_username": "frporp_bot",
         "leader": LEADER_INFO.get("nick", "Не назначен"),
-        "deputy_key": DEPUTY_KEY,
-        "token_ok": bool(await firebase_client.get_token()),
-        "auth_email": firebase_client.email,
         "time": datetime.now(timezone.utc).isoformat()
     }
     return web.json_response(data, headers=headers)
+
+_support_rate_history: Dict[str, List[float]] = {}
 
 async def handle_api_support(request):
     headers = {
@@ -1433,15 +1374,32 @@ async def handle_api_support(request):
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=headers)
 
+    client_ip = request.remote or "unknown"
+    now = datetime.now(timezone.utc).timestamp()
+    # Small bounded in-process limiter; add provider-level rate limiting for multi-instance hosting.
+    for ip, timestamps in list(_support_rate_history.items()):
+        recent = [t for t in timestamps if now - t < 60]
+        if recent:
+            _support_rate_history[ip] = recent
+        else:
+            del _support_rate_history[ip]
+    attempts = _support_rate_history.setdefault(client_ip, [])
+    if len(attempts) >= 5:
+        return web.json_response({"error": "Too many requests"}, status=429, headers=headers)
+    attempts.append(now)
+    if request.content_length is None or request.content_length > 12000:
+        return web.json_response({"error": "Invalid request size"}, status=413, headers=headers)
     try:
         data = await request.json()
+        if not isinstance(data, dict):
+            return web.json_response({"error": "Invalid payload"}, status=400, headers=headers)
         nick = str(data.get("nick", "Аноним")).strip()
         contact = str(data.get("contact", "Не указан")).strip()
         category = str(data.get("category", "Баг / Ошибка")).strip()
         description = str(data.get("description", "")).strip()
         screenshot = str(data.get("screenshot", "")).strip()
 
-        if not nick or not description:
+        if not nick or not description or len(nick) > 80 or len(description) > 4000 or len(contact) > 200 or len(category) > 80 or len(screenshot) > 1000:
             return web.json_response({"error": "Missing nick or description"}, status=400, headers=headers)
 
         ticket_payload = {
@@ -1501,8 +1459,8 @@ async def start_web_server():
 # ║  MAIN ENTRY POINT                                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
 async def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not configured!")
+    if not BOT_TOKEN or not FIREBASE_PASSWORD or not FIREBASE_API_KEY:
+        logger.error("Required credentials are not configured!")
         return
 
     # Загружаем сохранённое состояние (все юзеры, админы, замы) из Firestore
