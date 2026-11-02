@@ -34,6 +34,14 @@ OWNER_KEY = os.getenv("OWNER_KEY", "kiidsg12#$$").strip()
 DEPUTY_KEY = os.getenv("DEPUTY_KEY", "NEXUS-U1B23D-FRNP").strip()
 ADMIN_KEY = OWNER_KEY  # совместимость
 
+# Информация о Лидере (назначается Тех. Администратором через сайт)
+LEADER_INFO: Dict[str, str] = {
+    "nick": "Samuel_Norton",
+    "rank": "10 (Лидер)",
+    "contact": "",
+    "tech_nick": "Gopon (Тех. Администратор)"
+}
+
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -322,6 +330,28 @@ async def sync_state_from_cloud():
                     save_json(OWNER_FILE, owner_cfg)
                     save_json(REQUESTS_FILE, requests_db)
                     logger.info(f"Loaded cloud bot state: {len(users_db)} users, {len(admins_db)} admins, {len(owner_cfg.get('owner_ids', []))} owners")
+
+        # Также загружаем настройки системы (Лидер, назначенный через сайт, и ключ замов)
+        settings_url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
+        async with ClientSession() as session:
+            async with session.get(settings_url) as resp:
+                if resp.status == 200:
+                    s_data = await resp.json()
+                    fields = s_data.get("fields", {})
+                    global DEPUTY_KEY, LEADER_INFO
+                    if "deputyKey" in fields:
+                        custom_key = fields["deputyKey"].get("stringValue", "").strip()
+                        if custom_key:
+                            DEPUTY_KEY = custom_key
+                    if "leaderNick" in fields:
+                        LEADER_INFO["nick"] = fields["leaderNick"].get("stringValue", "").strip()
+                    if "leaderRank" in fields:
+                        LEADER_INFO["rank"] = fields["leaderRank"].get("stringValue", "").strip()
+                    if "leaderContact" in fields:
+                        LEADER_INFO["contact"] = fields["leaderContact"].get("stringValue", "").strip()
+                    if "techAdminNick" in fields:
+                        LEADER_INFO["tech_nick"] = fields["techAdminNick"].get("stringValue", "").strip()
+                    logger.info(f"Loaded cloud settings: Leader={LEADER_INFO.get('nick')}, DeputyKey={DEPUTY_KEY}")
     except Exception as e:
         logger.warning(f"Could not load state from Firestore: {e}")
 
@@ -891,15 +921,18 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             save_json(ADMINS_FILE, admins_db)
         notify_state_changed()
 
+        lead_nick = html.escape(LEADER_INFO.get("nick", "Не назначен"))
         await message.answer(
-            "👑 <b>Вы успешно авторизованы как ГЛАВНЫЙ РУКОВОДИТЕЛЬ (Владелец)!</b>\n\n"
-            f"🔑 <b>Ключ для ваших заместителей:</b> <code>{DEPUTY_KEY}</code>\n"
+            "🛠️ <b>Вы успешно авторизованы как ГЛАВНЫЙ ТЕХНИЧЕСКИЙ АДМИНИСТРАТОР!</b>\n\n"
+            f"👑 <b>Действующий Лидер фракции:</b> <code>{lead_nick}</code>\n"
+            "<i>(Лидера вы можете в любой момент назначить или сменить через Панель управления на сайте)</i>\n\n"
+            f"🔑 <b>Текущий ключ для заместителей:</b> <code>{DEPUTY_KEY}</code>\n"
             "Когда заместитель вводит этот ключ, вам в личные сообщения бота приходит запрос с кнопками «Одобрить» / «Отклонить».\n\n"
             "Вам доступны:\n"
-            "• Подтверждение входа для новых заместителей\n"
-            "• Уведомления о новых отчетах с кнопками Одобрить/Отклонить\n"
+            "• Подтверждение доступа для новых заместителей\n"
             "• Очередь на выдачу в игре (<code>/queue</code>)\n"
-            "• Список и снятие администраторов (<code>/admins</code>)",
+            "• Просмотр и снятие заместителей (<code>/admins</code>)\n"
+            "• Мониторинг всех заявок и обращений",
             reply_markup=get_main_menu(uid),
             parse_mode="HTML"
         )
@@ -1092,7 +1125,19 @@ async def cmd_list_admins(message: types.Message):
         return
 
     all_admins = list(set(owner_cfg.get("owner_ids", []) + admins_db))
-    text = f"👥 <b>Список руководства в боте ({len(all_admins)} чел.):</b>\n\n"
+    lead_nick = html.escape(LEADER_INFO.get("nick", "Не назначен"))
+    lead_rank = html.escape(str(LEADER_INFO.get("rank", "10")))
+    tech_nick = html.escape(LEADER_INFO.get("tech_nick", "Gopon"))
+
+    text = (
+        f"👥 <b>Руководство фракции и системы:</b>\n\n"
+        f"🛠️ <b>Главный Тех. Администратор:</b>\n"
+        f"• <b>{tech_nick}</b> 👑 <i>(Создатель системы)</i>\n\n"
+        f"👑 <b>Действующий Лидер фракции:</b>\n"
+        f"• <b>{lead_nick}</b> [{lead_rank}]\n"
+        f"<i>(Лидер назначается Тех. Администратором через Панель управления на сайте)</i>\n\n"
+        f"⭐ <b>Авторизованные Заместители в боте ({len(all_admins)} чел.):</b>\n"
+    )
     kb_rows = []
 
     for i, adm_id in enumerate(all_admins, 1):
@@ -1295,7 +1340,22 @@ async def process_support_msg(message: types.Message, state: FSMContext):
 # ║  DUMMY WEB SERVER ДЛЯ RENDER (STAY-ALIVE)                        ║
 # ╚══════════════════════════════════════════════════════════════════╝
 async def handle_ping(request):
-    return web.Response(text="FractionRp Telegram Bot is Running 24/7!", status=200)
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+    }
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=headers)
+    data = {
+        "status": "online",
+        "service": "FractionRp Telegram Bot",
+        "bot_username": "frporp_bot",
+        "leader": LEADER_INFO.get("nick", "Не назначен"),
+        "deputy_key": DEPUTY_KEY,
+        "time": datetime.now(timezone.utc).isoformat()
+    }
+    return web.json_response(data, headers=headers)
 
 async def start_web_server():
     app = web.Application()
