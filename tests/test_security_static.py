@@ -41,7 +41,7 @@ class BotSecurityChecks(unittest.TestCase):
 
     def test_report_quantities_and_pins(self):
         self.assertIn("waiting_for_quantity = State()", SOURCE)
-        self.assertIn("quantity=int(req.get(", SOURCE)
+        self.assertIn("quantity=quantity", SOURCE)
         self.assertIn("pin_chat_message", SOURCE)
         self.assertIn("unpin_chat_message", SOURCE)
         self.assertIn("async def adjust_report_quantity(", SOURCE)
