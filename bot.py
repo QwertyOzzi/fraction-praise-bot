@@ -80,6 +80,10 @@ class FirebaseClient:
         self.api_key = api_key
         self.email = email
         self.password = password
+        # Проверяем локальный конфиг, если в env не задан
+        if not self.password:
+            saved_cfg = load_json("firebase_config.json", {})
+            self.password = saved_cfg.get("FIREBASE_PASSWORD", "")
         self.id_token: Optional[str] = None
         self.token_expiry = 0
 
@@ -172,6 +176,17 @@ class FirebaseClient:
         rows = []
         for v in values:
             mv = v.get("mapValue", {}).get("fields", {})
+            proof_mv = mv.get("proof", {}).get("mapValue", {}).get("fields", {})
+            
+            raw_links = proof_mv.get("links", {}).get("arrayValue", {}).get("values", [])
+            links = []
+            for l in raw_links:
+                lmv = l.get("mapValue", {}).get("fields", {})
+                links.append({
+                    "text": lmv.get("text", {}).get("stringValue", ""),
+                    "url": lmv.get("url", {}).get("stringValue", "")
+                })
+
             rows.append({
                 "id": mv.get("id", {}).get("stringValue", ""),
                 "fullName": mv.get("fullName", {}).get("stringValue", ""),
@@ -180,8 +195,8 @@ class FirebaseClient:
                 "status": mv.get("status", {}).get("stringValue", "Выдано"),
                 "qty": int(mv.get("qty", {}).get("integerValue", 0)),
                 "proof": {
-                    "text": mv.get("proof", {}).get("mapValue", {}).get("fields", {}).get("text", {}).get("stringValue", ""),
-                    "links": []
+                    "text": proof_mv.get("text", {}).get("stringValue", ""),
+                    "links": links
                 }
             })
         return rows
@@ -654,6 +669,49 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
     else:
         await message.answer("❌ Неверный ключ администратора!")
+
+# Команда настройки пароля Firebase прямо из Telegram
+@dp.message(Command("setpass"))
+async def cmd_set_firebase_pass(message: types.Message):
+    if message.from_user.id not in admins_db:
+        await message.answer("Доступно только администраторам.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "ℹ️ **Привязка пароля Firebase к боту:**\n\n"
+            "Использование: `/setpass ваш_пароль_от_Firebase`\n\n"
+            "*(Введите пароль, который вы задали для `goponos12@gmail.com` в Firebase Console)*",
+            parse_mode="Markdown"
+        )
+        return
+
+    new_pass = args[1].strip()
+    await message.answer("🔄 Проверяю подключение к Firebase с этим паролем...")
+
+    # Тестируем авторизацию
+    firebase_client.password = new_pass
+    token = await firebase_client.get_token()
+
+    if token:
+        # Сохраняем в конфиг
+        cfg = load_json("firebase_config.json", {})
+        cfg["FIREBASE_PASSWORD"] = new_pass
+        save_json("firebase_config.json", cfg)
+
+        await message.answer(
+            "✅ **Связь с Firebase успешно установлена!**\n\n"
+            "Токен доступа получен. Теперь все одобрения в боте будут мгновенно появляться в таблице на сайте!",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            "❌ **Ошибка авторизации в Firebase!**\n\n"
+            "Firebase отклонил этот пароль для почты `goponos12@gmail.com`.\n\n"
+            "Проверьте, что в Firebase Console ➔ Authentication ➔ Users у пользователя `goponos12@gmail.com` задан именно этот пароль.",
+            parse_mode="Markdown"
+        )
 
 # Очередь на выдачу
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
