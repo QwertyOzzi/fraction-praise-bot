@@ -291,6 +291,45 @@ class FirebaseClient:
             }
         }
 
+    async def add_support_ticket(self, ticket_data: Dict[str, Any]) -> Optional[str]:
+        token = await self.get_token()
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/support_tickets"
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        body = {
+            "fields": {
+                "nick": {"stringValue": str(ticket_data.get("nick", "Аноним"))},
+                "contact": {"stringValue": str(ticket_data.get("contact", "Не указан"))},
+                "category": {"stringValue": str(ticket_data.get("category", "Баг / Ошибка"))},
+                "description": {"stringValue": str(ticket_data.get("description", ""))},
+                "screenshot": {"stringValue": str(ticket_data.get("screenshot", ""))},
+                "photo_id": {"stringValue": str(ticket_data.get("photo_id", ""))},
+                "status": {"stringValue": str(ticket_data.get("status", "Новое"))},
+                "source": {"stringValue": str(ticket_data.get("source", "telegram"))},
+                "createdAt": {"stringValue": str(ticket_data.get("createdAt", now_iso))},
+                "timestamp": {"timestampValue": now_iso}
+            }
+        }
+        try:
+            async with ClientSession() as session:
+                async with session.post(url, headers=headers, json=body) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        doc_name = data.get("name", "")
+                        doc_id = doc_name.split("/")[-1] if doc_name else ""
+                        logger.info(f"Support ticket saved to Firestore: {doc_id}")
+                        return doc_id
+                    else:
+                        err_text = await resp.text()
+                        logger.warning(f"Failed to save support ticket to Firestore ({resp.status}): {err_text}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error saving support ticket: {e}")
+            return None
+
 firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE_EMAIL, FIREBASE_PASSWORD)
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1315,6 +1354,28 @@ async def process_support_msg(message: types.Message, state: FSMContext):
         f"📝 <b>Сообщение:</b>\n{html.escape(content_text)}"
     )
 
+    # Сохраняем в коллекцию support_tickets в Firestore
+    ticket_payload = {
+        "nick": nick,
+        "contact": f"Telegram: @{message.from_user.username}" if message.from_user.username else f"TG ID: {uid}",
+        "category": "Обращение из Telegram",
+        "description": content_text,
+        "screenshot": "",
+        "photo_id": message.photo[-1].file_id if message.photo else "",
+        "status": "Новое",
+        "source": "telegram"
+    }
+    ticket_id = await firebase_client.add_support_ticket(ticket_payload)
+    ticket_label = f"#{ticket_id[-6:]}" if ticket_id else ""
+
+    admin_msg_with_id = (
+        f"🚨 <b>Новое обращение в Службу Поддержки {ticket_label}!</b>\n\n"
+        f"👤 <b>От:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
+        f"🆔 <b>Telegram ID:</b> <code>{uid}</code> {html.escape(username_str)}\n"
+        f"📝 <b>Сообщение:</b>\n{html.escape(content_text)}\n\n"
+        "🌐 <i>Также обращение доступно на сайте в разделе «Обращения»</i>"
+    )
+
     recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
     if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
         recipients.append(int(ADMIN_CHAT_ID))
@@ -1323,15 +1384,15 @@ async def process_support_msg(message: types.Message, state: FSMContext):
     for adm_id in recipients:
         try:
             if message.photo:
-                await bot.send_photo(adm_id, message.photo[-1].file_id, caption=admin_msg, parse_mode="HTML")
+                await bot.send_photo(adm_id, message.photo[-1].file_id, caption=admin_msg_with_id, parse_mode="HTML")
             else:
-                await bot.send_message(adm_id, admin_msg, parse_mode="HTML")
+                await bot.send_message(adm_id, admin_msg_with_id, parse_mode="HTML")
         except Exception as e:
             logger.warning(f"Could not forward support message to {adm_id}: {e}")
 
     await message.answer(
-        "✅ <b>Ваше обращение успешно передано Главному Руководству!</b>\n\n"
-        "Лидер проверит его в ближайшее время. Спасибо за помощь в улучшении системы!",
+        "✅ <b>Ваше обращение успешно зарегистрировано и передано руководству!</b>\n\n"
+        "Оно добавлено в общую панель обращений и будет проверено лидером/тех. администратором. Спасибо за содействие!",
         reply_markup=get_main_menu(uid),
         parse_mode="HTML"
     )
@@ -1357,10 +1418,73 @@ async def handle_ping(request):
     }
     return web.json_response(data, headers=headers)
 
+async def handle_api_support(request):
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+    }
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=headers)
+
+    try:
+        data = await request.json()
+        nick = str(data.get("nick", "Аноним")).strip()
+        contact = str(data.get("contact", "Не указан")).strip()
+        category = str(data.get("category", "Баг / Ошибка")).strip()
+        description = str(data.get("description", "")).strip()
+        screenshot = str(data.get("screenshot", "")).strip()
+
+        if not nick or not description:
+            return web.json_response({"error": "Missing nick or description"}, status=400, headers=headers)
+
+        ticket_payload = {
+            "nick": nick,
+            "contact": contact,
+            "category": category,
+            "description": description,
+            "screenshot": screenshot,
+            "status": "Новое",
+            "source": "site"
+        }
+        ticket_id = await firebase_client.add_support_ticket(ticket_payload)
+
+        # Мгновенно уведомляем руководство в Telegram
+        ticket_label = f"#{ticket_id[-6:]}" if ticket_id else ""
+        admin_msg = (
+            f"🌐 <b>Новое обращение с САЙТА в Службу Поддержки {ticket_label}!</b>\n\n"
+            f"👤 <b>Никнейм:</b> <code>{html.escape(nick)}</code>\n"
+            f"📞 <b>Контакт:</b> {html.escape(contact)}\n"
+            f"🏷️ <b>Категория:</b> {html.escape(category)}\n"
+            f"📝 <b>Описание:</b>\n{html.escape(description)}"
+        )
+        if screenshot:
+            admin_msg += f"\n\n🔗 <b>Скриншот:</b> {html.escape(screenshot)}"
+
+        admin_msg += "\n\n🌐 <i>Обращение сохранено в базе и доступно на сайте</i>"
+
+        recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
+        if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
+            recipients.append(int(ADMIN_CHAT_ID))
+        recipients = list(set(recipients))
+
+        for adm_id in recipients:
+            try:
+                await bot.send_message(adm_id, admin_msg, disable_web_page_preview=True, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"Could not forward web support ticket to {adm_id}: {e}")
+
+        return web.json_response({"status": "ok", "id": ticket_id}, headers=headers)
+    except Exception as e:
+        logger.error(f"Error handling /api/support: {e}")
+        return web.json_response({"error": str(e)}, status=500, headers=headers)
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_ping)
+    app.router.add_post("/api/support", handle_api_support)
+    app.router.add_options("/api/support", handle_api_support)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
