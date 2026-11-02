@@ -78,7 +78,8 @@ def load_functions(names, extra=None):
     env = {
         "re": re, "html": html, "hashlib": hashlib,
         "uuid": uuid, "asyncio": asyncio, "datetime": datetime, "timezone": timezone,
-        "Any": Any, "Dict": Dict, "List": List, "types": types,
+        "Any": Any, "Dict": Dict, "List": List,
+        "types": types.SimpleNamespace(CallbackQuery=Callback, Message=Message),
         "InlineKeyboardButton": Button, "InlineKeyboardMarkup": Markup,
         "logger": Logger(), "is_admin": lambda uid: uid == 6060562962,
     }
