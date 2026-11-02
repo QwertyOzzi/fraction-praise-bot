@@ -938,7 +938,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
         return
 
-    key = args[1].strip().strip('"').strip("'")
+    key = args[1].strip().strip('"').strip("'") if len(args) > 1 else ""
     
     # 1. Мастер-ключи Владельца (мгновенный вход без подтверждений)
     if uid in OWNER_TELEGRAM_IDS:
