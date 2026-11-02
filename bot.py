@@ -477,6 +477,8 @@ async def sync_state_from_cloud():
     except Exception as e:
         logger.warning(f"Could not load state from Firestore: {e}")
 
+_state_sync_lock = asyncio.Lock()
+
 def notify_state_changed():
     """Безопасная фоновая синхронизация с облаком Firestore."""
     try:
@@ -488,40 +490,41 @@ def notify_state_changed():
 
 async def sync_state_to_cloud():
     """Сохранение состояния бота в Firestore при любых изменениях."""
-    try:
-        token = await firebase_client.get_token()
-        if not token:
-            return
+    async with _state_sync_lock:
+        try:
+            token = await firebase_client.get_token()
+            if not token:
+                return
 
-        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        payload_data = {
-            "users": users_db,
-            "admins": admins_db,
-            "owners": owner_cfg.get("owner_ids", []),
-            "requests": requests_db
-        }
+            payload_data = {
+                "users": users_db,
+                "admins": admins_db,
+                "owners": owner_cfg.get("owner_ids", []),
+                "requests": requests_db
+            }
 
-        body = {
-            "fields": {
-                "data": {
-                    "stringValue": json.dumps(payload_data, ensure_ascii=False)
-                },
-                "updatedAt": {
-                    "timestampValue": datetime.now(timezone.utc).isoformat()
+            body = {
+                "fields": {
+                    "data": {
+                        "stringValue": json.dumps(payload_data, ensure_ascii=False)
+                    },
+                    "updatedAt": {
+                        "timestampValue": datetime.now(timezone.utc).isoformat()
+                    }
                 }
             }
-        }
 
-        async with ClientSession() as session:
-            async with session.patch(url, headers=headers, json=body) as resp:
-                if resp.status == 200:
-                    logger.info("Bot state successfully synced to cloud Firestore")
-                else:
-                    logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
-    except Exception as e:
-        logger.warning(f"Error syncing bot state to cloud: {e}")
+            async with ClientSession() as session:
+                async with session.patch(url, headers=headers, json=body) as resp:
+                    if resp.status == 200:
+                        logger.info("Bot state successfully synced to cloud Firestore")
+                    else:
+                        logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
+        except Exception as e:
+            logger.warning(f"Error syncing bot state to cloud: {e}")
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FSM STATES                                                      ║
