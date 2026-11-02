@@ -26,6 +26,14 @@ class BotSecurityChecks(unittest.TestCase):
         section = SOURCE.split("async def cmd_admin_auth(", 1)[1].split("@dp.callback_query", 1)[0]
         self.assertIn("OWNER_TELEGRAM_IDS", section)
 
+    def test_credit_uses_firestore_precondition(self):
+        self.assertIn('"currentDocument.updateTime": revision', SOURCE)
+        self.assertIn('async def credit_report(', SOURCE)
+
+    def test_approval_waits_for_credit(self):
+        section = SOURCE.split('async def approve_report(', 1)[1].split('async def reject_report(', 1)[0]
+        self.assertLess(section.index('await firebase_client.credit_report('), section.index('req["status"] = "approved"'))
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 
