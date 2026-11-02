@@ -657,6 +657,9 @@ async def process_nick(message: types.Message, state: FSMContext):
         elif text_val in ("➕ Начислить FRP / Похвалу", "/grant"):
             await cmd_grant_menu(message, state)
             return
+        elif text_val in ("🧑‍💼 Управление агентами", "/agents"):
+            await cmd_agent_panel(message, state)
+            return
         elif text_val == "📊 Мой статус":
             await cmd_my_status(message)
             return
@@ -1532,6 +1535,360 @@ async def process_grant_details(message: types.Message, state: FSMContext):
     raw = parts[1] if parts and parts[0] == "/grant" and len(parts) > 1 else (message.text or "")
     await state.clear()
     await perform_manual_grant(message, raw)
+
+
+# Button-driven administration for all registered and sheet-listed agents.
+# Only in-memory navigation state is stored here; balances remain authoritative in Firebase.
+agent_search_terms: Dict[int, str] = {}
+agent_action_tokens: Dict[str, Dict[str, Any]] = {}
+
+
+class AgentPanelStates(StatesGroup):
+    waiting_for_search = State()
+
+
+def agent_hash(nick: str) -> str:
+    return hashlib.sha256(nick.casefold().encode("utf-8")).hexdigest()[:12]
+
+
+async def fetch_agent_directory() -> List[Dict[str, Any]]:
+    frp_rows, praise_rows = await asyncio.gather(
+        firebase_client.get_sheet("fractionrp"), firebase_client.get_sheet("praise")
+    )
+    directory: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_agent(nick: str):
+        key = nick.casefold()
+        if key not in directory:
+            directory[key] = {
+                "nick": nick, "rank": "?", "frp": 0, "praise": 0,
+                "frp_status": "—", "praise_status": "—", "uid": None
+            }
+        return directory[key]
+
+    for uid, data in users_db.items():
+        if not isinstance(data, dict):
+            continue
+        nick = str(data.get("nick", "")).strip()
+        if not nick:
+            continue
+        item = ensure_agent(nick)
+        item["rank"] = str(data.get("rank", "?"))
+        item["uid"] = str(uid)
+
+    for rows, prefix in ((frp_rows, "frp"), (praise_rows, "praise")):
+        for row in rows:
+            nick = str(row.get("nick", "")).strip()
+            if not nick:
+                continue
+            item = ensure_agent(nick)
+            item[prefix] = int(row.get("qty") or 0)
+            item[prefix + "_status"] = str(row.get("status", "—"))
+            if item["rank"] == "?" and row.get("rank"):
+                item["rank"] = str(row["rank"])
+
+    return sorted(directory.values(), key=lambda item: item["nick"].casefold())
+
+
+def agent_list_markup(agents: List[Dict[str, Any]], page: int):
+    page_size = 8
+    pages = max(1, (len(agents) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    text = f"🧑‍💼 <b>Агенты — {len(agents)} чел.</b> (страница {page + 1}/{pages})\n\n"
+    if agents:
+        for agent in agents[page * page_size:(page + 1) * page_size]:
+            text += (f"• <b>{html.escape(agent['nick'])}</b> [{html.escape(agent['rank'])}] "
+                     f"— 🎖️ {agent['frp']} / 🌟 {agent['praise']}\n")
+    else:
+        text += "Никого не найдено. Нажмите «Сбросить поиск».\n"
+    keyboard = []
+    for agent in agents[page * page_size:(page + 1) * page_size]:
+        keyboard.append([InlineKeyboardButton(
+            text=f"👤 {agent['nick']}", callback_data=f"agview:{agent_hash(agent['nick'])}:{page}"
+        )])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"agpage:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="agnoop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"agpage:{page + 1}"))
+    keyboard.append(nav)
+    keyboard.append([
+        InlineKeyboardButton(text="🔎 Поиск", callback_data="agsearch"),
+        InlineKeyboardButton(text="Сбросить поиск", callback_data="agreset")
+    ])
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"agpage:{page}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def agent_detail_markup(agent: Dict[str, Any], page: int):
+    key = agent_hash(agent["nick"])
+    text = (
+        f"👤 <b>{html.escape(agent['nick'])}</b> [{html.escape(agent['rank'])}]\n"
+        f"🎖️ FRP: <b>{agent['frp']}</b> — {html.escape(agent['frp_status'])}\n"
+        f"🌟 Похвалы: <b>{agent['praise']}</b> — {html.escape(agent['praise_status'])}\n\n"
+        "Выберите действие. Начисление и списание потребуют подтверждения:"
+    )
+    keyboard = [
+        [InlineKeyboardButton(text="🎖️ FRP +1", callback_data=f"agask:g:f:{key}:1:{page}"),
+         InlineKeyboardButton(text="🎖️ FRP +5", callback_data=f"agask:g:f:{key}:5:{page}"),
+         InlineKeyboardButton(text="🎖️ FRP −1", callback_data=f"agask:d:f:{key}:1:{page}")],
+        [InlineKeyboardButton(text="🌟 Похвала +1", callback_data=f"agask:g:p:{key}:1:{page}"),
+         InlineKeyboardButton(text="🌟 Похвала +5", callback_data=f"agask:g:p:{key}:5:{page}"),
+         InlineKeyboardButton(text="🌟 Похвала −1", callback_data=f"agask:d:p:{key}:1:{page}")]
+    ]
+    if agent.get("uid") is not None:
+        keyboard.append([InlineKeyboardButton(text="🎖️ Изменить ранг", callback_data=f"agranks:{key}:{page}")])
+    keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data=f"agpage:{page}"),
+                     InlineKeyboardButton(text="🔄 Обновить", callback_data=f"agview:{key}:{page}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def agent_panel_list(message: types.Message, admin_id: int, page: int = 0, edit: bool = False):
+    agents = await fetch_agent_directory()
+    term = agent_search_terms.get(admin_id, "")
+    if term:
+        agents = [agent for agent in agents if term in agent["nick"].casefold()]
+    text, kb = agent_list_markup(agents, page)
+    if edit:
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def agent_panel_detail(message: types.Message, key: str, page: int):
+    agents = await fetch_agent_directory()
+    agent = next((item for item in agents if agent_hash(item["nick"]) == key), None)
+    if not agent:
+        await message.edit_text("⚠️ Агент больше не найден. Откройте список снова.")
+        return
+    text, kb = agent_detail_markup(agent, page)
+    await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.message(Command("agents"))
+@dp.message(F.text == "🧑‍💼 Управление агентами")
+async def cmd_agent_panel(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Панель доступна только руководству.")
+        return
+    await state.clear()
+    agent_search_terms.pop(message.from_user.id, None)
+    try:
+        await agent_panel_list(message, message.from_user.id)
+    except Exception as exc:
+        logger.error(f"Agent directory error: {exc}")
+        await message.answer("⚠️ Firebase не ответила. Попробуйте открыть панель позже.")
+
+
+@dp.callback_query(F.data.startswith("agpage:") | (F.data == "agreset"))
+async def agent_page(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if callback.data == "agreset":
+        agent_search_terms.pop(callback.from_user.id, None)
+        page = 0
+    else:
+        try:
+            page = int(callback.data.split(":")[1])
+        except (ValueError, IndexError):
+            await callback.answer("Ошибка страницы", show_alert=True)
+            return
+    try:
+        await agent_panel_list(callback.message, callback.from_user.id, page, edit=True)
+        await callback.answer()
+    except Exception as exc:
+        logger.warning(f"Agent list unavailable: {exc}")
+        await callback.answer("Ошибка загрузки Firebase", show_alert=True)
+
+
+@dp.callback_query(F.data == "agnoop")
+async def agent_noop(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "agsearch")
+async def agent_search(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AgentPanelStates.waiting_for_search)
+    await callback.message.answer("🔎 Введите часть ника агента. /cancel — отмена поиска.")
+    await callback.answer()
+
+
+@dp.message(AgentPanelStates.waiting_for_search)
+async def agent_search_term(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    value = (message.text or "").strip().casefold()
+    if not 1 <= len(value) <= 30:
+        await message.answer("Введите от 1 до 30 символов.")
+        return
+    await state.clear()
+    agent_search_terms[message.from_user.id] = value
+    try:
+        await agent_panel_list(message, message.from_user.id)
+    except Exception as exc:
+        logger.warning(f"Agent search unavailable: {exc}")
+        await message.answer("⚠️ Ошибка загрузки Firebase.")
+
+
+@dp.callback_query(F.data.startswith("agview:"))
+async def agent_view(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, key, page_str = callback.data.split(":")
+        await agent_panel_detail(callback.message, key, int(page_str))
+        await callback.answer()
+    except Exception as exc:
+        logger.warning(f"Agent detail unavailable: {exc}")
+        await callback.answer("Ошибка карточки агента", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("agask:"))
+async def agent_ask_action(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, kind, which, key, amount_raw, page_raw = callback.data.split(":")
+        qty, page = int(amount_raw), int(page_raw)
+        if kind not in ("g", "d") or which not in ("f", "p") or qty not in (1, 5):
+            raise ValueError("Invalid action")
+        if kind == "d" and qty != 1:
+            raise ValueError("Invalid debit")
+        agents = await fetch_agent_directory()
+        agent = next((item for item in agents if agent_hash(item["nick"]) == key), None)
+        if not agent:
+            await callback.answer("Агент не найден", show_alert=True)
+            return
+        now = datetime.now(timezone.utc).timestamp()
+        for token, task in list(agent_action_tokens.items()):
+            if now - task["created"] > 600:
+                agent_action_tokens.pop(token, None)
+        token = uuid.uuid4().hex[:16]
+        agent_action_tokens[token] = {
+            "uid": callback.from_user.id, "chat_id": callback.message.chat.id,
+            "nick": agent["nick"], "rank": agent["rank"],
+            "kind": kind, "which": which, "qty": qty, "page": page,
+            "key": key, "created": now, "status": "new"
+        }
+        operation = f"+{qty}" if kind == "g" else "−1"
+        type_name = "FRP" if which == "f" else "похвалы"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Подтвердить {operation}", callback_data=f"agdo:{token}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{key}:{page}")]
+        ])
+        await callback.message.edit_text(
+            f"⚠️ <b>Подтвердите действие</b>\n"
+            f"👤 {html.escape(agent['nick'])}\n"
+            f"{type_name}: <b>{operation}</b>\n"
+            "После подтверждения баланс изменится в Firebase.",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as exc:
+        logger.warning(f"Invalid agent action: {exc}")
+        await callback.answer("Не удалось подготовить действие", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("agdo:"))
+async def agent_do_action(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    token = callback.data.removeprefix("agdo:")
+    action = agent_action_tokens.get(token)
+    if not action or action["uid"] != callback.from_user.id or action["chat_id"] != callback.message.chat.id:
+        await callback.answer("Это действие уже недоступно. Откройте панель заново.", show_alert=True)
+        return
+    if action["status"] != "new" or datetime.now(timezone.utc).timestamp() - action["created"] > 600:
+        await callback.answer("Действие уже обработано или устарело.", show_alert=True)
+        return
+    # Lock before first await so simultaneous callbacks cannot execute the same action twice.
+    action["status"] = "processing"
+    sheet = "fractionrp" if action["which"] == "f" else "praise"
+    try:
+        if action["kind"] == "g":
+            await firebase_client.credit_report(
+                sheet, action["nick"], action["rank"],
+                f"Из админ-панели Telegram ID {callback.from_user.id}",
+                "", "panel-" + token, quantity=action["qty"]
+            )
+        else:
+            await firebase_client.debit_one(sheet, action["nick"])
+        action["status"] = "done"
+    except Exception as exc:
+        # No blind retry after a possibly successful but timed-out write.
+        action["status"] = "uncertain"
+        logger.error(f"Agent panel operation {token} failed: {exc}")
+        await callback.answer("Не подтверждено. Проверьте баланс, прежде чем повторять.", show_alert=True)
+        return
+
+    await callback.answer("✅ Баланс обновлён")
+    try:
+        await agent_panel_detail(callback.message, action["key"], action["page"])
+    except Exception as exc:
+        logger.warning(f"Agent card refresh failed after successful update: {exc}")
+        await callback.message.edit_text("✅ Операция выполнена. Откройте /agents для проверки.")
+
+
+@dp.callback_query(F.data.startswith("agranks:"))
+async def agent_rank_menu(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, key, page = callback.data.split(":")
+        agent = next((item for item in await fetch_agent_directory()
+                      if agent_hash(item["nick"]) == key), None)
+        if not agent or agent["uid"] is None:
+            await callback.answer("Агент не зарегистрирован в боте", show_alert=True)
+            return
+        buttons = []
+        for row in ((1, 2, 3, 4, 5), (6, 7, 8, 9, 10)):
+            buttons.append([InlineKeyboardButton(
+                text=str(rank), callback_data=f"agrank:{key}:{rank}:{page}"
+            ) for rank in row])
+        buttons.append([InlineKeyboardButton(text="🔙 Отмена", callback_data=f"agview:{key}:{page}")])
+        await callback.message.edit_text(
+            f"🎖️ Выберите новый ранг для <b>{html.escape(agent['nick'])}</b>:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as exc:
+        logger.warning(f"Rank menu failed: {exc}")
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("agrank:"))
+async def agent_set_rank(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, key, rank_raw, page_raw = callback.data.split(":")
+        rank = int(rank_raw)
+        if not 1 <= rank <= 10:
+            raise ValueError("Invalid rank")
+        agent = next((item for item in await fetch_agent_directory()
+                      if agent_hash(item["nick"]) == key), None)
+        if not agent or agent["uid"] is None or agent["uid"] not in users_db:
+            await callback.answer("Агент не найден", show_alert=True)
+            return
+        users_db[agent["uid"]]["rank"] = "X" if rank == 10 else str(rank)
+        save_json(USERS_FILE, users_db)
+        await sync_state_to_cloud()
+        await callback.answer("✅ Ранг обновлён")
+        await agent_panel_detail(callback.message, key, int(page_raw))
+    except Exception as exc:
+        logger.warning(f"Rank change failed: {exc}")
+        await callback.answer("⚠️ Не удалось обновить ранг", show_alert=True)
 
 
 @dp.message(Command("cancel"))
