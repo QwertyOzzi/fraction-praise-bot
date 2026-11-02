@@ -921,7 +921,7 @@ def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
         f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
         f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
         f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
-        ("Измените количество похвал кнопками ➖/➕, затем примите решение."
+        + ("Измените количество похвал кнопками ➖/➕, затем примите решение."
          if req.get("rep_type") == "praise" else
          "Одобрите или отклоните заявку.")
     )
