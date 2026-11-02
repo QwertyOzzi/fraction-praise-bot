@@ -193,7 +193,7 @@ class FirebaseClient:
             logger.error(f"Error updating sheet {sheet_name}: {e}")
             return False
 
-    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str) -> bool:
+    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str, report_id: str) -> bool:
         """Optimistic Firestore concurrency control for a single credit."""
         if sheet_name not in ("fractionrp", "praise"):
             raise ValueError("Unknown sheet")
@@ -209,6 +209,10 @@ class FirebaseClient:
                         raise RuntimeError(f"Firestore read failed: {response.status}")
                     data = await response.json()
                     revision = data.get("updateTime")
+                    applied_field = data.get("fields", {}).get("appliedReportIds", {}).get("arrayValue", {}).get("values", [])
+                    applied_ids = [v["stringValue"] for v in applied_field if isinstance(v, dict) and isinstance(v.get("stringValue"), str)]
+                    if report_id in applied_ids:
+                        return True
                     if not revision:
                         raise RuntimeError("Firestore version missing")
                     rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
@@ -223,7 +227,8 @@ class FirebaseClient:
                                  "fullName": f"{nick} ({rank})", "nick": nick,
                                  "rank": rank, "status": "На выдаче", "qty": 1, "proof": proof})
                 payload = {"fields": {"rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
-                                      "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}}}
+                                      "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()},
+                                      "appliedReportIds": {"arrayValue": {"values": [{"stringValue": report} for report in [*applied_ids, report_id]]}}}}
                 async with session.patch(url, headers={**headers, "Content-Type": "application/json"},
                                          params={"currentDocument.updateTime": revision}, json=payload) as response:
                     if response.status == 200:
@@ -853,7 +858,7 @@ async def approve_report(callback: types.CallbackQuery):
 
     try:
         success = await firebase_client.credit_report(
-            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"]
+            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"], req_id
         )
         if success:
             req["status"] = "approved"
