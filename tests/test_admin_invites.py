@@ -55,6 +55,8 @@ def load_functions(names, other=None):
     env = {
         "re": re, "html": html, "uuid": uuid, "datetime": datetime.datetime,
         "timezone": datetime.timezone, "types": types.SimpleNamespace(Message=Message, CallbackQuery=Callback),
+        "FSMContext": State,
+        "logger": types.SimpleNamespace(warning=lambda *args: None),
         "InlineKeyboardButton": Button, "InlineKeyboardMarkup": Markup,
         "is_owner": lambda x: x == 6060562962,
         "is_admin": lambda x: x == 6060562962,
