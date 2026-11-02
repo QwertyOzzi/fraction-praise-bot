@@ -40,12 +40,15 @@ class Store:
             self.version += 1
             self.qty += 1
             return Response(412)
-        if params["currentDocument.updateTime"] != "v" + str(self.version):
+        precondition = dict(params).get("currentDocument.updateTime") if isinstance(params, list) else params.get("currentDocument.updateTime")
+        if precondition != "v" + str(self.version):
             return Response(412)
         values = json["fields"]["rows"]["arrayValue"]["values"]
         row = values[0]["mapValue"]["fields"]
         self.qty = int(row["qty"]["integerValue"])
-        self.ids = [x["stringValue"] for x in json["fields"]["appliedReportIds"]["arrayValue"]["values"]]
+        ledger = json["fields"].get("appliedReportIds")
+        if ledger is not None:
+            self.ids = [x["stringValue"] for x in ledger["arrayValue"]["values"]]
         self.version += 1
         return Response(200)
 
@@ -79,6 +82,24 @@ class TestCreditIntegration(unittest.IsolatedAsyncioTestCase):
         await self.client.credit_report("praise", "Alice", "8", "test", "https://example.org", "id2")
         self.assertEqual(self.store.qty, 4)
         self.assertGreater(self.store.read_count, 1)
+    async def test_multiple_praise_credits(self):
+        await self.client.credit_report("praise", "Alice", "8", "test", "https://example.org", "id9", quantity=3)
+        self.assertEqual(self.store.qty, 5)
+        await self.client.credit_report("praise", "Alice", "8", "test", "https://example.org", "id9", quantity=3)
+        self.assertEqual(self.store.qty, 5)
+
+    async def test_debit_reduces_queue(self):
+        self.assertEqual(await self.client.debit_one("fractionrp", "Alice"), 1)
+        self.assertEqual(await self.client.debit_one("fractionrp", "Alice"), 0)
+        self.assertEqual(await self.client.debit_one("fractionrp", "Alice"), 0)
+        self.assertEqual(self.store.qty, 0)
+
+    async def test_debit_conflict_retries(self):
+        self.store.conflict_once = True
+        self.assertEqual(await self.client.debit_one("fractionrp", "Alice"), 2)
+        self.assertEqual(self.store.qty, 2)
+        self.assertGreater(self.store.read_count, 1)
+
     async def test_reject_unknown_sheet(self):
         with self.assertRaises(ValueError):
             await self.client.credit_report("invalid", "Alice", "8", "test", "https://example.org", "id3")

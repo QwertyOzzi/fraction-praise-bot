@@ -3,6 +3,7 @@ import os
 import json
 import html
 import logging
+import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
@@ -193,10 +194,12 @@ class FirebaseClient:
             logger.error(f"Error updating sheet {sheet_name}: {e}")
             return False
 
-    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str, report_id: str) -> bool:
+    async def credit_report(self, sheet_name: str, nick: str, rank: str, reason: str, proof_url: str, report_id: str, quantity: int = 1) -> bool:
         """Optimistic Firestore concurrency control for a single credit."""
         if sheet_name not in ("fractionrp", "praise"):
             raise ValueError("Unknown sheet")
+        if not isinstance(quantity, int) or not 1 <= quantity <= 20:
+            raise ValueError("Quantity must be between 1 and 20")
         token = await self.get_token()
         if not token:
             raise RuntimeError("Firebase authentication unavailable")
@@ -217,15 +220,16 @@ class FirebaseClient:
                         raise RuntimeError("Firestore version missing")
                     rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
                 existing = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
-                proof = {"text": reason, "links": [{"text": reason, "url": proof_url}]}
+                proof_links = [{"text": reason, "url": proof_url}] if proof_url.startswith(("https://", "http://")) else []
+                proof = {"text": reason, "links": proof_links}
                 if existing:
-                    existing["qty"] = int(existing.get("qty") or 0) + 1
+                    existing["qty"] = int(existing.get("qty") or 0) + quantity
                     existing["status"] = "На выдаче"
                     existing["proof"] = proof
                 else:
                     rows.append({"id": str(int(datetime.now().timestamp() * 1000000)),
                                  "fullName": f"{nick} ({rank})", "nick": nick,
-                                 "rank": rank, "status": "На выдаче", "qty": 1, "proof": proof})
+                                 "rank": rank, "status": "На выдаче", "qty": quantity, "proof": proof})
                 payload = {"fields": {"rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
                                       "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()},
                                       "appliedReportIds": {"arrayValue": {"values": [{"stringValue": report} for report in [*applied_ids, report_id]]}}}}
@@ -237,6 +241,50 @@ class FirebaseClient:
                         raise RuntimeError(f"Firestore write failed: {response.status}")
             await asyncio.sleep(0.1 * (attempt + 1))
         raise RuntimeError("Concurrent modifications: retry limit reached")
+
+    async def debit_one(self, sheet_name: str, nick: str) -> int:
+        """Consume one point with an updateTime precondition; return remaining points."""
+        if sheet_name not in ("fractionrp", "praise"):
+            raise ValueError("Unknown sheet")
+        token = await self.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/sheets/{sheet_name}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        for attempt in range(5):
+            async with ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Firestore read failed: {response.status}")
+                    data = await response.json()
+                    revision = data.get("updateTime")
+                    if not revision:
+                        raise RuntimeError("Firestore version missing")
+                    rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                item = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
+                if not item:
+                    raise ValueError("Player not found")
+                remaining = int(item.get("qty") or 0)
+                if remaining <= 0:
+                    return 0
+                remaining -= 1
+                item["qty"] = remaining
+                if remaining == 0:
+                    item["status"] = "Выдано"
+                payload = {"fields": {
+                    "rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
+                    "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}
+                }}
+                # Keep appliedReportIds and any other metadata untouched.
+                params = [("currentDocument.updateTime", revision),
+                          ("updateMask.fieldPaths", "rows"), ("updateMask.fieldPaths", "updatedAt")]
+                async with session.patch(url, headers=headers, params=params, json=payload) as response:
+                    if response.status == 200:
+                        return remaining
+                    if response.status not in (409, 412):
+                        raise RuntimeError(f"Firestore write failed: {response.status}")
+            await asyncio.sleep(0.1 * (attempt + 1))
+        raise RuntimeError("Concurrent changes, try again")
 
     def _parse_firestore_rows(self, values: list) -> List[Dict[str, Any]]:
         rows = []
@@ -429,6 +477,8 @@ async def sync_state_from_cloud():
     except Exception as e:
         logger.warning(f"Could not load state from Firestore: {e}")
 
+_state_sync_lock = asyncio.Lock()
+
 def notify_state_changed():
     """Безопасная фоновая синхронизация с облаком Firestore."""
     try:
@@ -440,40 +490,41 @@ def notify_state_changed():
 
 async def sync_state_to_cloud():
     """Сохранение состояния бота в Firestore при любых изменениях."""
-    try:
-        token = await firebase_client.get_token()
-        if not token:
-            return
+    async with _state_sync_lock:
+        try:
+            token = await firebase_client.get_token()
+            if not token:
+                return
 
-        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        payload_data = {
-            "users": users_db,
-            "admins": admins_db,
-            "owners": owner_cfg.get("owner_ids", []),
-            "requests": requests_db
-        }
+            payload_data = {
+                "users": users_db,
+                "admins": admins_db,
+                "owners": owner_cfg.get("owner_ids", []),
+                "requests": requests_db
+            }
 
-        body = {
-            "fields": {
-                "data": {
-                    "stringValue": json.dumps(payload_data, ensure_ascii=False)
-                },
-                "updatedAt": {
-                    "timestampValue": datetime.now(timezone.utc).isoformat()
+            body = {
+                "fields": {
+                    "data": {
+                        "stringValue": json.dumps(payload_data, ensure_ascii=False)
+                    },
+                    "updatedAt": {
+                        "timestampValue": datetime.now(timezone.utc).isoformat()
+                    }
                 }
             }
-        }
 
-        async with ClientSession() as session:
-            async with session.patch(url, headers=headers, json=body) as resp:
-                if resp.status == 200:
-                    logger.info("Bot state successfully synced to cloud Firestore")
-                else:
-                    logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
-    except Exception as e:
-        logger.warning(f"Error syncing bot state to cloud: {e}")
+            async with ClientSession() as session:
+                async with session.patch(url, headers=headers, json=body) as resp:
+                    if resp.status == 200:
+                        logger.info("Bot state successfully synced to cloud Firestore")
+                    else:
+                        logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
+        except Exception as e:
+            logger.warning(f"Error syncing bot state to cloud: {e}")
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FSM STATES                                                      ║
@@ -484,9 +535,13 @@ class RegistrationStates(StatesGroup):
 
 class ReportStates(StatesGroup):
     waiting_for_type = State()
+    waiting_for_quantity = State()
     waiting_for_reason = State()
     waiting_for_proof = State()
     confirm = State()
+
+class GrantStates(StatesGroup):
+    waiting_for_details = State()
 
 class SupportStates(StatesGroup):
     waiting_for_message = State()
@@ -501,7 +556,9 @@ MENU_BUTTONS = [
     "⚙️ Мой никнейм",
     "💬 Поддержка / Баг-репорт",
     "📋 Очередь на выдачу (Админ)",
-    "👥 Список админов"
+    "👥 Список админов",
+    "📌 Ожидающие заявки",
+    "➕ Начислить FRP / Похвалу"
 ]
 
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
@@ -519,6 +576,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     ]
     if admin_mode:
         buttons.append([KeyboardButton(text="📋 Очередь на выдачу (Админ)"), KeyboardButton(text="👥 Список админов")])
+        buttons.append([KeyboardButton(text="📌 Ожидающие заявки"), KeyboardButton(text="➕ Начислить FRP / Похвалу")])
 
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -573,6 +631,12 @@ async def process_nick(message: types.Message, state: FSMContext):
             return
         elif text_val == "👥 Список админов" or text_val == "/admins":
             await cmd_list_admins(message)
+            return
+        elif text_val in ("📌 Ожидающие заявки", "/pending"):
+            await cmd_pending(message)
+            return
+        elif text_val in ("➕ Начислить FRP / Похвалу", "/grant"):
+            await cmd_grant_menu(message, state)
             return
         elif text_val == "📊 Мой статус":
             await cmd_my_status(message)
@@ -731,19 +795,60 @@ async def start_report(message: types.Message, state: FSMContext):
     )
     await state.set_state(ReportStates.waiting_for_type)
 
-@dp.callback_query(ReportStates.waiting_for_type, F.data.in_(["type_fractionrp", "type_praise"]))
-async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
-    rep_type = "fractionrp" if callback.data == "type_fractionrp" else "praise"
-    await state.update_data(rep_type=rep_type)
-
+async def show_report_reason_menu(message: types.Message, state: FSMContext, edit: bool = False):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💼 Вербовка", callback_data="reason_вербовка")],
         [InlineKeyboardButton(text="📑 Отчёт на форуме", callback_data="reason_отчет")],
         [InlineKeyboardButton(text="🎯 Другое задание", callback_data="reason_другое")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
-    await callback.message.edit_text("Выберите причину / категорию выдачи:", reply_markup=kb)
+    if edit:
+        await message.edit_text("Выберите причину / категорию выдачи:", reply_markup=kb)
+    else:
+        await message.answer("Выберите причину / категорию выдачи:", reply_markup=kb)
     await state.set_state(ReportStates.waiting_for_reason)
+
+
+@dp.callback_query(ReportStates.waiting_for_type, F.data.in_(["type_fractionrp", "type_praise"]))
+async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
+    rep_type = "fractionrp" if callback.data == "type_fractionrp" else "praise"
+    await state.update_data(rep_type=rep_type, quantity=1)
+    if rep_type == "praise":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=str(n), callback_data=f"repqty_{n}") for n in (1, 2, 3, 5, 10)],
+            [InlineKeyboardButton(text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
+        ])
+        await callback.message.edit_text("🌟 Сколько похвал в заявке? Выберите число или введите от 1 до 20:", reply_markup=kb)
+        await state.set_state(ReportStates.waiting_for_quantity)
+    else:
+        await show_report_reason_menu(callback.message, state, edit=True)
+
+
+@dp.callback_query(ReportStates.waiting_for_quantity, F.data.startswith("repqty_"))
+async def process_report_quantity_button(callback: types.CallbackQuery, state: FSMContext):
+    value = callback.data[len("repqty_"):]
+    if value == "custom":
+        await callback.message.edit_text("Введите количество похвал числом от 1 до 20:")
+        await callback.answer()
+        return
+    if not value.isdecimal() or not 1 <= int(value) <= 20:
+        await callback.answer("Укажите число от 1 до 20", show_alert=True)
+        return
+    await state.update_data(quantity=int(value))
+    await show_report_reason_menu(callback.message, state, edit=True)
+    await callback.answer()
+
+
+@dp.message(ReportStates.waiting_for_quantity)
+async def process_report_quantity_text(message: types.Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value.isdecimal() or not 1 <= int(value) <= 20:
+        await message.answer("⚠️ Укажите целое число от 1 до 20 или отправьте /cancel.")
+        return
+    await state.update_data(quantity=int(value))
+    await show_report_reason_menu(message, state)
+
 
 @dp.callback_query(ReportStates.waiting_for_reason, F.data.startswith("reason_"))
 async def process_report_reason(callback: types.CallbackQuery, state: FSMContext):
@@ -759,7 +864,10 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
 
 @dp.message(ReportStates.waiting_for_proof)
 async def process_report_proof(message: types.Message, state: FSMContext):
-    proof = message.text.strip()
+    proof = (message.text or "").strip()
+    if not proof.startswith(("https://", "http://")) or len(proof) > 1000:
+        await message.answer("⚠️ Отправьте ссылку http(s) длиной не более 1000 символов.")
+        return
     data = await state.get_data()
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id, {})
@@ -771,7 +879,7 @@ async def process_report_proof(message: types.Message, state: FSMContext):
     text = (
         "📋 <b>Проверьте данные вашего отчета:</b>\n\n"
         f"• <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
-        f"• <b>Тип:</b> {rep_type_label} (+1)\n"
+        f"• <b>Тип:</b> {rep_type_label} (+{data.get('quantity', 1)})\n"
         f"• <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
         f"• <b>Доказательства:</b> {html.escape(proof)}\n\n"
         "Отправить отчет на проверку руководству?"
@@ -788,6 +896,103 @@ async def cancel_report(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Подача отчета отменена.")
 
+def pending_report_keyboard(req_id: str, req: Dict[str, Any]) -> InlineKeyboardMarkup:
+    qty = int(req.get("quantity", 1))
+    controls = []
+    if req.get("rep_type") == "praise":
+        controls.append([
+            InlineKeyboardButton(text="➖ 1", callback_data=f"qtyminus_{req_id}"),
+            InlineKeyboardButton(text=f"🌟 {qty}", callback_data=f"qtyshow_{req_id}"),
+            InlineKeyboardButton(text="➕ 1", callback_data=f"qtyplus_{req_id}")
+        ])
+    controls.append([
+        InlineKeyboardButton(text=f"✅ Одобрить (+{qty})", callback_data=f"approve_{req_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=controls)
+
+
+def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
+    qty = int(req.get("quantity", 1))
+    return (
+        f"📨 <b>Заявка #{html.escape(req_id)} ожидает решения</b>\n\n"
+        f"👤 <b>Агент:</b> <code>{html.escape(str(req.get('nick') or ''))}</code> "
+        f"[{html.escape(str(req.get('rank') or '?'))}]\n"
+        f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
+        f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
+        f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
+        + ("Измените количество похвал кнопками ➖/➕, затем примите решение."
+         if req.get("rep_type") == "praise" else
+         "Одобрите или отклоните заявку.")
+    )
+
+
+async def send_pending_report_to_admin(chat_id: int, req_id: str, req: Dict[str, Any]) -> None:
+    sent = await bot.send_message(chat_id, pending_report_text(req_id, req),
+                                  reply_markup=pending_report_keyboard(req_id, req),
+                                  disable_web_page_preview=True, parse_mode="HTML")
+    refs = req.setdefault("admin_messages", [])
+    refs.append({"chat_id": chat_id, "message_id": sent.message_id})
+    try:
+        await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id,
+                                   disable_notification=True)
+    except Exception as exc:
+        logger.info(f"Could not pin pending report in {chat_id}: {exc}")
+
+
+async def refresh_pending_report_messages(req_id: str, req: Dict[str, Any]) -> None:
+    for info in req.get("admin_messages", []):
+        try:
+            await bot.edit_message_text(
+                pending_report_text(req_id, req), chat_id=int(info["chat_id"]),
+                message_id=int(info["message_id"]),
+                reply_markup=pending_report_keyboard(req_id, req),
+                parse_mode="HTML", disable_web_page_preview=True
+            )
+        except Exception as exc:
+            logger.info(f"Could not refresh pending report: {exc}")
+
+
+async def close_pending_report_messages(req_id: str, req: Dict[str, Any], result: str) -> None:
+    text = pending_report_text(req_id, req) + f"\n\n{html.escape(result)}"
+    for info in req.get("admin_messages", []):
+        try:
+            await bot.edit_message_text(text, chat_id=int(info["chat_id"]),
+                                        message_id=int(info["message_id"]),
+                                        parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as exc:
+            logger.info(f"Could not close report notification: {exc}")
+        try:
+            await bot.unpin_chat_message(chat_id=int(info["chat_id"]),
+                                         message_id=int(info["message_id"]))
+        except Exception as exc:
+            logger.info(f"Could not unpin completed report: {exc}")
+
+
+@dp.callback_query(F.data.startswith("qtyshow_"))
+async def show_report_quantity(callback: types.CallbackQuery):
+    await callback.answer("Используйте ➖/➕, чтобы изменить количество.")
+
+
+@dp.callback_query(F.data.startswith("qtyplus_") | F.data.startswith("qtyminus_"))
+async def adjust_report_quantity(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    plus = callback.data.startswith("qtyplus_")
+    req_id = callback.data.split("_", 1)[1]
+    req = requests_db.get(req_id)
+    if not req or req.get("status") != "pending" or req.get("rep_type") != "praise":
+        await callback.answer("Заявка уже закрыта или не найдена.", show_alert=True)
+        return
+    new_qty = max(1, min(20, int(req.get("quantity", 1)) + (1 if plus else -1)))
+    req["quantity"] = new_qty
+    save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
+    await refresh_pending_report_messages(req_id, req)
+    await callback.answer(f"Количество похвал: {new_qty}")
+
+
 @dp.callback_query(ReportStates.confirm, F.data == "send_report_confirm")
 async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -795,7 +1000,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     user_data = users_db.get(user_id, {})
     await state.clear()
 
-    req_id = str(int(datetime.now().timestamp()))[-6:]
+    req_id = uuid.uuid4().hex[:12]
     requests_db[req_id] = {
         "req_id": req_id,
         "user_id": user_id,
@@ -804,6 +1009,8 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         "rep_type": data["rep_type"],
         "reason": data["reason"],
         "proof": data["proof"],
+        "quantity": int(data.get("quantity", 1)),
+        "admin_messages": [],
         "status": "pending",
         "created_at": datetime.now().isoformat()
     }
@@ -816,30 +1023,15 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         parse_mode="HTML"
     )
 
-    # Уведомляем руководство
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить (+1)", callback_data=f"approve_{req_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
-        ]
-    ])
-
-    admin_msg = (
-        f"📨 <b>Новый отчет на выдачу #{req_id}</b>\n\n"
-        f"👤 <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
-        f"📌 <b>Тип:</b> <code>/{data['rep_type']}</code> (+1)\n"
-        f"📝 <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
-        f"🔗 <b>Доказательства:</b> {html.escape(data['proof'])}\n\n"
-        f"Выберите действие:"
-    )
-
-    # Отправляем всем админам и владельцам
-    recipients = list(set(owner_cfg.get("owner_ids", []) + admins_db))
+    # Every pending request gets its own pinned administrator message.
+    recipients = set(owner_cfg.get("owner_ids", []) + admins_db)
     for adm_id in recipients:
         try:
-            await bot.send_message(adm_id, admin_msg, reply_markup=admin_kb, disable_web_page_preview=True, parse_mode="HTML")
-        except Exception as e:
-            logger.warning(f"Could not send to admin {adm_id}: {e}")
+            await send_pending_report_to_admin(adm_id, req_id, requests_db[req_id])
+        except Exception as exc:
+            logger.warning(f"Could not notify admin {adm_id}: {exc}")
+    save_json(REQUESTS_FILE, requests_db)
+    await sync_state_to_cloud()
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  ОДОБРЕНИЕ / ОТКЛОНЕНИЕ ОТЧЕТА АДМИНОМ                          ║
@@ -856,29 +1048,42 @@ async def approve_report(callback: types.CallbackQuery):
         await callback.answer("Заявка уже была обработана ранее!", show_alert=True)
         return
 
+    quantity = int(req.get("quantity", 1))
+    # Lock this request before the first network await so other callbacks cannot
+    # approve/reject or change quantity while the credit is being applied.
+    req["status"] = "processing"
     try:
         success = await firebase_client.credit_report(
-            req["rep_type"], req["nick"], req.get("rank", "8"), req["reason"], req["proof"], req_id
+            req["rep_type"], req["nick"], req.get("rank", "8"),
+            req["reason"], req["proof"], req_id, quantity=quantity
         )
-        if success:
-            req["status"] = "approved"
-            req["approved_by"] = callback.from_user.full_name
-            save_json(REQUESTS_FILE, requests_db)
-            notify_state_changed()
-            await callback.answer("✅ База данных обновлена!", show_alert=False)
-            await callback.message.edit_text(
-                callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> {callback.from_user.mention_html()}",
-                parse_mode="HTML"
-            )
-            try:
-                await bot.send_message(int(req["user_id"]), f"✅ Отчет #{req_id} одобрен. Начислен +1 балл.")
-            except Exception as exc:
-                logger.warning(f"Could not notify reporter: {exc}")
-        else:
-            await callback.answer("⚠️ Firebase не обновился. Заявка остаётся ожидающей.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error updating sheet on approve: {e}")
-        await callback.answer(f"⚠️ Ошибка базы данных: {e}", show_alert=True)
+    except Exception as exc:
+        req["status"] = "pending"
+        logger.error(f"Error updating sheet on approve: {exc}")
+        await callback.answer("⚠️ Нет подтверждения Firebase; проверьте таблицу и повторите.", show_alert=True)
+        return
+    if not success:
+        req["status"] = "pending"
+        await callback.answer("⚠️ Firebase не обновился. Заявка остаётся ожидающей.", show_alert=True)
+        return
+
+    req["status"] = "approved"
+    req["approved_by"] = callback.from_user.full_name
+    save_json(REQUESTS_FILE, requests_db)
+    notify_state_changed()
+    try:
+        await callback.answer("✅ База данных обновлена!", show_alert=False)
+    except Exception as exc:
+        logger.info(f"Could not answer approval callback: {exc}")
+    await close_pending_report_messages(
+        req_id, req, f"✅ ОДОБРЕНО: +{quantity} ({callback.from_user.full_name})"
+    )
+    try:
+        await bot.send_message(int(req["user_id"]),
+                               f"✅ Отчет #{req_id} одобрен. Начислено +{quantity} балл(ов).")
+    except Exception as exc:
+        logger.warning(f"Could not notify reporter: {exc}")
+
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_report(callback: types.CallbackQuery):
@@ -897,10 +1102,7 @@ async def reject_report(callback: types.CallbackQuery):
     save_json(REQUESTS_FILE, requests_db)
     notify_state_changed()
 
-    await callback.message.edit_text(
-        callback.message.text + f"\n\n❌ <b>ОТКЛОНЕНО</b> лидером {callback.from_user.mention_html()}",
-        parse_mode="HTML"
-    )
+    await close_pending_report_messages(req_id, req, f"❌ ОТКЛОНЕНО ({callback.from_user.full_name})")
 
     try:
         await bot.send_message(
@@ -1181,81 +1383,174 @@ async def process_remove_admin(callback: types.CallbackQuery):
     else:
         await callback.answer("Администратор не найден в списке.", show_alert=True)
 
+@dp.message(Command("pending"))
+@dp.message(F.text == "📌 Ожидающие заявки")
+async def cmd_pending(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступно только руководству.")
+        return
+    pending = [(rid, req) for rid, req in requests_db.items() if req.get("status") == "pending"]
+    if not pending:
+        await message.answer("✅ Заявок, ожидающих решения, нет.")
+        return
+    await message.answer(f"📌 Ожидают решения: {len(pending)}. Отправляю и закрепляю сообщения.")
+    for rid, req in pending[:30]:
+        existing = next((ref for ref in req.get("admin_messages", [])
+                         if int(ref["chat_id"]) == message.chat.id), None)
+        if existing:
+            try:
+                await bot.pin_chat_message(chat_id=message.chat.id,
+                                           message_id=int(existing["message_id"]),
+                                           disable_notification=True)
+                continue
+            except Exception:
+                pass
+        try:
+            await send_pending_report_to_admin(message.chat.id, rid, req)
+        except Exception as exc:
+            logger.warning(f"Could not restore pinned report {rid}: {exc}")
+    save_json(REQUESTS_FILE, requests_db)
+    await sync_state_to_cloud()
+    if len(pending) > 30:
+        await message.answer("⚠️ Показаны первые 30 заявок. Остальные доступны после их обработки.")
+
+
+async def perform_manual_grant(message: types.Message, raw: str):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только лидер или заместитель может начислять баллы.")
+        return
+    args = raw.strip().split()
+    if len(args) != 3:
+        await message.answer("Формат: <code>/grant frp Nick_Name 2</code> или "
+                             "<code>/grant praise Nick_Name 3</code>.",
+                             parse_mode="HTML")
+        return
+    kind, nick, qty_raw = args
+    sheet = {"frp": "fractionrp", "fractionrp": "fractionrp",
+             "praise": "praise"}.get(kind.lower())
+    if not sheet or not qty_raw.isdecimal() or not 1 <= int(qty_raw) <= 20:
+        await message.answer("Укажите frp или praise и количество от 1 до 20.")
+        return
+    if len(nick) > 30 or "_" not in nick or not all(c.isalnum() or c == "_" for c in nick):
+        await message.answer("Укажите игровой ник в формате Name_Surname.")
+        return
+    user_entry = next((u for u in users_db.values()
+                       if u.get("nick", "").casefold() == nick.casefold()), None)
+    rank = str(user_entry.get("rank", "8")) if user_entry else "8"
+    qty = int(qty_raw)
+    grant_id = "manual-" + uuid.uuid4().hex
+    try:
+        success = await firebase_client.credit_report(
+            sheet, nick, rank, f"Ручная выдача администратором {message.from_user.id}",
+            "", grant_id, quantity=qty
+        )
+        if success:
+            await message.answer(
+                f"✅ Начислено <b>+{qty}</b> /{sheet} игроку <code>{html.escape(nick)}</code>. "
+                "Баллы доступны в очереди на выдачу.",
+                parse_mode="HTML"
+            )
+    except Exception as exc:
+        logger.error(f"Manual grant failed ({grant_id}): {exc}")
+        await message.answer(
+            "⚠️ Нет подтверждения начисления. Проверьте таблицу перед повторением команды."
+        )
+
+
+@dp.message(Command("grant"))
+async def cmd_grant(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    await perform_manual_grant(message, parts[1] if len(parts) > 1 else "")
+
+
+@dp.message(F.text == "➕ Начислить FRP / Похвалу")
+async def cmd_grant_menu(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для руководства.")
+        return
+    await state.set_state(GrantStates.waiting_for_details)
+    await message.answer(
+        "➕ Введите тип, ник и количество (1–20):\n"
+        "<code>frp Gomez_Addams 2</code>\n"
+        "<code>praise Gomez_Addams 3</code>\n\n"
+        "Или используйте /grant praise Gomez_Addams 3. Для отмены: /cancel.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(GrantStates.waiting_for_details)
+async def process_grant_details(message: types.Message, state: FSMContext):
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_main_menu(message.from_user.id))
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    raw = parts[1] if parts and parts[0] == "/grant" and len(parts) > 1 else (message.text or "")
+    await state.clear()
+    await perform_manual_grant(message, raw)
+
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Действие отменено.", reply_markup=get_main_menu(message.from_user.id))
 
 # Очередь на выдачу
+def render_queue(rows: List[Dict[str, Any]]):
+    pending = [r for r in rows if int(r.get("qty") or 0) > 0]
+    if not pending:
+        return "🎉 Очередь пуста! Все FRP выданы.", None
+
+    text = f"📋 <b>Очередь на выдачу (/fractionrp) — {len(pending)} чел.:</b>\n\n"
+    buttons = []
+    for i, r in enumerate(pending[:15], 1):
+        nick = str(r.get("nick", "Noname"))
+        qty = int(r.get("qty") or 0)
+        rank = str(r.get("rank", ""))
+        rank_text = f" [{rank}]" if rank else ""
+        text += (f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_text)} — <b>{qty} шт.</b>\n"
+                 f"Команда: <code>/fractionrp {html.escape(nick)}</code>\n\n")
+        buttons.append([InlineKeyboardButton(text=f"✓ Выдать 1 для {nick}", callback_data=f"issue_1_{nick}")])
+    if len(pending) > 15:
+        text += f"…Ещё {len(pending) - 15} игроков.\n"
+    text += "<i>Список обновляется после каждого списания.</i>"
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
 @dp.message(Command("queue"))
 async def cmd_queue(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.answer("Доступно только руководству.")
         return
-
-    await message.answer("🔄 Загружаю очередь из таблицы...")
     try:
         rows = await firebase_client.get_sheet("fractionrp")
+        text, keyboard = render_queue(rows)
+        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Error fetching queue: {e}")
-        rows = []
+        logger.error(f"Could not load issue queue: {e}")
+        await message.answer("⚠️ Не удалось загрузить очередь из Firebase.")
 
-    pending = [r for r in rows if r.get("status") == "На выдаче" or (r.get("qty") or 0) > 0]
 
-    if not pending:
-        await message.answer("🎉 Очередь пуста! Нет игроков со статусом «На выдаче».")
-        return
-
-    text = f"📋 <b>Очередь на выдачу (/fractionrp) — {len(pending)} чел.:</b>\n\n"
-    keyboard_buttons = []
-
-    for i, r in enumerate(pending[:15], 1):
-        nick = r.get("nick", "Noname")
-        qty = r.get("qty", 0)
-        rank = r.get("rank", "")
-        rank_str = f" [{rank}]" if rank else ""
-        cmd = f"/fractionrp {nick}"
-        text += f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_str)} — <b>{qty} шт.</b>\nКоманда: <code>{cmd}</code>\n\n"
-
-        keyboard_buttons.append([
-            InlineKeyboardButton(text=f"✓ Выдать 1 для {nick}", callback_data=f"issue_1_{nick}")
-        ])
-
-    text += "<i>(Кликните по команде выше, чтобы скопировать её в игре)</i>"
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
-# Быстрое списание 1 балла админом прямо из Telegram
 @dp.callback_query(F.data.startswith("issue_1_"))
 async def process_issue_one(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("У вас нет прав!", show_alert=True)
         return
-
-    nick = callback.data.replace("issue_1_", "")
+    nick = callback.data[len("issue_1_"):]
     try:
+        remaining = await firebase_client.debit_one("fractionrp", nick)
+        await callback.answer(
+            f"✓ {nick}: осталось {remaining}" if remaining else f"{nick}: баллы закончились",
+            show_alert=False
+        )
+        # Refresh original message; zero-quantity rows disappear completely.
         rows = await firebase_client.get_sheet("fractionrp")
-        item = next((r for r in rows if r.get("nick", "").lower() == nick.lower()), None)
-
-        if not item:
-            await callback.answer("Игрок не найден в таблице!", show_alert=True)
-            return
-
-        cur_qty = item.get("qty", 0)
-        new_qty = max(0, cur_qty - 1)
-        item["qty"] = new_qty
-        if new_qty == 0:
-            item["status"] = "Выдано"
-
-        success = await firebase_client.update_sheet("fractionrp", rows)
-        if success:
-            await callback.answer(f"✓ Списан 1 балл у {nick}! Осталось: {new_qty}", show_alert=True)
-        else:
-            await callback.answer("⚠️ Ошибка сохранения в Firebase!", show_alert=True)
+        new_text, new_keyboard = render_queue(rows)
+        await callback.message.edit_text(new_text, reply_markup=new_keyboard, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Error issuing point: {e}")
-        await callback.answer(f"⚠️ Ошибка: {e}", show_alert=True)
+        await callback.answer("⚠️ Списание не подтверждено. Обновите /queue.", show_alert=True)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  СЛУЖБА ПОДДЕРЖКИ И БАГ-ТРЕКЕР В БОТЕ                            ║
