@@ -34,6 +34,11 @@ class BotSecurityChecks(unittest.TestCase):
         section = SOURCE.split('async def approve_report(', 1)[1].split('async def reject_report(', 1)[0]
         self.assertLess(section.index('await firebase_client.credit_report('), section.index('req["status"] = "approved"'))
 
+    def test_report_idempotency_ledger(self):
+        self.assertIn('if report_id in applied_ids:', SOURCE)
+        self.assertIn('"appliedReportIds"', SOURCE)
+        self.assertIn('req["proof"], req_id', SOURCE)
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 
