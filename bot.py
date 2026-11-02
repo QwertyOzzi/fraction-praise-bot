@@ -1657,7 +1657,7 @@ async def fetch_agent_directory() -> List[Dict[str, Any]]:
         if raw == "X":
             rank = 10
         else:
-            matched = re.match(r"^(10|[1-9])(?:\\D|$)", raw)
+            matched = re.match(r"^(10|[1-9])(?:[^0-9]|$)", raw)
             rank = int(matched.group(1)) if matched else 0
         return (-rank, str(item["nick"]).casefold())
 
