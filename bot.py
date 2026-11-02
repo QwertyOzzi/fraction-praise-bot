@@ -154,10 +154,10 @@ class FirebaseClient:
                         return self._parse_firestore_rows(rows_field)
                     else:
                         logger.warning(f"Failed to fetch {sheet_name} from Firestore: {resp.status}")
-                        return []
+                        raise RuntimeError(f"Firestore read failed: {resp.status}")
         except Exception as e:
             logger.error(f"Error fetching sheet {sheet_name}: {e}")
-            return []
+            raise
 
     async def update_sheet(self, sheet_name: str, rows: List[Dict[str, Any]]) -> bool:
         token = await self.get_token()
@@ -811,28 +811,6 @@ async def approve_report(callback: types.CallbackQuery):
         await callback.answer("Заявка уже была обработана ранее!", show_alert=True)
         return
 
-    req["status"] = "approved"
-    req["approved_by"] = callback.from_user.full_name
-    save_json(REQUESTS_FILE, requests_db)
-    notify_state_changed()
-
-    # Обновляем сообщение у админа
-    await callback.message.edit_text(
-        callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> лидером {callback.from_user.mention_html()} (+1 балл добавлен в таблицу)",
-        parse_mode="HTML"
-    )
-
-    # Уведомляем игрока
-    try:
-        await bot.send_message(
-            int(req["user_id"]),
-            f"🎉 <b>Ваш отчет #{req_id} на /{req['rep_type']} ОДОБРЕН!</b>\n\n"
-            f"Вам начислен <b>+1 балл</b> (статус «На выдаче»). Ожидайте выдачи в игре!",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Error notifying user: {e}")
-
     # Обновляем таблицу в Firestore
     sheet_name = req["rep_type"]
     nick = req["nick"]
@@ -866,9 +844,21 @@ async def approve_report(callback: types.CallbackQuery):
 
         success = await firebase_client.update_sheet(sheet_name, rows)
         if success:
+            req["status"] = "approved"
+            req["approved_by"] = callback.from_user.full_name
+            save_json(REQUESTS_FILE, requests_db)
+            notify_state_changed()
             await callback.answer("✅ База данных обновлена!", show_alert=False)
+            await callback.message.edit_text(
+                callback.message.text + f"\n\n✅ <b>ОДОБРЕНО</b> {callback.from_user.mention_html()}",
+                parse_mode="HTML"
+            )
+            try:
+                await bot.send_message(int(req["user_id"]), f"✅ Отчет #{req_id} одобрен. Начислен +1 балл.")
+            except Exception as exc:
+                logger.warning(f"Could not notify reporter: {exc}")
         else:
-            await callback.answer("⚠️ Одобрено локально (проверьте пароль Firebase /setpass)", show_alert=True)
+            await callback.answer("⚠️ Firebase не обновился. Заявка остаётся ожидающей.", show_alert=True)
     except Exception as e:
         logger.error(f"Error updating sheet on approve: {e}")
         await callback.answer(f"⚠️ Ошибка базы данных: {e}", show_alert=True)
