@@ -1182,6 +1182,17 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             )
             return
         target_id, target_profile = candidates[0]
+        # Cached usernames can be reassigned. Verify the live Telegram identity
+        # before allowing owner-approved privilege escalation.
+        try:
+            live_chat = await bot.get_chat(target_id)
+        except Exception as exc:
+            logger.warning(f"Could not verify Telegram username for {target_id}: {exc}")
+            await message.answer("⚠️ Не удалось проверить Telegram-юзернейм. Попросите человека написать /start.")
+            return
+        if (getattr(live_chat, "username", "") or "").casefold() != handle.casefold():
+            await message.answer("⚠️ Telegram-юзернейм изменился. Попросите человека написать /start.")
+            return
         if target_id == uid or is_admin(target_id):
             await message.answer("ℹ️ У этого пользователя уже есть права администратора.")
             return
