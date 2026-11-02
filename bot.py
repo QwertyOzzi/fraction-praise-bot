@@ -29,11 +29,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
-OWNER_KEY = os.getenv("OWNER_KEY", "").strip()
 OWNER_TELEGRAM_IDS = {6060562962}
 # 2. Ключ для лидеров и заместителей (требует подтверждения владельца)
 DEPUTY_KEY = os.getenv("DEPUTY_KEY", "").strip()
-ADMIN_KEY = OWNER_KEY  # совместимость
+ADMIN_KEY = ""  # legacy compatibility; owner access is Telegram ID-based
 
 # Информация о Лидере (назначается Тех. Администратором через сайт)
 LEADER_INFO: Dict[str, str] = {
@@ -70,10 +69,9 @@ def save_json(filepath: str, data: Any):
 
 # Firebase credentials with reliable defaults & file persistence
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "fraction-praise").strip()
-FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "AIzaSyBX7JWz6ay-ozED5ZmKoC7Umn58ae2lvIE").strip()
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "").strip()
 FIREBASE_EMAIL = os.getenv("FIREBASE_EMAIL", "goponos12@gmail.com").strip()
 
-_saved_fb_cfg = load_json("firebase_config.json", {})
 FIREBASE_PASSWORD = os.getenv("FIREBASE_PASSWORD", "").strip()
 
 WEBAPP_URL = "https://qwertyozzi.github.io/fraction-praise-tracker/"
@@ -93,7 +91,7 @@ if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
         save_json(ADMINS_FILE, admins_db)
 
 def is_admin(user_id: int) -> bool:
-    return user_id in admins_db or user_id in owner_cfg.get("owner_ids", [])
+    return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
 
 def is_owner(user_id: int) -> bool:
     return user_id in owner_cfg.get("owner_ids", [])
@@ -107,9 +105,6 @@ class FirebaseClient:
         self.api_key = api_key
         self.email = email
         self.password = password
-        if not self.password:
-            saved_cfg = load_json("firebase_config.json", {})
-            self.password = os.getenv("FIREBASE_PASSWORD", "").strip()
         self.id_token: Optional[str] = None
         self.token_expiry = 0
 
@@ -522,7 +517,7 @@ async def process_nick(message: types.Message, state: FSMContext):
     text_val = (message.text or "").strip()
 
     # Если пользователь ввёл ключ напрямую или нажал команду /admin
-    if text_val.startswith("/admin") or (DEPUTY_KEY and text_val == DEPUTY_KEY) or (OWNER_KEY and text_val == OWNER_KEY):
+    if text_val.startswith("/admin") or (DEPUTY_KEY and text_val == DEPUTY_KEY):
         if not text_val.startswith("/admin"):
             message.text = f"/admin {text_val}"
         await cmd_admin_auth(message, state)
@@ -934,7 +929,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         await message.answer(
             "ℹ️ <b>Авторизация в системе руководства:</b>\n\n"
             "• <b>Для заместителей и лидеров:</b>\n"
-            f"Отправьте команду: <code>/admin [KEY REDACTED]</code>\n"
+            "Используйте команду /admin с вашим персональным ключом.\n"
             "<i>(После отправки запрос поступит Главному Лидеру на одобрение)</i>\n\n"
             "• <b>Для Главного Руководителя:</b>\n"
             "Используйте ваш личный мастер-ключ: <code>/admin мастер_ключ</code>",
@@ -959,7 +954,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             "🛠️ <b>Вы успешно авторизованы как ГЛАВНЫЙ ТЕХНИЧЕСКИЙ АДМИНИСТРАТОР!</b>\n\n"
             f"👑 <b>Действующий Лидер фракции:</b> <code>{lead_nick}</code>\n"
             "<i>(Лидера вы можете в любой момент назначить или сменить через Панель управления на сайте)</i>\n\n"
-            f"🔑 <b>Текущий ключ для заместителей:</b> <code>[KEY REDACTED]</code>\n"
+            "🔑 Ключ заместителя задаётся только в настройках Render.\n"
             "Когда заместитель вводит этот ключ, вам в личные сообщения бота приходит запрос с кнопками «Одобрить» / «Отклонить».\n\n"
             "Вам доступны:\n"
             "• Подтверждение доступа для новых заместителей\n"
@@ -1016,7 +1011,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             f"👤 <b>Агент:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
             f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
             f"📱 <b>Пользователь:</b> {html.escape(message.from_user.full_name)} {html.escape(username_str)}\n"
-            f"🔑 <b>Введённый ключ:</b> <code>[KEY REDACTED]</code>\n\n"
+            f"🔑 <b>Введённый ключ:</b> выданный ключ\n\n"
             "Предоставить пользователю права руководства (проверка отчетов, очередь на выдачу, списание баллов)?"
         )
 
@@ -1428,7 +1423,7 @@ async def handle_api_support(request):
         description = str(data.get("description", "")).strip()
         screenshot = str(data.get("screenshot", "")).strip()
 
-        if not nick or not description:
+        if not nick or not description or len(nick) > 80 or len(description) > 4000 or len(contact) > 200 or len(category) > 80 or len(screenshot) > 1000:
             return web.json_response({"error": "Missing nick or description"}, status=400, headers=headers)
 
         ticket_payload = {
@@ -1488,8 +1483,8 @@ async def start_web_server():
 # ║  MAIN ENTRY POINT                                               ║
 # ╚══════════════════════════════════════════════════════════════════╝
 async def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not configured!")
+    if not BOT_TOKEN or not FIREBASE_PASSWORD or not FIREBASE_API_KEY:
+        logger.error("Required credentials are not configured!")
         return
 
     # Загружаем сохранённое состояние (все юзеры, админы, замы) из Firestore
