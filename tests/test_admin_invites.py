@@ -50,7 +50,7 @@ def load_functions(names, other=None):
             nodes.append(node)
     env = {
         "re": re, "html": html, "uuid": uuid, "datetime": datetime.datetime,
-        "timezone": datetime.timezone, "types": types,
+        "timezone": datetime.timezone, "types": types.SimpleNamespace(Message=Message, CallbackQuery=Callback),
         "InlineKeyboardButton": Button, "InlineKeyboardMarkup": Markup,
         "is_owner": lambda x: x == 6060562962,
         "is_admin": lambda x: x == 6060562962,
