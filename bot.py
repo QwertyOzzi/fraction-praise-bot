@@ -429,8 +429,13 @@ async def sync_state_from_cloud():
     """Загрузка сохранённого состояния бота из Firestore при запуске."""
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
+        token = await firebase_client.get_token()
+        if not token:
+            logger.warning("Firebase authentication unavailable; cannot load cloud state")
+            return
+        headers = {"Authorization": f"Bearer {token}"}
         async with ClientSession() as session:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     raw = data.get("fields", {}).get("data", {}).get("stringValue", "{}")
@@ -1772,13 +1777,15 @@ async def main():
         logger.error("Required credentials are not configured!")
         return
 
-    # Загружаем сохранённое состояние (все юзеры, админы, замы) из Firestore
-    await sync_state_from_cloud()
-
-    # Запускаем фоновый web-сервер для Render
+    # Render must see an open HTTP port even when Firebase is responding slowly.
     await start_web_server()
 
-    # Запускаем polling бота
+    # Do not let an unavailable Firestore dependency block the entire deployment.
+    try:
+        await asyncio.wait_for(sync_state_from_cloud(), timeout=20)
+    except asyncio.TimeoutError:
+        logger.error("Initial Firebase sync timed out after 20 seconds")
+
     logger.info("Bot polling starting...")
     await dp.start_polling(bot)
 
