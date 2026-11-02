@@ -29,7 +29,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-RELEASE_TAG = "bulk-grants-agent-panel-v3"
+RELEASE_TAG = "leader-deputy-roles-v4"
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
@@ -86,6 +86,7 @@ logger = logging.getLogger(__name__)
 users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
 pending_admin_requests: Dict[int, Dict[str, Any]] = {}
+admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 
@@ -100,6 +101,16 @@ def is_admin(user_id: int) -> bool:
 
 def is_owner(user_id: int) -> bool:
     return user_id in OWNER_TELEGRAM_IDS
+
+
+def is_leader(user_id: int) -> bool:
+    return is_owner(user_id) or (user_id in admins_db and admin_roles.get(str(user_id)) == "leader")
+
+
+def role_name(user_id: int) -> str:
+    if is_owner(user_id): return "Владелец"
+    if not is_admin(user_id): return "Агент"
+    return "Лидер" if is_leader(user_id) else "Заместитель"
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FIREBASE REST CLIENT                                            ║
@@ -448,6 +459,14 @@ async def sync_state_from_cloud():
                     for uid, udata in cloud_users.items():
                         users_db[str(uid)] = udata
 
+                    cloud_roles = cloud_data.get("admin_roles", {})
+                    # Role labels are not grants: they apply only to IDs approved locally.
+                    if isinstance(cloud_roles, dict):
+                        for role_id, role in cloud_roles.items():
+                            if str(role_id).isdigit() and int(role_id) in admins_db and role in ("leader", "deputy"):
+                                admin_roles[str(role_id)] = role
+                        save_json("admin_roles.json", admin_roles)
+
                     cloud_admins = cloud_data.get("admins", [])
                     # Cloud-stored admins are not a source of authorization.\n                    # Only previously approved local admins remain trusted.
 
@@ -511,6 +530,7 @@ async def sync_state_to_cloud():
             payload_data = {
                 "users": users_db,
                 "admins": admins_db,
+                "admin_roles": admin_roles,
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db
             }
@@ -1193,18 +1213,19 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         if (getattr(live_chat, "username", "") or "").casefold() != handle.casefold():
             await message.answer("⚠️ Telegram-юзернейм изменился. Попросите человека написать /start.")
             return
-        if target_id == uid or is_admin(target_id):
-            await message.answer("ℹ️ У этого пользователя уже есть права администратора.")
+        if target_id == uid:
+            await message.answer("ℹ️ Владельца нельзя переназначить.")
             return
         nonce = uuid.uuid4().hex[:16]
         pending_admin_requests[target_id] = {
             "expires": datetime.now(timezone.utc).timestamp() + 600,
-            "nonce": nonce, "source": "owner"
+            "nonce": nonce, "source": "owner", "role": None
         }
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Назначить", callback_data=f"adm_grant_{target_id}_{nonce}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_deny_{target_id}_{nonce}")
-        ]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Лидер", callback_data=f"adm_role_{target_id}_{nonce}_leader")],
+            [InlineKeyboardButton(text="⭐ Заместитель", callback_data=f"adm_role_{target_id}_{nonce}_deputy")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_deny_{target_id}_{nonce}")]
+        ])
         await message.answer(
             f"👤 <b>Назначить администратором?</b>\n"
             f"Telegram: @{html.escape(handle)}\n"
@@ -1266,7 +1287,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         # Only a fresh request backed by the deputy key can be confirmed.
         nonce = uuid.uuid4().hex[:16]
         pending_admin_requests[uid] = {"expires": datetime.now(timezone.utc).timestamp() + 600,
-                                       "nonce": nonce, "source": "deputy"}
+                                       "nonce": nonce, "source": "deputy", "role": "deputy"}
 
         # Уведомляем заместителя о том, что запрос отправлен
         await message.answer(
@@ -1335,6 +1356,36 @@ def verify_admin_request(data: str, prefix: str):
     return target_id
 
 
+@dp.callback_query(F.data.startswith("adm_role_"))
+async def callback_admin_select_role(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Только владелец может назначать руководство.", show_alert=True)
+        return
+    parts = callback.data.removeprefix("adm_role_").split("_")
+    if len(parts) != 3:
+        await callback.answer("Неверный запрос.", show_alert=True)
+        return
+    target, nonce, role = parts
+    if not target.isdecimal() or role not in ("leader", "deputy"):
+        await callback.answer("Неверная роль.", show_alert=True)
+        return
+    target_id = int(target)
+    if verify_admin_request(f"adm_grant_{target_id}_{nonce}", "adm_grant_") != target_id:
+        await callback.answer("Запрос истёк.", show_alert=True)
+        return
+    request = pending_admin_requests.get(target_id, {})
+    if request.get("source") != "owner":
+        await callback.answer("Недопустимый запрос.", show_alert=True)
+        return
+    request["role"] = role
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить назначение", callback_data=f"adm_grant_{target_id}_{nonce}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_deny_{target_id}_{nonce}")]
+    ])
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer("👑 Лидер" if role == "leader" else "⭐ Заместитель")
+
+
 @dp.callback_query(F.data.startswith("adm_grant_"))
 async def callback_admin_grant(callback: types.CallbackQuery):
     if not is_owner(callback.from_user.id):
@@ -1344,10 +1395,16 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     if target_id is None:
         await callback.answer("Запрос недействителен или истёк.", show_alert=True)
         return
+    role = pending_admin_requests.get(target_id, {}).get("role")
+    if role not in ("leader", "deputy"):
+        await callback.answer("Сначала выберите роль.", show_alert=True)
+        return
     pending_admin_requests.pop(target_id, None)
     if target_id not in admins_db:
         admins_db.append(target_id)
         save_json(ADMINS_FILE, admins_db)
+    admin_roles[str(target_id)] = role
+    save_json("admin_roles.json", admin_roles)
     notify_state_changed()
     target_user = users_db.get(str(target_id), {})
     try:
@@ -1360,7 +1417,7 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     try:
         await bot.send_message(
             target_id,
-            "🎉 <b>Владелец выдал вам права администратора.</b>\n"
+            f"🎉 <b>Ваша роль: {role_name(target_id)}.</b>\n"
             "Откройте /start для обновления меню.",
             reply_markup=get_main_menu(target_id), parse_mode="HTML"
         )
@@ -1424,7 +1481,7 @@ async def cmd_list_admins(message: types.Message):
         is_me = (adm_id == message.from_user.id)
         is_own = adm_id in owner_cfg.get("owner_ids", [])
         
-        role_label = " 👑 <b>(Владелец)</b>" if is_own else " ⭐ <i>(Заместитель)</i>"
+        role_label = " 👑 <b>(Владелец)</b>" if is_own else (" 👑 <b>(Лидер)</b>" if is_leader(adm_id) else " ⭐ <i>(Заместитель)</i>")
         me_label = " <i>(Вы)</i>" if is_me else ""
 
         text += f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_str)} {html.escape(username)}{role_label}{me_label}\n   ID: <code>{adm_id}</code>\n\n"
@@ -1460,6 +1517,8 @@ async def process_remove_admin(callback: types.CallbackQuery):
 
     if target_id in admins_db:
         admins_db.remove(target_id)
+        admin_roles.pop(str(target_id), None)
+        save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
         notify_state_changed()
         await callback.answer("Заместитель успешно снят!", show_alert=True)
@@ -1914,7 +1973,7 @@ async def agent_do_action(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agranks:"))
 async def agent_rank_menu(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_leader(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -1942,7 +2001,7 @@ async def agent_rank_menu(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agrank:"))
 async def agent_set_rank(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_leader(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:

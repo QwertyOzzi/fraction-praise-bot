@@ -68,7 +68,7 @@ class BotSecurityChecks(unittest.TestCase):
         section = SOURCE.split("async def main():", 1)[1]
         self.assertLess(section.index("await start_web_server()"), section.index("await asyncio.wait_for(sync_state_from_cloud(), timeout=20)"))
         self.assertIn('headers = {"Authorization": f"Bearer {token}"}', SOURCE)
-        self.assertIn('RELEASE_TAG = "bulk-grants-agent-panel-v3"', SOURCE)
+        self.assertIn('RELEASE_TAG = "leader-deputy-roles-v4"', SOURCE)
 
     def test_python_syntax(self):
         ast.parse(SOURCE)
