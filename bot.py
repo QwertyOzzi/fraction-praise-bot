@@ -536,6 +536,9 @@ class ReportStates(StatesGroup):
     waiting_for_proof = State()
     confirm = State()
 
+class GrantStates(StatesGroup):
+    waiting_for_details = State()
+
 class SupportStates(StatesGroup):
     waiting_for_message = State()
 
@@ -549,7 +552,9 @@ MENU_BUTTONS = [
     "⚙️ Мой никнейм",
     "💬 Поддержка / Баг-репорт",
     "📋 Очередь на выдачу (Админ)",
-    "👥 Список админов"
+    "👥 Список админов",
+    "📌 Ожидающие заявки",
+    "➕ Начислить FRP / Похвалу"
 ]
 
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
@@ -567,6 +572,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     ]
     if admin_mode:
         buttons.append([KeyboardButton(text="📋 Очередь на выдачу (Админ)"), KeyboardButton(text="👥 Список админов")])
+        buttons.append([KeyboardButton(text="📌 Ожидающие заявки"), KeyboardButton(text="➕ Начислить FRP / Похвалу")])
 
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -621,6 +627,12 @@ async def process_nick(message: types.Message, state: FSMContext):
             return
         elif text_val == "👥 Список админов" or text_val == "/admins":
             await cmd_list_admins(message)
+            return
+        elif text_val in ("📌 Ожидающие заявки", "/pending"):
+            await cmd_pending(message)
+            return
+        elif text_val in ("➕ Начислить FRP / Похвалу", "/grant"):
+            await cmd_grant_menu(message, state)
             return
         elif text_val == "📊 Мой статус":
             await cmd_my_status(message)
@@ -1349,6 +1361,113 @@ async def process_remove_admin(callback: types.CallbackQuery):
         await cmd_list_admins(callback.message)
     else:
         await callback.answer("Администратор не найден в списке.", show_alert=True)
+
+@dp.message(Command("pending"))
+@dp.message(F.text == "📌 Ожидающие заявки")
+async def cmd_pending(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступно только руководству.")
+        return
+    pending = [(rid, req) for rid, req in requests_db.items() if req.get("status") == "pending"]
+    if not pending:
+        await message.answer("✅ Заявок, ожидающих решения, нет.")
+        return
+    await message.answer(f"📌 Ожидают решения: {len(pending)}. Отправляю и закрепляю сообщения.")
+    for rid, req in pending[:30]:
+        existing = next((ref for ref in req.get("admin_messages", [])
+                         if int(ref["chat_id"]) == message.chat.id), None)
+        if existing:
+            try:
+                await bot.pin_chat_message(chat_id=message.chat.id,
+                                           message_id=int(existing["message_id"]),
+                                           disable_notification=True)
+                continue
+            except Exception:
+                pass
+        try:
+            await send_pending_report_to_admin(message.chat.id, rid, req)
+        except Exception as exc:
+            logger.warning(f"Could not restore pinned report {rid}: {exc}")
+    save_json(REQUESTS_FILE, requests_db)
+    await sync_state_to_cloud()
+    if len(pending) > 30:
+        await message.answer("⚠️ Показаны первые 30 заявок. Остальные доступны после их обработки.")
+
+
+async def perform_manual_grant(message: types.Message, raw: str):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только лидер или заместитель может начислять баллы.")
+        return
+    args = raw.strip().split()
+    if len(args) != 3:
+        await message.answer("Формат: <code>/grant frp Nick_Name 2</code> или "
+                             "<code>/grant praise Nick_Name 3</code>.",
+                             parse_mode="HTML")
+        return
+    kind, nick, qty_raw = args
+    sheet = {"frp": "fractionrp", "fractionrp": "fractionrp",
+             "praise": "praise"}.get(kind.lower())
+    if not sheet or not qty_raw.isdecimal() or not 1 <= int(qty_raw) <= 20:
+        await message.answer("Укажите frp или praise и количество от 1 до 20.")
+        return
+    if len(nick) > 30 or "_" not in nick or not all(c.isalnum() or c == "_" for c in nick):
+        await message.answer("Укажите игровой ник в формате Name_Surname.")
+        return
+    user_entry = next((u for u in users_db.values()
+                       if u.get("nick", "").casefold() == nick.casefold()), None)
+    rank = str(user_entry.get("rank", "8")) if user_entry else "8"
+    qty = int(qty_raw)
+    grant_id = "manual-" + uuid.uuid4().hex
+    try:
+        success = await firebase_client.credit_report(
+            sheet, nick, rank, f"Ручная выдача администратором {message.from_user.id}",
+            "", grant_id, quantity=qty
+        )
+        if success:
+            await message.answer(
+                f"✅ Начислено <b>+{qty}</b> /{sheet} игроку <code>{html.escape(nick)}</code>. "
+                "Баллы доступны в очереди на выдачу.",
+                parse_mode="HTML"
+            )
+    except Exception as exc:
+        logger.error(f"Manual grant failed ({grant_id}): {exc}")
+        await message.answer(
+            "⚠️ Нет подтверждения начисления. Проверьте таблицу перед повторением команды."
+        )
+
+
+@dp.message(Command("grant"))
+async def cmd_grant(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    await perform_manual_grant(message, parts[1] if len(parts) > 1 else "")
+
+
+@dp.message(F.text == "➕ Начислить FRP / Похвалу")
+async def cmd_grant_menu(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для руководства.")
+        return
+    await state.set_state(GrantStates.waiting_for_details)
+    await message.answer(
+        "➕ Введите тип, ник и количество (1–20):\n"
+        "<code>frp Gomez_Addams 2</code>\n"
+        "<code>praise Gomez_Addams 3</code>\n\n"
+        "Или используйте /grant praise Gomez_Addams 3. Для отмены: /cancel.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(GrantStates.waiting_for_details)
+async def process_grant_details(message: types.Message, state: FSMContext):
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_main_menu(message.from_user.id))
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    raw = parts[1] if parts and parts[0] == "/grant" and len(parts) > 1 else (message.text or "")
+    await state.clear()
+    await perform_manual_grant(message, raw)
+
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
