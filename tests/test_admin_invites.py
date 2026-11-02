@@ -83,7 +83,9 @@ class TestAdminInvites(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.env["pending_admin_requests"]), 1)
         kb = m.answers[-1][1]["reply_markup"]
         data = kb.inline_keyboard[0][0].callback_data
-        self.assertEqual(self.env["verify_admin_request"](data, "adm_grant_"), 101)
+        self.assertTrue(data.startswith("adm_role_101_"))
+        self.assertTrue(data.endswith("_leader"))
+        self.assertEqual(kb.inline_keyboard[1][0].text, "⭐ Заместитель")
 
     async def test_non_owner_cannot_direct_invite(self):
         m = Message("/admin @Known_User", user_id=111)
@@ -114,6 +116,13 @@ class TestAdminInvites(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAdminAuthStatic(unittest.TestCase):
+    def test_leader_only_rank_changes(self):
+        for handler in ("agent_rank_menu", "agent_set_rank"):
+            body = SOURCE.split(f"async def {handler}(", 1)[1].split("\\n\\n@dp.", 1)[0]
+            self.assertIn("if not is_leader(callback.from_user.id):", body)
+        self.assertIn('admin_roles[str(target_id)] = role', SOURCE)
+        self.assertIn('role not in ("leader", "deputy")', SOURCE)
+
     def test_grant_callback_owner_only(self):
         section = SOURCE.split("async def callback_admin_grant(", 1)[1].split(
             "async def callback_admin_deny(", 1)[0]
