@@ -329,13 +329,13 @@ async def process_nick(message: types.Message, state: FSMContext):
         return
 
     # 2. Строгая проверка формата ника SA-MP (Имя_Фамилия)
-    clean_nick = text.replace(" ", "_")
+    nick = text.replace(" ", "_")
     invalid_chars = set("()[]{}<>!@#$%^&*+=?.,/'\"|:;0123456789")
     # Проверяем, что нет спецсимволов/цифр/эмодзи и есть одно подчеркивание
-    has_bad_chars = any(c in invalid_chars for c in clean_nick)
-    is_emoji = any(ord(c) > 127 and ord(c) not in range(1040, 1104) for c in clean_nick)
+    has_bad_chars = any(c in invalid_chars for c in nick)
+    is_emoji = any(ord(c) > 127 and ord(c) not in range(1040, 1104) for c in nick)
 
-    if "_" not in clean_nick or len(clean_nick) < 4 or has_bad_chars or is_emoji:
+    if "_" not in nick or len(nick) < 4 or has_bad_chars or is_emoji:
         await message.answer(
             "⚠️ **Некорректный игровой никнейм!**\n\n"
             "Игровой ник должен быть в формате `Имя_Фамилия` (например: `Gomez_Addams` или `Samuel_Norton`).\n\n"
@@ -344,7 +344,7 @@ async def process_nick(message: types.Message, state: FSMContext):
         )
         return
 
-    await state.update_data(nick=clean_nick)
+    await state.update_data(nick=nick)
     
     # Клавиатура выбора ранга
     kb = InlineKeyboardMarkup(inline_keyboard=[
