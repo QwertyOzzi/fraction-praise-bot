@@ -531,6 +531,7 @@ class RegistrationStates(StatesGroup):
 
 class ReportStates(StatesGroup):
     waiting_for_type = State()
+    waiting_for_quantity = State()
     waiting_for_reason = State()
     waiting_for_proof = State()
     confirm = State()
@@ -778,19 +779,60 @@ async def start_report(message: types.Message, state: FSMContext):
     )
     await state.set_state(ReportStates.waiting_for_type)
 
-@dp.callback_query(ReportStates.waiting_for_type, F.data.in_(["type_fractionrp", "type_praise"]))
-async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
-    rep_type = "fractionrp" if callback.data == "type_fractionrp" else "praise"
-    await state.update_data(rep_type=rep_type)
-
+async def show_report_reason_menu(message: types.Message, state: FSMContext, edit: bool = False):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💼 Вербовка", callback_data="reason_вербовка")],
         [InlineKeyboardButton(text="📑 Отчёт на форуме", callback_data="reason_отчет")],
         [InlineKeyboardButton(text="🎯 Другое задание", callback_data="reason_другое")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
-    await callback.message.edit_text("Выберите причину / категорию выдачи:", reply_markup=kb)
+    if edit:
+        await message.edit_text("Выберите причину / категорию выдачи:", reply_markup=kb)
+    else:
+        await message.answer("Выберите причину / категорию выдачи:", reply_markup=kb)
     await state.set_state(ReportStates.waiting_for_reason)
+
+
+@dp.callback_query(ReportStates.waiting_for_type, F.data.in_(["type_fractionrp", "type_praise"]))
+async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
+    rep_type = "fractionrp" if callback.data == "type_fractionrp" else "praise"
+    await state.update_data(rep_type=rep_type, quantity=1)
+    if rep_type == "praise":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=str(n), callback_data=f"repqty_{n}") for n in (1, 2, 3, 5, 10)],
+            [InlineKeyboardButton(text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
+        ])
+        await callback.message.edit_text("🌟 Сколько похвал в заявке? Выберите число или введите от 1 до 20:", reply_markup=kb)
+        await state.set_state(ReportStates.waiting_for_quantity)
+    else:
+        await show_report_reason_menu(callback.message, state, edit=True)
+
+
+@dp.callback_query(ReportStates.waiting_for_quantity, F.data.startswith("repqty_"))
+async def process_report_quantity_button(callback: types.CallbackQuery, state: FSMContext):
+    value = callback.data[len("repqty_"):]
+    if value == "custom":
+        await callback.message.edit_text("Введите количество похвал числом от 1 до 20:")
+        await callback.answer()
+        return
+    if not value.isdecimal() or not 1 <= int(value) <= 20:
+        await callback.answer("Укажите число от 1 до 20", show_alert=True)
+        return
+    await state.update_data(quantity=int(value))
+    await show_report_reason_menu(callback.message, state, edit=True)
+    await callback.answer()
+
+
+@dp.message(ReportStates.waiting_for_quantity)
+async def process_report_quantity_text(message: types.Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value.isdecimal() or not 1 <= int(value) <= 20:
+        await message.answer("⚠️ Укажите целое число от 1 до 20 или отправьте /cancel.")
+        return
+    await state.update_data(quantity=int(value))
+    await show_report_reason_menu(message, state)
+
 
 @dp.callback_query(ReportStates.waiting_for_reason, F.data.startswith("reason_"))
 async def process_report_reason(callback: types.CallbackQuery, state: FSMContext):
@@ -806,7 +848,10 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
 
 @dp.message(ReportStates.waiting_for_proof)
 async def process_report_proof(message: types.Message, state: FSMContext):
-    proof = message.text.strip()
+    proof = (message.text or "").strip()
+    if not proof.startswith(("https://", "http://")) or len(proof) > 1000:
+        await message.answer("⚠️ Отправьте ссылку http(s) длиной не более 1000 символов.")
+        return
     data = await state.get_data()
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id, {})
@@ -818,7 +863,7 @@ async def process_report_proof(message: types.Message, state: FSMContext):
     text = (
         "📋 <b>Проверьте данные вашего отчета:</b>\n\n"
         f"• <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
-        f"• <b>Тип:</b> {rep_type_label} (+1)\n"
+        f"• <b>Тип:</b> {rep_type_label} (+{data.get('quantity', 1)})\n"
         f"• <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
         f"• <b>Доказательства:</b> {html.escape(proof)}\n\n"
         "Отправить отчет на проверку руководству?"
@@ -842,7 +887,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     user_data = users_db.get(user_id, {})
     await state.clear()
 
-    req_id = str(int(datetime.now().timestamp()))[-6:]
+    req_id = uuid.uuid4().hex[:12]
     requests_db[req_id] = {
         "req_id": req_id,
         "user_id": user_id,
@@ -851,6 +896,8 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         "rep_type": data["rep_type"],
         "reason": data["reason"],
         "proof": data["proof"],
+        "quantity": int(data.get("quantity", 1)),
+        "admin_messages": [],
         "status": "pending",
         "created_at": datetime.now().isoformat()
     }
