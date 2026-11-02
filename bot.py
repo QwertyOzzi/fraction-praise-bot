@@ -220,7 +220,8 @@ class FirebaseClient:
                         raise RuntimeError("Firestore version missing")
                     rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
                 existing = next((row for row in rows if row.get("nick", "").casefold() == nick.casefold()), None)
-                proof = {"text": reason, "links": [{"text": reason, "url": proof_url}]}
+                proof_links = [{"text": reason, "url": proof_url}] if proof_url.startswith(("https://", "http://")) else []
+                proof = {"text": reason, "links": proof_links}
                 if existing:
                     existing["qty"] = int(existing.get("qty") or 0) + quantity
                     existing["status"] = "На выдаче"
