@@ -40,7 +40,8 @@ class Store:
             self.version += 1
             self.qty += 1
             return Response(412)
-        if params["currentDocument.updateTime"] != "v" + str(self.version):
+        precondition = dict(params).get("currentDocument.updateTime") if isinstance(params, list) else params.get("currentDocument.updateTime")
+        if precondition != "v" + str(self.version):
             return Response(412)
         values = json["fields"]["rows"]["arrayValue"]["values"]
         row = values[0]["mapValue"]["fields"]
