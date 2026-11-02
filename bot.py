@@ -29,9 +29,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
-OWNER_KEY = os.getenv("OWNER_KEY", "kiidsg12#$$").strip()
+OWNER_KEY = os.getenv("OWNER_KEY", "").strip()
+OWNER_TELEGRAM_IDS = {6060562962}
 # 2. Ключ для лидеров и заместителей (требует подтверждения владельца)
-DEPUTY_KEY = os.getenv("DEPUTY_KEY", "NEXUS-U1B23D-FRNP").strip()
+DEPUTY_KEY = os.getenv("DEPUTY_KEY", "").strip()
 ADMIN_KEY = OWNER_KEY  # совместимость
 
 # Информация о Лидере (назначается Тех. Администратором через сайт)
@@ -73,7 +74,7 @@ FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "AIzaSyBX7JWz6ay-ozED5ZmKoC7Umn
 FIREBASE_EMAIL = os.getenv("FIREBASE_EMAIL", "goponos12@gmail.com").strip()
 
 _saved_fb_cfg = load_json("firebase_config.json", {})
-FIREBASE_PASSWORD = os.getenv("FIREBASE_PASSWORD", _saved_fb_cfg.get("FIREBASE_PASSWORD", "sCeARB6ep98d2AQ")).strip()
+FIREBASE_PASSWORD = os.getenv("FIREBASE_PASSWORD", "").strip()
 
 WEBAPP_URL = "https://qwertyozzi.github.io/fraction-praise-tracker/"
 
@@ -108,7 +109,7 @@ class FirebaseClient:
         self.password = password
         if not self.password:
             saved_cfg = load_json("firebase_config.json", {})
-            self.password = saved_cfg.get("FIREBASE_PASSWORD", "sCeARB6ep98d2AQ")
+            self.password = os.getenv("FIREBASE_PASSWORD", "").strip()
         self.id_token: Optional[str] = None
         self.token_expiry = 0
 
@@ -136,10 +137,6 @@ class FirebaseClient:
                     else:
                         err_text = await resp.text()
                         logger.warning(f"Firebase Auth failed ({resp.status}): {err_text}")
-                        if self.password != "sCeARB6ep98d2AQ":
-                            logger.info("Retrying Firebase Auth with verified fallback password...")
-                            self.password = "sCeARB6ep98d2AQ"
-                            return await self.get_token()
                         return None
         except Exception as e:
             logger.error(f"Error getting Firebase token: {e}")
@@ -394,7 +391,7 @@ async def sync_state_from_cloud():
                         LEADER_INFO["contact"] = fields["leaderContact"].get("stringValue", "").strip()
                     if "techAdminNick" in fields:
                         LEADER_INFO["tech_nick"] = fields["techAdminNick"].get("stringValue", "").strip()
-                    logger.info(f"Loaded cloud settings: Leader={LEADER_INFO.get('nick')}, DeputyKey={DEPUTY_KEY}")
+                    logger.info("Loaded cloud settings")
     except Exception as e:
         logger.warning(f"Could not load state from Firestore: {e}")
 
@@ -525,7 +522,7 @@ async def process_nick(message: types.Message, state: FSMContext):
     text_val = (message.text or "").strip()
 
     # Если пользователь ввёл ключ напрямую или нажал команду /admin
-    if text_val.startswith("/admin") or text_val.upper() == DEPUTY_KEY.upper() or text_val == OWNER_KEY:
+    if text_val.startswith("/admin") or (DEPUTY_KEY and text_val == DEPUTY_KEY) or (OWNER_KEY and text_val == OWNER_KEY):
         if not text_val.startswith("/admin"):
             message.text = f"/admin {text_val}"
         await cmd_admin_auth(message, state)
@@ -937,7 +934,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         await message.answer(
             "ℹ️ <b>Авторизация в системе руководства:</b>\n\n"
             "• <b>Для заместителей и лидеров:</b>\n"
-            f"Отправьте команду: <code>/admin {DEPUTY_KEY}</code>\n"
+            f"Отправьте команду: <code>/admin [KEY REDACTED]</code>\n"
             "<i>(После отправки запрос поступит Главному Лидеру на одобрение)</i>\n\n"
             "• <b>Для Главного Руководителя:</b>\n"
             "Используйте ваш личный мастер-ключ: <code>/admin мастер_ключ</code>",
@@ -948,14 +945,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     key = args[1].strip().strip('"').strip("'")
     
     # 1. Мастер-ключи Владельца (мгновенный вход без подтверждений)
-    valid_owner_keys = {
-        OWNER_KEY.strip().strip('"').strip("'"),
-        "kiidsg12#$$",
-        "kiidsg12",
-        "arizona1234"
-    }
-
-    if key in valid_owner_keys or key.startswith("kiidsg12"):
+    if uid in OWNER_TELEGRAM_IDS:
         if uid not in owner_cfg.get("owner_ids", []):
             owner_cfg.setdefault("owner_ids", []).append(uid)
             save_json(OWNER_FILE, owner_cfg)
@@ -969,7 +959,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             "🛠️ <b>Вы успешно авторизованы как ГЛАВНЫЙ ТЕХНИЧЕСКИЙ АДМИНИСТРАТОР!</b>\n\n"
             f"👑 <b>Действующий Лидер фракции:</b> <code>{lead_nick}</code>\n"
             "<i>(Лидера вы можете в любой момент назначить или сменить через Панель управления на сайте)</i>\n\n"
-            f"🔑 <b>Текущий ключ для заместителей:</b> <code>{DEPUTY_KEY}</code>\n"
+            f"🔑 <b>Текущий ключ для заместителей:</b> <code>[KEY REDACTED]</code>\n"
             "Когда заместитель вводит этот ключ, вам в личные сообщения бота приходит запрос с кнопками «Одобрить» / «Отклонить».\n\n"
             "Вам доступны:\n"
             "• Подтверждение доступа для новых заместителей\n"
@@ -981,8 +971,8 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
         return
 
-    # 2. Ключ Заместителя / Лидера (NEXUS-U1B23D-FRNP)
-    if key.upper() == DEPUTY_KEY.upper() or key == DEPUTY_KEY:
+    # 2. Ключ Заместителя / Лидера ()
+    if DEPUTY_KEY and key == DEPUTY_KEY:
         if is_admin(uid):
             await message.answer(
                 "ℹ️ <b>Вы уже являетесь администратором бота!</b>\n"
@@ -1026,7 +1016,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             f"👤 <b>Агент:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
             f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
             f"📱 <b>Пользователь:</b> {html.escape(message.from_user.full_name)} {html.escape(username_str)}\n"
-            f"🔑 <b>Введённый ключ:</b> <code>{DEPUTY_KEY}</code>\n\n"
+            f"🔑 <b>Введённый ключ:</b> <code>[KEY REDACTED]</code>\n\n"
             "Предоставить пользователю права руководства (проверка отчетов, очередь на выдачу, списание баллов)?"
         )
 
@@ -1040,7 +1030,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
     # 3. Неверный ключ
     await message.answer(
         "❌ <b>Неверный ключ доступа!</b>\n\n"
-        f"• Если вы заместитель: введите <code>/admin {DEPUTY_KEY}</code>\n"
+        f"• Если вы заместитель: введите <code>/admin [KEY REDACTED]</code>\n"
         "• Если вы владелец: используйте личный мастер-ключ.",
         parse_mode="HTML"
     )
@@ -1204,7 +1194,7 @@ async def cmd_list_admins(message: types.Message):
     text += (
         "💡 <b>Как добавить нового заместителя:</b>\n"
         "Передайте ему ключ для входа:\n"
-        f"<code>/admin {DEPUTY_KEY}</code>\n\n"
+        f"<code>/admin [KEY REDACTED]</code>\n\n"
         "После отправки команды вам в этот чат придёт запрос с кнопками <b>[Одобрить доступ]</b> / <b>[Отклонить]</b>."
     )
 
@@ -1417,9 +1407,6 @@ async def handle_ping(request):
         "service": "FractionRp Telegram Bot",
         "bot_username": "frporp_bot",
         "leader": LEADER_INFO.get("nick", "Не назначен"),
-        "deputy_key": DEPUTY_KEY,
-        "token_ok": bool(await firebase_client.get_token()),
-        "auth_email": firebase_client.email,
         "time": datetime.now(timezone.utc).isoformat()
     }
     return web.json_response(data, headers=headers)
