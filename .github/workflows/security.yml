@@ -11,4 +11,4 @@ jobs:
         with:
           python-version: '3.11'
       - name: Static bot security checks
-        run: python -m unittest discover -s tests -p 'test_security_*.py'
+        run: python -m unittest discover -s tests -p 'test_*.py'
