@@ -76,11 +76,21 @@ class BotSecurityChecks(unittest.TestCase):
         self.assertIn("admins_db[:] = sorted(approved_ids)", section)
         self.assertIn('admin_roles[str(item)] = role', section)
         self.assertIn("save_json(ADMINS_FILE, admins_db)", section)
+        self.assertIn("hmac.compare_digest(", section)
+        self.assertIn("Unsigned historic admin list found", section)
+        self.assertIn("owner /recoveradmins approval required", section)
 
     def test_refuse_cloud_overwrite_before_initial_read(self):
         section = SOURCE.split("async def sync_state_to_cloud():", 1)[1].split("# ╔", 1)[0]
         self.assertIn("if not _cloud_state_hydrated:", section)
         self.assertLess(section.index("if not _cloud_state_hydrated:"), section.index("session.patch"))
+
+    def test_admin_acl_signature_and_recovery(self):
+        self.assertIn("def sign_admin_permissions(", SOURCE)
+        self.assertIn('"admin_acl_signature": sign_admin_permissions(admins_db, admin_roles)', SOURCE)
+        recovery = SOURCE.split("async def callback_recover_admins(", 1)[1].split("@dp.callback_query", 1)[0]
+        self.assertIn("if not is_owner(callback.from_user.id)", recovery)
+        self.assertIn("await sync_state_to_cloud()", recovery)
 
     def test_python_syntax(self):
         ast.parse(SOURCE)
