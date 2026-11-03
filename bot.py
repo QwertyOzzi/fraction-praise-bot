@@ -626,10 +626,10 @@ async def sync_state_to_cloud():
         try:
             if not _cloud_state_hydrated:
                 logger.error("Refusing to overwrite cloud state: initial read was not confirmed")
-                return
+                return False
             token = await firebase_client.get_token()
             if not token:
-                return
+                return False
 
             url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -659,10 +659,13 @@ async def sync_state_to_cloud():
                 async with session.patch(url, headers=headers, json=body) as resp:
                     if resp.status == 200:
                         logger.info("Bot state successfully synced to cloud Firestore")
+                        return True
                     else:
                         logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
+                        return False
         except Exception as e:
             logger.warning(f"Error syncing bot state to cloud: {e}")
+            return False
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FSM STATES                                                      ║
@@ -1319,12 +1322,15 @@ async def callback_recover_admins(callback: types.CallbackQuery):
             admins_db.append(uid)
         admin_roles[str(uid)] = role
     admins_db.sort()
+    _cloud_state_hydrated = True
+    if not await sync_state_to_cloud():
+        _cloud_state_hydrated = False
+        await callback.answer("⚠️ Восстановление не сохранено. Проверьте Firebase.", show_alert=True)
+        return
     save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
     _pending_legacy_admins.clear()
     _pending_legacy_nonce = ""
-    _cloud_state_hydrated = True
-    await sync_state_to_cloud()
     await callback.message.edit_text("✅ Список администраторов подтверждён и сохранён.")
     await callback.answer()
 
@@ -1567,13 +1573,26 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     if role not in ("leader", "deputy"):
         await callback.answer("Сначала выберите роль.", show_alert=True)
         return
-    pending_admin_requests.pop(target_id, None)
-    if target_id not in admins_db:
+    was_admin = target_id in admins_db
+    previous_role = admin_roles.get(str(target_id))
+    if not was_admin:
         admins_db.append(target_id)
-        save_json(ADMINS_FILE, admins_db)
     admin_roles[str(target_id)] = role
+    if not await sync_state_to_cloud():
+        if not was_admin:
+            admins_db.remove(target_id)
+        if previous_role is None:
+            admin_roles.pop(str(target_id), None)
+        else:
+            admin_roles[str(target_id)] = previous_role
+        await callback.answer(
+            "⚠️ Права НЕ подтверждены Firebase. Попробуйте ещё раз после проверки связи.",
+            show_alert=True
+        )
+        return
+    pending_admin_requests.pop(target_id, None)
+    save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
-    notify_state_changed()
     target_user = users_db.get(str(target_id), {})
     try:
         await callback.message.edit_text(
@@ -1684,12 +1703,20 @@ async def process_remove_admin(callback: types.CallbackQuery):
         return
 
     if target_id in admins_db:
+        previous_role = admin_roles.get(str(target_id))
         admins_db.remove(target_id)
-        _explicit_revoked_admins.add(target_id)
         admin_roles.pop(str(target_id), None)
+        if not await sync_state_to_cloud():
+            admins_db.append(target_id)
+            if previous_role:
+                admin_roles[str(target_id)] = previous_role
+            await callback.answer(
+                "⚠️ Удаление прав НЕ сохранено в Firebase. Повторите позже.",
+                show_alert=True
+            )
+            return
         save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
-        notify_state_changed()
         await callback.answer("Заместитель успешно снят!", show_alert=True)
         try:
             await callback.message.delete()
@@ -1841,6 +1868,8 @@ class AgentPanelStates(StatesGroup):
 
 async def remove_agent_everywhere(nick: str) -> bool:
     """Remove an unneeded agent only when its two outstanding balances are zero."""
+    if not _cloud_state_hydrated:
+        raise RuntimeError("Cannot delete agents before cloud state is loaded")
     if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", nick):
         raise ValueError("Invalid agent nickname")
     matches = [(uid, entry) for uid, entry in users_db.items()
@@ -2560,7 +2589,7 @@ async def main():
     # One-time cleanup requested by the owner. Track completion in cloud state
     # so a future user who legitimately chooses this nick is not deleted again.
     migration = "remove-accidental-Samuel_Norton_10-v1"
-    if migration not in completed_cleanup_ids:
+    if _cloud_state_hydrated and migration not in completed_cleanup_ids:
         try:
             if await remove_agent_everywhere("Samuel_Norton_10"):
                 completed_cleanup_ids.add(migration)
