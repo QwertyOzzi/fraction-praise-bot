@@ -1280,6 +1280,39 @@ async def reject_report(callback: types.CallbackQuery):
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # Авторизация: /admin ключ
+@dp.message(Command("security"))
+async def cmd_security_overview(message: types.Message):
+    """Owner-only overview of the actual in-memory Telegram ACL."""
+    if not is_owner(message.from_user.id) or getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Проверка прав доступна только владельцу в личных сообщениях.")
+        return
+    all_admins = sorted({
+        uid for uid in admins_db if type(uid) is int and uid not in OWNER_TELEGRAM_IDS
+    })
+    members = []
+    for uid in all_admins[:50]:
+        info = users_db.get(str(uid), {})
+        nick = html.escape(str(info.get("nick", "Не зарегистрирован")))
+        role = "👑 Лидер" if is_leader(uid) else "⭐ Заместитель"
+        members.append(f"• {nick} (ID <code>{uid}</code>) — {role}")
+    if len(all_admins) > 50:
+        members.append(f"…и ещё {len(all_admins)-50} администраторов")
+    if not members:
+        members.append("• Никого, кроме владельца")
+    state_label = "✅ Firebase загружена" if _cloud_state_hydrated else "⚠️ Firebase НЕ подтверждена"
+    await message.answer(
+        f"🔐 <b>Аудит доступа бота</b>\n"
+        f"Версия: <code>{html.escape(RELEASE_TAG)}</code>\n"
+        f"{state_label}\n"
+        f"Владелец: <code>{next(iter(OWNER_TELEGRAM_IDS))}</code>\n"
+        f"Администраторов: <b>{len(all_admins)}</b>\n\n"
+        + "\n".join(members)
+        + "\n\nДля снятия лишних прав используйте /admins. "
+          "Никто не получает доступ только по рангу, ключу или ADMIN_CHAT_ID.",
+        parse_mode="HTML"
+    )
+
+
 @dp.message(Command("recoveradmins"))
 async def cmd_recover_admins(message: types.Message):
     if not is_owner(message.from_user.id) or getattr(message.chat, "type", "") != "private":
