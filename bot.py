@@ -5,6 +5,7 @@ import html
 import logging
 import uuid
 import hashlib
+import hmac
 import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -92,12 +93,28 @@ owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 completed_cleanup_ids = set()
 _cloud_state_hydrated = False
 _explicit_revoked_admins: set[int] = set()
+_pending_legacy_admins: Dict[int, str] = {}
+_pending_legacy_nonce: str = ""
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
     if cid not in admins_db:
         admins_db.append(cid)
         save_json(ADMINS_FILE, admins_db)
+
+def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
+    """Sign permission grants, so untrusted Firestore edits cannot grant admin."""
+    valid_ids = sorted({n for n in admin_ids if type(n) is int and n > 0
+                        and n not in OWNER_TELEGRAM_IDS})
+    signed_payload = {
+        "admins": valid_ids,
+        "roles": {str(n): roles.get(str(n), "deputy") for n in valid_ids}
+    }
+    secret = (os.getenv("ADMIN_ACL_SIGNING_KEY", "").strip() or BOT_TOKEN).encode("utf-8")
+    msg = json.dumps(signed_payload, ensure_ascii=True, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
@@ -487,7 +504,7 @@ firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE
 # ╚══════════════════════════════════════════════════════════════════╝
 async def sync_state_from_cloud():
     """Restore approved admins from the owner-restricted Firestore state document."""
-    global _cloud_state_hydrated
+    global _cloud_state_hydrated, _pending_legacy_nonce
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
         token = await firebase_client.get_token()
@@ -518,22 +535,38 @@ async def sync_state_from_cloud():
                     cloud_roles = cloud_data.get("admin_roles", {})
                     if not isinstance(cloud_admins, list) or not isinstance(cloud_roles, dict):
                         raise RuntimeError("Invalid Firebase admin state")
+                    filtered = sorted({
+                        item for item in cloud_admins if type(item) is int
+                        and item > 0 and item not in OWNER_TELEGRAM_IDS
+                        and (str(item) in users_db or str(item) in cloud_users)
+                    })
+                    filtered_roles = {
+                        str(item): cloud_roles.get(str(item), "deputy")
+                        if cloud_roles.get(str(item)) in ("leader", "deputy")
+                        else "deputy" for item in filtered
+                    }
+                    signature = cloud_data.get("admin_acl_signature", "")
+                    expected = sign_admin_permissions(filtered, filtered_roles)
+                    if filtered and not signature:
+                        # Legacy unsigned state: show it to the owner for confirmation.
+                        # It must never grant access automatically.
+                        _pending_legacy_admins.clear()
+                        _pending_legacy_admins.update({
+                            item: filtered_roles[str(item)] for item in filtered
+                        })
+                        _pending_legacy_nonce = uuid.uuid4().hex[:16]
+                        logger.error("Unsigned historic admin list found; owner /recoveradmins approval required")
+                        return
+                    if signature and not hmac.compare_digest(str(signature), expected):
+                        logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
+                        return
                     approved_ids = set(admins_db)
-                    for item in cloud_admins:
-                        if type(item) is not int or item <= 0:
-                            continue
-                        # Accept only registered identities; users cannot choose their Telegram ID.
-                        if str(item) not in users_db and str(item) not in cloud_users:
-                            logger.warning("Skipping cloud admin with no registered Telegram account")
-                            continue
-                        approved_ids.add(item)
+                    approved_ids.update(filtered)
                     admins_db[:] = sorted(approved_ids)
+                    for item in filtered:
+                        admin_roles[str(item)] = filtered_roles[str(item)]
                     for item in admins_db:
-                        role = cloud_roles.get(str(item))
-                        if role in ("leader", "deputy"):
-                            admin_roles[str(item)] = role
-                        elif str(item) not in admin_roles:
-                            admin_roles[str(item)] = "deputy"
+                        admin_roles.setdefault(str(item), "deputy")
                     save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
@@ -606,6 +639,7 @@ async def sync_state_to_cloud():
                 "users": users_db,
                 "admins": admins_db,
                 "admin_roles": admin_roles,
+                "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db
@@ -1246,6 +1280,65 @@ async def reject_report(callback: types.CallbackQuery):
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # Авторизация: /admin ключ
+@dp.message(Command("recoveradmins"))
+async def cmd_recover_admins(message: types.Message):
+    if not is_owner(message.from_user.id) or getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Только владелец в личном чате может восстанавливать права.")
+        return
+    if not _pending_legacy_admins:
+        await message.answer("Старый список администраторов для восстановления не найден. "
+                             "Если облачная запись уже была затёрта, потребуется резервная копия.")
+        return
+    lines = []
+    for uid, role in sorted(_pending_legacy_admins.items()):
+        profile = users_db.get(str(uid), {})
+        nick = html.escape(str(profile.get("nick", "Неизвестно")))
+        lines.append(f"• {nick} — ID {uid} — {role}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Восстановить перечисленных", callback_data=f"aclrestore:{_pending_legacy_nonce}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="aclrestorecancel")]
+    ])
+    await message.answer(
+        "🔐 <b>Найден архивный неподписанный список:</b>\n\n"
+        + "\n".join(lines) + "\n\nПроверьте каждого человека перед подтверждением.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("aclrestore:"))
+async def callback_recover_admins(callback: types.CallbackQuery):
+    global _cloud_state_hydrated, _pending_legacy_nonce
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    nonce = callback.data.removeprefix("aclrestore:")
+    if not nonce or nonce != _pending_legacy_nonce or not _pending_legacy_admins:
+        await callback.answer("Запрос устарел.", show_alert=True)
+        return
+    for uid, role in _pending_legacy_admins.items():
+        if uid not in admins_db:
+            admins_db.append(uid)
+        admin_roles[str(uid)] = role
+    admins_db.sort()
+    save_json(ADMINS_FILE, admins_db)
+    save_json("admin_roles.json", admin_roles)
+    _pending_legacy_admins.clear()
+    _pending_legacy_nonce = ""
+    _cloud_state_hydrated = True
+    await sync_state_to_cloud()
+    await callback.message.edit_text("✅ Список администраторов подтверждён и сохранён.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "aclrestorecancel")
+async def callback_recover_cancel(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.message.edit_text("Восстановление отменено. Исходный список пока не изменён.")
+    await callback.answer()
+
+
 @dp.message(Command("admin"))
 async def cmd_admin_auth(message: types.Message, state: FSMContext):
     await state.clear()
