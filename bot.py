@@ -257,6 +257,49 @@ class FirebaseClient:
             await asyncio.sleep(0.1 * (attempt + 1))
         raise RuntimeError("Concurrent modifications: retry limit reached")
 
+    async def remove_zero_balance_agent(self, sheet_name: str, nick: str) -> bool:
+        """Delete an empty sheet entry using Firestore revision protection.
+
+        Return True if absent or deleted. Do not delete entries with a positive balance.
+        """
+        if sheet_name not in ("fractionrp", "praise"):
+            raise ValueError("Unknown sheet")
+        token = await self.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/sheets/{sheet_name}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        for attempt in range(5):
+            async with ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Firestore read failed: {response.status}")
+                    data = await response.json()
+                    revision = data.get("updateTime")
+                    if not revision:
+                        raise RuntimeError("Missing Firestore revision")
+                    rows = self._parse_firestore_rows(data.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                matches = [row for row in rows if str(row.get("nick", "")).casefold() == nick.casefold()]
+                if not matches:
+                    return True
+                if any(int(row.get("qty") or 0) != 0 for row in matches):
+                    return False
+                new_rows = [row for row in rows if str(row.get("nick", "")).casefold() != nick.casefold()]
+                body = {"fields": {
+                    "rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in new_rows]}},
+                    "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}
+                }}
+                params = [("currentDocument.updateTime", revision),
+                          ("updateMask.fieldPaths", "rows"), ("updateMask.fieldPaths", "updatedAt")]
+                async with session.patch(url, headers=headers, params=params, json=body) as response:
+                    if response.status == 200:
+                        return True
+                    if response.status not in (409, 412):
+                        raise RuntimeError(f"Firestore delete entry failed: {response.status}")
+            await asyncio.sleep(0.1 * (attempt + 1))
+        raise RuntimeError("Concurrent writes prevented deletion")
+
+
     async def debit_one(self, sheet_name: str, nick: str) -> int:
         """Consume one point with an updateTime precondition; return remaining points."""
         if sheet_name not in ("fractionrp", "praise"):
@@ -1670,6 +1713,38 @@ class AgentPanelStates(StatesGroup):
     waiting_for_search = State()
 
 
+async def remove_agent_everywhere(nick: str) -> bool:
+    """Remove an unneeded agent only when its two outstanding balances are zero."""
+    if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", nick):
+        raise ValueError("Invalid agent nickname")
+    matches = [(uid, entry) for uid, entry in users_db.items()
+               if isinstance(entry, dict)
+               and str(entry.get("nick", "")).casefold() == nick.casefold()]
+    if any(uid.isdecimal() and (int(uid) in OWNER_TELEGRAM_IDS or int(uid) in admins_db)
+           for uid, _ in matches):
+        raise ValueError("Нельзя удалить руководство через очистку агентов.")
+    # Verify balances before touching any persistent data.
+    rows_by_sheet = await asyncio.gather(
+        firebase_client.get_sheet("fractionrp"), firebase_client.get_sheet("praise")
+    )
+    for rows in rows_by_sheet:
+        if any(str(row.get("nick", "")).casefold() == nick.casefold() and
+               int(row.get("qty") or 0) != 0 for row in rows):
+            raise ValueError("У агента есть ненулевой баланс. Очистка отменена.")
+
+    # Each sheet uses updateTime to avoid overwriting concurrent grants.
+    for sheet in ("fractionrp", "praise"):
+        if not await firebase_client.remove_zero_balance_agent(sheet, nick):
+            raise ValueError("Баланс изменился. Удаление отменено.")
+
+    for uid, _ in matches:
+        users_db.pop(uid, None)
+    if matches:
+        save_json(USERS_FILE, users_db)
+        await sync_state_to_cloud()
+    return True
+
+
 def agent_hash(nick: str) -> str:
     return hashlib.sha256(nick.casefold().encode("utf-8")).hexdigest()[:12]
 
@@ -1772,6 +1847,7 @@ def agent_detail_markup(agent: Dict[str, Any], page: int):
     ]
     if agent.get("uid") is not None:
         keyboard.append([InlineKeyboardButton(text="🎖️ Изменить ранг", callback_data=f"agranks:{key}:{page}")])
+    keyboard.append([InlineKeyboardButton(text="🗑️ Удалить запись (владелец)", callback_data=f"agdelete:{key}:{page}")])
     keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data=f"agpage:{page}"),
                      InlineKeyboardButton(text="🔄 Обновить", callback_data=f"agview:{key}:{page}")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -1969,6 +2045,58 @@ async def agent_do_action(callback: types.CallbackQuery):
     except Exception as exc:
         logger.warning(f"Agent card refresh failed after successful update: {exc}")
         await callback.message.edit_text("✅ Операция выполнена. Откройте /agents для проверки.")
+
+
+@dp.callback_query(F.data.startswith("agdelete:"))
+async def agent_delete_prompt(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Удаление доступно только владельцу.", show_alert=True)
+        return
+    try:
+        _, key, page = callback.data.split(":")
+        agent = next((x for x in await fetch_agent_directory()
+                      if agent_hash(x["nick"]) == key), None)
+        if not agent:
+            await callback.answer("Агент не найден.", show_alert=True)
+            return
+        if int(agent["frp"]) != 0 or int(agent["praise"]) != 0:
+            await callback.answer("Баланс не равен нулю. Удаление запрещено.", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Да, удалить", callback_data=f"agdeleteok:{key}:{page}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{key}:{page}")]
+        ])
+        await callback.message.edit_text(
+            f"Удалить запись <b>{html.escape(agent['nick'])}</b> из бота и таблиц? "
+            "Доступно только для нулевых балансов.",
+            reply_markup=kb, parse_mode="HTML"
+        )
+        await callback.answer()
+    except Exception as exc:
+        logger.warning(f"Agent delete confirmation error: {exc}")
+        await callback.answer("Не удалось подготовить удаление.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("agdeleteok:"))
+async def agent_delete_confirm(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Удаление доступно только владельцу.", show_alert=True)
+        return
+    try:
+        _, key, page = callback.data.split(":")
+        agent = next((x for x in await fetch_agent_directory()
+                      if agent_hash(x["nick"]) == key), None)
+        if not agent:
+            await callback.answer("Запись уже отсутствует.", show_alert=True)
+            return
+        await remove_agent_everywhere(agent["nick"])
+        await callback.answer("✅ Запись удалена.")
+        await agent_panel_list(callback.message, callback.from_user.id, int(page), edit=True)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+    except Exception as exc:
+        logger.error(f"Could not remove agent safely: {exc}")
+        await callback.answer("Ошибка удаления. Обновите /agents.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("agranks:"))
@@ -2302,6 +2430,14 @@ async def main():
         await asyncio.wait_for(sync_state_from_cloud(), timeout=20)
     except asyncio.TimeoutError:
         logger.error("Initial Firebase sync timed out after 20 seconds")
+
+    # One-time cleanup of a user-confirmed accidental duplicate account.
+    # Never touch real Samuel_Norton, any non-zero balance, or privileged accounts.
+    try:
+        if await remove_agent_everywhere("Samuel_Norton_10"):
+            logger.info("Accidental duplicate Samuel_Norton_10 cleaned up")
+    except Exception as exc:
+        logger.warning(f"Could not clean up accidental duplicate: {exc}")
 
     logger.info("Bot polling starting...")
     await dp.start_polling(bot)
