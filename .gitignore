@@ -6,3 +6,15 @@ admins_db.json
 requests_db.json
 .venv/
 venv/
+admin_roles.json
+owner_config.json
+*.bak
+*.sqlite3
+*.db
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+firebase-service-account*.json
+service-account*.json
