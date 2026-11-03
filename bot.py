@@ -2363,6 +2363,10 @@ async def agent_do_action(callback: types.CallbackQuery):
         else:
             await firebase_client.debit_one(sheet, action["nick"])
         action["status"] = "done"
+        activity = "panel_grant" if action["kind"] == "g" else "panel_debit"
+        amount = "+" + str(action["qty"]) if action["kind"] == "g" else "-1"
+        asyncio.create_task(record_admin_activity(activity, callback.from_user.id,
+            f"{action['nick']}: {amount}", sheet))
     except Exception as exc:
         # No blind retry after a possibly successful but timed-out write.
         action["status"] = "uncertain"
@@ -2585,7 +2589,7 @@ async def process_support_msg(message: types.Message, state: FSMContext):
     rank = u_info.get("rank", "?")
     username_str = f"(@{message.from_user.username})" if message.from_user.username else ""
 
-    content_text = message.text or message.caption or "[Вложение без текста]"
+    content_text = (message.text or message.caption or "[Вложение без текста]")[:600]
 
     admin_msg = (
         "🚨 <b>Новое обращение в Службу Поддержки!</b>\n\n"
@@ -2608,6 +2612,8 @@ async def process_support_msg(message: types.Message, state: FSMContext):
     }
     ticket_id = await firebase_client.add_support_ticket(ticket_payload)
     ticket_label = f"#{ticket_id[-6:]}" if ticket_id else ""
+    if not ticket_id:
+        logger.warning("Support ticket was forwarded to leadership but not stored in Firestore")
 
     admin_msg_with_id = (
         f"🚨 <b>Новое обращение в Службу Поддержки {ticket_label}!</b>\n\n"
@@ -2633,12 +2639,13 @@ async def process_support_msg(message: types.Message, state: FSMContext):
         except Exception as e:
             logger.warning(f"Could not forward support message to {adm_id}: {e}")
 
-    await message.answer(
-        "✅ <b>Ваше обращение успешно зарегистрировано и передано руководству!</b>\n\n"
-        "Оно добавлено в общую панель обращений и будет проверено лидером/тех. администратором. Спасибо за содействие!",
-        reply_markup=get_main_menu(uid),
-        parse_mode="HTML"
+    status_text = (
+        "✅ <b>Обращение сохранено в базе и передано руководству.</b>"
+        if ticket_id else
+        "⚠️ <b>Обращение отправлено руководству в Telegram, но Firebase не подтвердил сохранение.</b> "
+        "Попросите техадминистратора проверить правила и журнал."
     )
+    await message.answer(status_text, reply_markup=get_main_menu(uid), parse_mode="HTML")
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  DUMMY WEB SERVER ДЛЯ RENDER (STAY-ALIVE)                        ║
