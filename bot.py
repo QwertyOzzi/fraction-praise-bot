@@ -115,14 +115,15 @@ def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
+    # Fail closed while Firebase has not confirmed the signed access list.
+    return user_id in OWNER_TELEGRAM_IDS or (_cloud_state_hydrated and user_id in admins_db)
 
 def is_owner(user_id: int) -> bool:
     return user_id in OWNER_TELEGRAM_IDS
 
 
 def is_leader(user_id: int) -> bool:
-    return is_owner(user_id) or (user_id in admins_db and admin_roles.get(str(user_id)) == "leader")
+    return is_owner(user_id) or (is_admin(user_id) and admin_roles.get(str(user_id)) == "leader")
 
 
 def role_name(user_id: int) -> str:
@@ -557,13 +558,12 @@ async def sync_state_from_cloud():
                     if signature and not hmac.compare_digest(str(signature), expected):
                         logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
                         return
-                    approved_ids = set(admins_db)
-                    approved_ids.update(filtered)
-                    admins_db[:] = sorted(approved_ids)
-                    for item in filtered:
-                        admin_roles[str(item)] = filtered_roles[str(item)]
-                    for item in admins_db:
-                        admin_roles.setdefault(str(item), "deputy")
+                    # The authenticated, signed cloud ACL is authoritative.
+                    # Do not merge potentially stale local admin JSON into it:
+                    # doing so could resurrect a previously revoked administrator.
+                    admins_db[:] = filtered
+                    admin_roles.clear()
+                    admin_roles.update(filtered_roles)
                     save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
