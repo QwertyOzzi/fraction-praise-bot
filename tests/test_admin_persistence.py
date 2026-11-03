@@ -114,6 +114,16 @@ class TestAdminRestoration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx["admin_roles"], cloud["admin_roles"])
         self.assertTrue(ctx["_cloud_state_hydrated"])
 
+    async def test_stale_local_admin_not_restored_without_signed_grant(self):
+        cloud = {"users": {}, "admins": [], "admin_roles": {}, "requests": {}}
+        ctx = build_context(cloud)
+        ctx["admins_db"].append(123456)
+        ctx["admin_roles"]["123456"] = "leader"
+        await ctx["sync_state_from_cloud"]()
+        self.assertEqual(ctx["admins_db"], [])
+        self.assertEqual(ctx["admin_roles"], {})
+        self.assertTrue(ctx["_cloud_state_hydrated"])
+
     async def test_unsigned_legacy_requires_owner_approval(self):
         cloud = {"users": {"101": {"nick": "Old_Leader"}},
                  "admins": [101], "admin_roles": {"101": "leader"}}
