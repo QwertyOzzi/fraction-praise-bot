@@ -538,7 +538,6 @@ async def sync_state_from_cloud():
                     filtered = sorted({
                         item for item in cloud_admins if type(item) is int
                         and item > 0 and item not in OWNER_TELEGRAM_IDS
-                        and (str(item) in users_db or str(item) in cloud_users)
                     })
                     filtered_roles = {
                         str(item): cloud_roles.get(str(item), "deputy")
