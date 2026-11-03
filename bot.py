@@ -29,7 +29,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-RELEASE_TAG = "leader-deputy-roles-v4"
+RELEASE_TAG = "agent-cleanup-v5"
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
@@ -89,6 +89,7 @@ pending_admin_requests: Dict[int, Dict[str, Any]] = {}
 admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
+completed_cleanup_ids = set()
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
@@ -497,6 +498,10 @@ async def sync_state_from_cloud():
                     data = await resp.json()
                     raw = data.get("fields", {}).get("data", {}).get("stringValue", "{}")
                     cloud_data = json.loads(raw)
+                    completed_cleanup_ids.update(
+                        item for item in cloud_data.get("completed_cleanup_ids", [])
+                        if isinstance(item, str)
+                    )
 
                     cloud_users = cloud_data.get("users", {})
                     for uid, udata in cloud_users.items():
@@ -574,6 +579,7 @@ async def sync_state_to_cloud():
                 "users": users_db,
                 "admins": admins_db,
                 "admin_roles": admin_roles,
+                "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db
             }
@@ -2431,13 +2437,17 @@ async def main():
     except asyncio.TimeoutError:
         logger.error("Initial Firebase sync timed out after 20 seconds")
 
-    # One-time cleanup of a user-confirmed accidental duplicate account.
-    # Never touch real Samuel_Norton, any non-zero balance, or privileged accounts.
-    try:
-        if await remove_agent_everywhere("Samuel_Norton_10"):
-            logger.info("Accidental duplicate Samuel_Norton_10 cleaned up")
-    except Exception as exc:
-        logger.warning(f"Could not clean up accidental duplicate: {exc}")
+    # One-time cleanup requested by the owner. Track completion in cloud state
+    # so a future user who legitimately chooses this nick is not deleted again.
+    migration = "remove-accidental-Samuel_Norton_10-v1"
+    if migration not in completed_cleanup_ids:
+        try:
+            if await remove_agent_everywhere("Samuel_Norton_10"):
+                completed_cleanup_ids.add(migration)
+                await sync_state_to_cloud()
+                logger.info("Accidental duplicate cleanup completed")
+        except Exception as exc:
+            logger.warning(f"Could not clean up accidental duplicate: {exc}")
 
     logger.info("Bot polling starting...")
     await dp.start_polling(bot)
