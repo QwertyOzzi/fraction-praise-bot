@@ -800,6 +800,42 @@ async def record_admin_activity(action: str, actor_id: int, details: str, sheet:
             logger.warning("Owner audit notification failed: %s", type(exc).__name__)
 
 
+async def record_profile_activity(actor_id: int, action: str, old_nick: str,
+                                  new_nick: str, rank: str, username: str = "") -> None:
+    """Audit verified Telegram profile changes without granting admin privileges."""
+    try:
+        token = await firebase_client.get_token()
+        if not token:
+            logger.warning("Profile audit skipped: Firebase not authenticated")
+            return
+        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/audit_log"
+        actor = f"{new_nick[:65]}" + (f" (@{username[:32]})" if username else "") + f" (Telegram ID {actor_id})"
+        details = f"Ник: {old_nick or '(новый профиль)'} → {new_nick}; ранг: {rank}"[:500]
+        body = {"fields": {
+            "source": {"stringValue": "telegram"},
+            "action": {"stringValue": action},
+            "actor": {"stringValue": actor},
+            "actorTelegramId": {"integerValue": str(actor_id)},
+            "details": {"stringValue": details},
+            "sheet": {"stringValue": ""},
+            "createdAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}
+        }}
+        async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+            async with session.post(url, json=body, headers={"Authorization": f"Bearer {token}"}) as response:
+                if response.status != 200:
+                    logger.warning("Profile audit write failed (HTTP %s)", response.status)
+    except Exception as exc:
+        logger.warning("Profile audit delivery failed: %s", type(exc).__name__)
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    """Registered before all state handlers so /cancel cannot be swallowed by report input."""
+    await state.clear()
+    await message.answer("❌ Действие отменено. Выберите новый пункт меню.",
+                         reply_markup=get_main_menu(message.from_user.id))
+
+
 @dp.message(Command("notifications"))
 async def cmd_owner_notifications(message: types.Message):
     """Owner-only private /notifications on|off; mirrored by the site toggle."""
@@ -943,21 +979,54 @@ async def process_nick(message: types.Message, state: FSMContext):
 async def process_rank(callback: types.CallbackQuery, state: FSMContext):
     rank = callback.data.replace("rank_", "")
     data = await state.get_data()
-    nick = data["nick"]
+    nick = data.get("nick", "")
+    if not nick:
+        await callback.answer("Регистрация устарела. Введите /start.", show_alert=True)
+        await state.clear()
+        return
 
     user_id = str(callback.from_user.id)
-    users_db[user_id] = {
+    previous = users_db.get(user_id)
+    old_profile = dict(previous) if isinstance(previous, dict) else None
+    old_nick = str((old_profile or {}).get("nick") or "")
+    username = callback.from_user.username or ""
+    updated = {
+        **(old_profile or {}),
         "nick": nick,
         "rank": rank,
-        "telegram_username": callback.from_user.username or "",
-        "registered_at": datetime.now().isoformat()
+        "telegram_username": username,
+        "registered_at": (old_profile or {}).get("registered_at") or datetime.now().isoformat()
     }
+    users_db[user_id] = updated
+    # Do not claim success until the owner-authenticated cloud write is confirmed.
+    if not await sync_state_to_cloud():
+        if old_profile is not None:
+            users_db[user_id] = old_profile
+        else:
+            users_db.pop(user_id, None)
+        await callback.answer("Не удалось подтвердить сохранение в Firebase. Повторите выбор ранга.", show_alert=True)
+        return
     save_json(USERS_FILE, users_db)
-    notify_state_changed()
-
     await state.clear()
-    await callback.message.edit_text(f"✅ Профиль успешно настроен!\n\n👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n🎖️ <b>Ранг:</b> {html.escape(rank)}", parse_mode="HTML")
-    await callback.message.answer("Теперь вы можете подавать отчеты через меню:", reply_markup=get_main_menu(callback.from_user.id))
+    activity = "profile_changed" if old_nick else "profile_registered"
+    asyncio.create_task(record_profile_activity(
+        callback.from_user.id, activity, old_nick, nick, rank, username
+    ))
+    extra = (
+        "\n\nℹ️ Ранее выданные баллы и ники в таблицах не переименовываются автоматически. "
+        "Таблицы редактируются отдельно администратором."
+        if old_nick and old_nick.casefold() != nick.casefold() else ""
+    )
+    await callback.message.edit_text(
+        f"✅ Профиль сохранён в Firebase!\n\n👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n"
+        f"🎖️ <b>Ранг:</b> {html.escape(rank)}" + extra, parse_mode="HTML"
+    )
+    await callback.message.answer(
+        "Теперь вы можете подавать отчеты через меню:",
+        reply_markup=get_main_menu(callback.from_user.id)
+    )
+    await callback.answer()
+
 
 # Смена ника
 @dp.message(F.text == "⚙️ Мой никнейм")
@@ -2497,11 +2566,6 @@ async def agent_set_rank(callback: types.CallbackQuery):
         logger.warning(f"Rank change failed: {exc}")
         await callback.answer("⚠️ Не удалось обновить ранг", show_alert=True)
 
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено.", reply_markup=get_main_menu(message.from_user.id))
 
 # Очередь на выдачу
 def render_queue(rows: List[Dict[str, Any]]):
