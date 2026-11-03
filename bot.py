@@ -529,8 +529,12 @@ async def sync_state_from_cloud():
                     cloud_users = cloud_data.get("users", {})
                     if not isinstance(cloud_users, dict):
                         raise RuntimeError("Invalid Firebase user list")
-                    for uid, udata in cloud_users.items():
-                        users_db[str(uid)] = udata
+                    # Treat the cloud profile list as authoritative. Merging stale
+                    # local JSON resurrected agents deleted from /agents after restart.
+                    restored_users = {str(uid): entry for uid, entry in cloud_users.items()
+                                      if isinstance(entry, dict)}
+                    if len(restored_users) != len(cloud_users):
+                        raise RuntimeError("Invalid Firebase user profiles")
 
                     # config/bot_state must be OWNER-WRITE-ONLY in deployed Firebase rules.
                     # Never use owner_ids or an arbitrary user rank to grant permissions.
@@ -562,6 +566,9 @@ async def sync_state_from_cloud():
                     if signature and not hmac.compare_digest(str(signature), expected):
                         logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
                         return
+                    # Apply profiles only after the cloud administrator signature is verified.
+                    users_db.clear()
+                    users_db.update(restored_users)
                     # The authenticated, signed cloud ACL is authoritative.
                     # Do not merge potentially stale local admin JSON into it:
                     # doing so could resurrect a previously revoked administrator.
