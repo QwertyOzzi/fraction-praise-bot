@@ -74,7 +74,7 @@ class BotSecurityChecks(unittest.TestCase):
         section = SOURCE.split("async def sync_state_from_cloud():", 1)[1].split("_state_sync_lock =", 1)[0]
         self.assertIn('cloud_admins = cloud_data.get("admins", [])', section)
         self.assertIn("admins_db[:] = sorted(approved_ids)", section)
-        self.assertIn('admin_roles[str(item)] = role', section)
+        self.assertIn('admin_roles[str(item)] = filtered_roles[str(item)]', section)
         self.assertIn("save_json(ADMINS_FILE, admins_db)", section)
         self.assertIn("hmac.compare_digest(", section)
         self.assertIn("Unsigned historic admin list found", section)
