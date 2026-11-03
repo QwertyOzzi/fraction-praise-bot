@@ -92,6 +92,26 @@ class BotSecurityChecks(unittest.TestCase):
         self.assertIn("if not is_owner(callback.from_user.id)", recovery)
         self.assertIn("await sync_state_to_cloud()", recovery)
 
+    def test_notification_chat_never_grants_admin(self):
+        initial = SOURCE.split("def sign_admin_permissions(", 1)[0]
+        self.assertNotIn("admins_db.append(cid)", initial)
+        self.assertIn("ADMIN_CHAT_ID is a notification destination", initial)
+
+    def test_security_audit_owner_and_dm_only(self):
+        section = SOURCE.split("async def cmd_security_overview(", 1)[1].split(
+            '@dp.message(Command("recoveradmins"))', 1)[0]
+        self.assertIn("if not is_owner(message.from_user.id)", section)
+        self.assertIn('getattr(message.chat, "type", "") != "private"', section)
+
+    def test_deputy_key_requires_dm_and_owner_approval(self):
+        section = SOURCE.split("async def cmd_admin_auth(", 1)[1].split(
+            "def verify_admin_request(", 1)[0]
+        self.assertIn('getattr(message.chat, "type", "") != "private"', section)
+        self.assertIn('pending_admin_requests[uid] =', section)
+        approval = SOURCE.split("async def callback_admin_grant(", 1)[1].split(
+            '@dp.callback_query(F.data.startswith("adm_deny_"))', 1)[0]
+        self.assertIn("is_owner(callback.from_user.id)", approval)
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 
