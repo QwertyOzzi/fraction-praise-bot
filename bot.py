@@ -736,6 +736,88 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+
+async def record_admin_activity(action: str, actor_id: int, details: str, sheet: str = "") -> None:
+    """Best-effort audit log and optional owner-only Telegram notification."""
+    if not is_admin(actor_id):
+        return
+    actor_role = role_name(actor_id)
+    actor = f"{actor_role} (Telegram ID {actor_id})"
+    message = str(details)[:500]
+    try:
+        token = await firebase_client.get_token()
+        if token:
+            url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/audit_log"
+            body = {"fields": {
+                "source": {"stringValue": "telegram"},
+                "action": {"stringValue": str(action)[:55]},
+                "actor": {"stringValue": actor},
+                "actorTelegramId": {"integerValue": str(actor_id)},
+                "details": {"stringValue": message},
+                "sheet": {"stringValue": str(sheet)[:30]},
+                "createdAt": {"timestampValue": datetime.now(timezone.utc).isoformat()}
+            }}
+            async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+                async with session.post(url, json=body, headers={"Authorization": f"Bearer {token}"}) as resp:
+                    if resp.status != 200:
+                        logger.warning("Audit event write failed (HTTP %s)", resp.status)
+    except Exception as exc:
+        logger.warning("Audit event logging failed: %s", type(exc).__name__)
+
+    if is_owner(actor_id):
+        return
+    enabled = True
+    try:
+        token = await firebase_client.get_token()
+        if token:
+            url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
+            async with ClientSession(timeout=ClientTimeout(total=6)) as session:
+                async with session.get(url, headers={"Authorization": f"Bearer {token}"}) as resp:
+                    if resp.status == 200:
+                        settings = (await resp.json()).get("fields", {})
+                        enabled = settings.get("auditTelegramEnabled", {}).get("booleanValue", True) is not False
+    except Exception as exc:
+        logger.warning("Could not read owner notification setting: %s", type(exc).__name__)
+    if not enabled:
+        return
+
+    alert = f"🔔 Действие руководства\n{actor}\n{action}: {message}"
+    for owner_id in OWNER_TELEGRAM_IDS:
+        try:
+            await bot.send_message(owner_id, alert[:4000], parse_mode=None)
+        except Exception as exc:
+            logger.warning("Owner audit notification failed: %s", type(exc).__name__)
+
+
+@dp.message(Command("notifications"))
+async def cmd_owner_notifications(message: types.Message):
+    """Owner-only private /notifications on|off; mirrored by the site toggle."""
+    if not is_owner(message.from_user.id) or message.chat.type != "private":
+        await message.answer("⛔ Только владелец в личном чате.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+        await message.answer("Используйте /notifications on или /notifications off.")
+        return
+    desired = parts[1].lower() == "on"
+    token = await firebase_client.get_token()
+    if not token:
+        await message.answer("⚠️ Нет связи с Firebase, настройка не сохранена.")
+        return
+    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
+    body = {"fields": {"auditTelegramEnabled": {"booleanValue": desired}}}
+    params = [("updateMask.fieldPaths", "auditTelegramEnabled")]
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=8)) as session:
+            async with session.patch(url, params=params, json=body,
+                                     headers={"Authorization": f"Bearer {token}"}) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+        await message.answer("✅ Уведомления руководства " + ("включены" if desired else "выключены") + ".")
+    except Exception as exc:
+        logger.warning("Owner notification preferences save failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось сохранить настройку Firebase.")
+
 @dp.message(Command("version"))
 async def cmd_version(message: types.Message):
     commit = os.getenv("RENDER_GIT_COMMIT", "").strip()
@@ -1239,6 +1321,8 @@ async def approve_report(callback: types.CallbackQuery):
 
     req["status"] = "approved"
     req["approved_by"] = callback.from_user.full_name
+    asyncio.create_task(record_admin_activity("report_approved", callback.from_user.id,
+        f"Заявка {req_id}: {req.get('nick', '')}, +{quantity}", req.get("rep_type", "")))
     save_json(REQUESTS_FILE, requests_db)
     notify_state_changed()
     try:
@@ -1269,6 +1353,8 @@ async def reject_report(callback: types.CallbackQuery):
 
     req["status"] = "rejected"
     req["rejected_by"] = callback.from_user.full_name
+    asyncio.create_task(record_admin_activity("report_rejected", callback.from_user.id,
+        f"Заявка {req_id}: {req.get('nick', '')}", req.get("rep_type", "")))
     save_json(REQUESTS_FILE, requests_db)
     notify_state_changed()
 
@@ -1768,6 +1854,8 @@ async def process_remove_admin(callback: types.CallbackQuery):
             return
         save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
+        asyncio.create_task(record_admin_activity("admin_revoked", callback.from_user.id,
+            f"Доступ отозван у Telegram ID {target_id}"))
         await callback.answer("Заместитель успешно снят!", show_alert=True)
         try:
             await callback.message.delete()
@@ -1859,6 +1947,8 @@ async def perform_manual_grant(message: types.Message, raw: str):
                 "", grant_id, quantity=qty
             )
             if success:
+                asyncio.create_task(record_admin_activity("manual_grant", message.from_user.id,
+                    f"{nick}: +{qty}", sheet))
                 results.append(f"✅ {html.escape(nick)}: +{qty}")
             else:
                 results.append(f"⚠️ {html.escape(nick)}: не подтверждено")
@@ -2296,6 +2386,8 @@ async def agent_delete_confirm(callback: types.CallbackQuery):
             await callback.answer("Запись уже отсутствует.", show_alert=True)
             return
         await remove_agent_everywhere(agent["nick"])
+        asyncio.create_task(record_admin_activity("agent_deleted", callback.from_user.id,
+            f"Удалён агент {agent['nick']}"))
         await callback.answer("✅ Запись удалена.")
         await agent_panel_list(callback.message, callback.from_user.id, int(page), edit=True)
     except ValueError as exc:
@@ -2351,6 +2443,8 @@ async def agent_set_rank(callback: types.CallbackQuery):
         users_db[agent["uid"]]["rank"] = "X" if rank == 10 else str(rank)
         save_json(USERS_FILE, users_db)
         await sync_state_to_cloud()
+        asyncio.create_task(record_admin_activity("rank_changed", callback.from_user.id,
+            f"{agent['nick']}: новый ранг {rank}"))
         await callback.answer("✅ Ранг обновлён")
         await agent_panel_detail(callback.message, key, int(page_raw))
     except Exception as exc:
@@ -2408,6 +2502,8 @@ async def process_issue_one(callback: types.CallbackQuery):
     nick = callback.data[len("issue_1_"):]
     try:
         remaining = await firebase_client.debit_one("fractionrp", nick)
+        asyncio.create_task(record_admin_activity("point_issued", callback.from_user.id,
+            f"{nick}: -1, осталось {remaining}", "fractionrp"))
         await callback.answer(
             f"✓ {nick}: осталось {remaining}" if remaining else f"{nick}: баллы закончились",
             show_alert=False
