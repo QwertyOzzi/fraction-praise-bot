@@ -1096,8 +1096,12 @@ async def cmd_my_status(message: types.Message):
     await message.answer("🔄 Запрашиваю актуальные данные из таблицы...")
 
     try:
-        frp_rows = await firebase_client.get_sheet("fractionrp")
-        praise_rows = await firebase_client.get_sheet("praise")
+        frp_rows, praise_rows = await asyncio.wait_for(
+            asyncio.gather(
+                firebase_client.get_sheet("fractionrp"),
+                firebase_client.get_sheet("praise")
+            ), timeout=10
+        )
     except Exception as e:
         logger.error("Error fetching agent status sheets: %s", type(e).__name__)
         await message.answer(
@@ -1130,6 +1134,11 @@ async def cmd_my_status(message: types.Message):
         f"• Статус: <b>{praise_status_esc}</b>\n\n"
         f"🌐 Таблицу в реальном времени можно посмотреть по кнопке ниже:"
     )
+    if not frp_item or not praise_item:
+        text += (
+            "\n\nℹ️ «Нет записи» означает отсутствие строки с этим ником в соответствующей "
+            "таблице. Регистрация в боте хранится отдельно; удаление на сайте её не отменяет."
+        )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Открыть сайт таблицы", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
@@ -1211,6 +1220,9 @@ async def process_report_quantity_button(callback: types.CallbackQuery, state: F
 @dp.message(ReportStates.waiting_for_quantity)
 async def process_report_quantity_text(message: types.Message, state: FSMContext):
     value = (message.text or "").strip()
+    if value.split("@", 1)[0] == "/cancel":
+        await cmd_cancel(message, state)
+        return
     if not value.isdecimal() or not 1 <= int(value) <= 20:
         await message.answer("⚠️ Укажите целое число от 1 до 20 или отправьте /cancel.")
         return
@@ -1233,6 +1245,9 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
 @dp.message(ReportStates.waiting_for_proof)
 async def process_report_proof(message: types.Message, state: FSMContext):
     """Accept URL, Telegram photo or Telegram video without downloading media."""
+    if (message.text or "").strip().split("@", 1)[0] == "/cancel":
+        await cmd_cancel(message, state)
+        return
     media_type = ""
     media_id = ""
     proof_url = ""
