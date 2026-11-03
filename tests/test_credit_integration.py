@@ -22,6 +22,7 @@ class Response:
 class Store:
     def __init__(self):
         self.qty = 2
+        self.deleted = False
         self.version = 1
         self.ids = []
         self.conflict_once = False
@@ -29,9 +30,9 @@ class Store:
     def get(self):
         self.read_count += 1
         return Response(200, {"updateTime": "v" + str(self.version), "fields": {
-            "rows": {"arrayValue": {"values": [{"mapValue": {"fields": {
+            "rows": {"arrayValue": {"values": ([] if self.deleted else [{"mapValue": {"fields": {
                 "nick": {"stringValue": "Alice"}, "qty": {"integerValue": str(self.qty)}
-            }}}]}},
+            }}}])}},
             "appliedReportIds": {"arrayValue": {"values": [{"stringValue": v} for v in self.ids]}}
         }})
     def patch(self, params, json):
@@ -44,8 +45,12 @@ class Store:
         if precondition != "v" + str(self.version):
             return Response(412)
         values = json["fields"]["rows"]["arrayValue"]["values"]
-        row = values[0]["mapValue"]["fields"]
-        self.qty = int(row["qty"]["integerValue"])
+        if values:
+            row = values[0]["mapValue"]["fields"]
+            self.qty = int(row["qty"]["integerValue"])
+            self.deleted = False
+        else:
+            self.deleted = True
         ledger = json["fields"].get("appliedReportIds")
         if ledger is not None:
             self.ids = [x["stringValue"] for x in ledger["arrayValue"]["values"]]
@@ -99,6 +104,21 @@ class TestCreditIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.client.debit_one("fractionrp", "Alice"), 2)
         self.assertEqual(self.store.qty, 2)
         self.assertGreater(self.store.read_count, 1)
+
+    async def test_remove_only_zero_balance_agent(self):
+        self.assertFalse(await self.client.remove_zero_balance_agent("fractionrp", "Alice"))
+        self.assertFalse(self.store.deleted)
+        self.store.qty = 0
+        self.assertTrue(await self.client.remove_zero_balance_agent("fractionrp", "Alice"))
+        self.assertTrue(self.store.deleted)
+        self.assertTrue(await self.client.remove_zero_balance_agent("fractionrp", "Alice"))
+
+    async def test_remove_conflict_retries(self):
+        self.store.qty = 0
+        self.store.conflict_once = True
+        # Simulated concurrent writer adds 1: no deletion may follow the conflict.
+        self.assertFalse(await self.client.remove_zero_balance_agent("fractionrp", "Alice"))
+        self.assertFalse(self.store.deleted)
 
     async def test_reject_unknown_sheet(self):
         with self.assertRaises(ValueError):
