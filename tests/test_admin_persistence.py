@@ -114,6 +114,23 @@ class TestAdminRestoration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx["admin_roles"], cloud["admin_roles"])
         self.assertTrue(ctx["_cloud_state_hydrated"])
 
+    async def test_deleted_cloud_profile_is_not_resurrected_from_local_cache(self):
+        cloud = {
+            "users": {"222": {"nick": "Still_Registered", "rank": "8"}},
+            "admins": [],
+            "admin_roles": {},
+            "requests": {}
+        }
+        ctx = build_context(cloud)
+        ctx["users_db"].update({
+            "222": {"nick": "Outdated_Nick", "rank": "8"},
+            "999": {"nick": "Already_Deleted", "rank": "7"}
+        })
+        await ctx["sync_state_from_cloud"]()
+        self.assertEqual(ctx["users_db"], cloud["users"])
+        self.assertNotIn("999", ctx["users_db"])
+        self.assertTrue(ctx["_cloud_state_hydrated"])
+
     async def test_stale_local_admin_not_restored_without_signed_grant(self):
         cloud = {"users": {}, "admins": [], "admin_roles": {}, "requests": {}}
         ctx = build_context(cloud)
