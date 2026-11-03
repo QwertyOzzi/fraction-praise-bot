@@ -5,6 +5,7 @@ import html
 import logging
 import uuid
 import hashlib
+import hmac
 import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-RELEASE_TAG = "agent-cleanup-v5"
+RELEASE_TAG = "durable-admin-recovery-v6"
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
@@ -90,12 +91,30 @@ admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 completed_cleanup_ids = set()
+_cloud_state_hydrated = False
+_explicit_revoked_admins: set[int] = set()
+_pending_legacy_admins: Dict[int, str] = {}
+_pending_legacy_nonce: str = ""
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
     if cid not in admins_db:
         admins_db.append(cid)
         save_json(ADMINS_FILE, admins_db)
+
+def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
+    """Sign permission grants, so untrusted Firestore edits cannot grant admin."""
+    valid_ids = sorted({n for n in admin_ids if type(n) is int and n > 0
+                        and n not in OWNER_TELEGRAM_IDS})
+    signed_payload = {
+        "admins": valid_ids,
+        "roles": {str(n): roles.get(str(n), "deputy") for n in valid_ids}
+    }
+    secret = (os.getenv("ADMIN_ACL_SIGNING_KEY", "").strip() or BOT_TOKEN).encode("utf-8")
+    msg = json.dumps(signed_payload, ensure_ascii=True, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
@@ -484,7 +503,8 @@ firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE
 # ║  CLOUD STATE PERSISTENCE (FIRESTORE SYNC ДЛЯ RENDER)             ║
 # ╚══════════════════════════════════════════════════════════════════╝
 async def sync_state_from_cloud():
-    """Загрузка сохранённого состояния бота из Firestore при запуске."""
+    """Restore approved admins from the owner-restricted Firestore state document."""
+    global _cloud_state_hydrated, _pending_legacy_nonce
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
         token = await firebase_client.get_token()
@@ -504,19 +524,49 @@ async def sync_state_from_cloud():
                     )
 
                     cloud_users = cloud_data.get("users", {})
+                    if not isinstance(cloud_users, dict):
+                        raise RuntimeError("Invalid Firebase user list")
                     for uid, udata in cloud_users.items():
                         users_db[str(uid)] = udata
 
-                    cloud_roles = cloud_data.get("admin_roles", {})
-                    # Role labels are not grants: they apply only to IDs approved locally.
-                    if isinstance(cloud_roles, dict):
-                        for role_id, role in cloud_roles.items():
-                            if str(role_id).isdigit() and int(role_id) in admins_db and role in ("leader", "deputy"):
-                                admin_roles[str(role_id)] = role
-                        save_json("admin_roles.json", admin_roles)
-
+                    # config/bot_state must be OWNER-WRITE-ONLY in deployed Firebase rules.
+                    # Never use owner_ids or an arbitrary user rank to grant permissions.
                     cloud_admins = cloud_data.get("admins", [])
-                    # Cloud-stored admins are not a source of authorization.\n                    # Only previously approved local admins remain trusted.
+                    cloud_roles = cloud_data.get("admin_roles", {})
+                    if not isinstance(cloud_admins, list) or not isinstance(cloud_roles, dict):
+                        raise RuntimeError("Invalid Firebase admin state")
+                    filtered = sorted({
+                        item for item in cloud_admins if type(item) is int
+                        and item > 0 and item not in OWNER_TELEGRAM_IDS
+                    })
+                    filtered_roles = {
+                        str(item): cloud_roles.get(str(item), "deputy")
+                        if cloud_roles.get(str(item)) in ("leader", "deputy")
+                        else "deputy" for item in filtered
+                    }
+                    signature = cloud_data.get("admin_acl_signature", "")
+                    expected = sign_admin_permissions(filtered, filtered_roles)
+                    if filtered and not signature:
+                        # Legacy unsigned state: show it to the owner for confirmation.
+                        # It must never grant access automatically.
+                        _pending_legacy_admins.clear()
+                        _pending_legacy_admins.update({
+                            item: filtered_roles[str(item)] for item in filtered
+                        })
+                        _pending_legacy_nonce = uuid.uuid4().hex[:16]
+                        logger.error("Unsigned historic admin list found; owner /recoveradmins approval required")
+                        return
+                    if signature and not hmac.compare_digest(str(signature), expected):
+                        logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
+                        return
+                    approved_ids = set(admins_db)
+                    approved_ids.update(filtered)
+                    admins_db[:] = sorted(approved_ids)
+                    for item in filtered:
+                        admin_roles[str(item)] = filtered_roles[str(item)]
+                    for item in admins_db:
+                        admin_roles.setdefault(str(item), "deputy")
+                    save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
 
@@ -528,7 +578,13 @@ async def sync_state_from_cloud():
                     save_json(ADMINS_FILE, admins_db)
                     save_json(OWNER_FILE, owner_cfg)
                     save_json(REQUESTS_FILE, requests_db)
+                    _cloud_state_hydrated = True
                     logger.info(f"Loaded cloud bot state: {len(users_db)} users, {len(admins_db)} admins, {len(owner_cfg.get('owner_ids', []))} owners")
+                elif resp.status == 404:
+                    # New installations can start without an existing state document.
+                    _cloud_state_hydrated = True
+                else:
+                    raise RuntimeError(f"Cloud state read failed: {resp.status}")
 
         # Также загружаем настройки системы (Лидер, назначенный через сайт, и ключ замов)
         settings_url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
@@ -565,12 +621,15 @@ def notify_state_changed():
         pass
 
 async def sync_state_to_cloud():
-    """Сохранение состояния бота в Firestore при любых изменениях."""
+    """Save state after confirming cloud auth state was successfully hydrated."""
     async with _state_sync_lock:
         try:
+            if not _cloud_state_hydrated:
+                logger.error("Refusing to overwrite cloud state: initial read was not confirmed")
+                return False
             token = await firebase_client.get_token()
             if not token:
-                return
+                return False
 
             url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -579,6 +638,7 @@ async def sync_state_to_cloud():
                 "users": users_db,
                 "admins": admins_db,
                 "admin_roles": admin_roles,
+                "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db
@@ -599,10 +659,13 @@ async def sync_state_to_cloud():
                 async with session.patch(url, headers=headers, json=body) as resp:
                     if resp.status == 200:
                         logger.info("Bot state successfully synced to cloud Firestore")
+                        return True
                     else:
                         logger.warning(f"Failed to sync bot state to cloud: {resp.status}")
+                        return False
         except Exception as e:
             logger.warning(f"Error syncing bot state to cloud: {e}")
+            return False
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  FSM STATES                                                      ║
@@ -1219,6 +1282,73 @@ async def reject_report(callback: types.CallbackQuery):
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # Авторизация: /admin ключ
+@dp.message(Command("recoveradmins"))
+async def cmd_recover_admins(message: types.Message):
+    if not is_owner(message.from_user.id) or getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Только владелец в личном чате может восстанавливать права.")
+        return
+    if not _pending_legacy_admins:
+        await message.answer("Старый список администраторов для восстановления не найден. "
+                             "Если облачная запись уже была затёрта, потребуется резервная копия.")
+        return
+    lines = []
+    for uid, role in sorted(_pending_legacy_admins.items()):
+        profile = users_db.get(str(uid), {})
+        nick = html.escape(str(profile.get("nick", "Неизвестно")))
+        lines.append(f"• {nick} — ID {uid} — {role}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Восстановить перечисленных", callback_data=f"aclrestore:{_pending_legacy_nonce}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="aclrestorecancel")]
+    ])
+    await message.answer(
+        "🔐 <b>Найден архивный неподписанный список:</b>\n\n"
+        + "\n".join(lines) + "\n\nПроверьте каждого человека перед подтверждением.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("aclrestore:"))
+async def callback_recover_admins(callback: types.CallbackQuery):
+    global _cloud_state_hydrated, _pending_legacy_nonce
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    nonce = callback.data.removeprefix("aclrestore:")
+    if not nonce or nonce != _pending_legacy_nonce or not _pending_legacy_admins:
+        await callback.answer("Запрос устарел.", show_alert=True)
+        return
+    previous_admins = list(admins_db)
+    previous_roles = dict(admin_roles)
+    for uid, role in _pending_legacy_admins.items():
+        if uid not in admins_db:
+            admins_db.append(uid)
+        admin_roles[str(uid)] = role
+    admins_db.sort()
+    _cloud_state_hydrated = True
+    if not await sync_state_to_cloud():
+        admins_db[:] = previous_admins
+        admin_roles.clear()
+        admin_roles.update(previous_roles)
+        _cloud_state_hydrated = False
+        await callback.answer("⚠️ Восстановление не сохранено. Проверьте Firebase.", show_alert=True)
+        return
+    save_json(ADMINS_FILE, admins_db)
+    save_json("admin_roles.json", admin_roles)
+    _pending_legacy_admins.clear()
+    _pending_legacy_nonce = ""
+    await callback.message.edit_text("✅ Список администраторов подтверждён и сохранён.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "aclrestorecancel")
+async def callback_recover_cancel(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.message.edit_text("Восстановление отменено. Исходный список пока не изменён.")
+    await callback.answer()
+
+
 @dp.message(Command("admin"))
 async def cmd_admin_auth(message: types.Message, state: FSMContext):
     await state.clear()
@@ -1448,13 +1578,26 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     if role not in ("leader", "deputy"):
         await callback.answer("Сначала выберите роль.", show_alert=True)
         return
-    pending_admin_requests.pop(target_id, None)
-    if target_id not in admins_db:
+    was_admin = target_id in admins_db
+    previous_role = admin_roles.get(str(target_id))
+    if not was_admin:
         admins_db.append(target_id)
-        save_json(ADMINS_FILE, admins_db)
     admin_roles[str(target_id)] = role
+    if not await sync_state_to_cloud():
+        if not was_admin:
+            admins_db.remove(target_id)
+        if previous_role is None:
+            admin_roles.pop(str(target_id), None)
+        else:
+            admin_roles[str(target_id)] = previous_role
+        await callback.answer(
+            "⚠️ Права НЕ подтверждены Firebase. Попробуйте ещё раз после проверки связи.",
+            show_alert=True
+        )
+        return
+    pending_admin_requests.pop(target_id, None)
+    save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
-    notify_state_changed()
     target_user = users_db.get(str(target_id), {})
     try:
         await callback.message.edit_text(
@@ -1565,11 +1708,20 @@ async def process_remove_admin(callback: types.CallbackQuery):
         return
 
     if target_id in admins_db:
+        previous_role = admin_roles.get(str(target_id))
         admins_db.remove(target_id)
         admin_roles.pop(str(target_id), None)
+        if not await sync_state_to_cloud():
+            admins_db.append(target_id)
+            if previous_role:
+                admin_roles[str(target_id)] = previous_role
+            await callback.answer(
+                "⚠️ Удаление прав НЕ сохранено в Firebase. Повторите позже.",
+                show_alert=True
+            )
+            return
         save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
-        notify_state_changed()
         await callback.answer("Заместитель успешно снят!", show_alert=True)
         try:
             await callback.message.delete()
@@ -1721,6 +1873,8 @@ class AgentPanelStates(StatesGroup):
 
 async def remove_agent_everywhere(nick: str) -> bool:
     """Remove an unneeded agent only when its two outstanding balances are zero."""
+    if not _cloud_state_hydrated:
+        raise RuntimeError("Cannot delete agents before cloud state is loaded")
     if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", nick):
         raise ValueError("Invalid agent nickname")
     matches = [(uid, entry) for uid, entry in users_db.items()
@@ -2440,7 +2594,7 @@ async def main():
     # One-time cleanup requested by the owner. Track completion in cloud state
     # so a future user who legitimately chooses this nick is not deleted again.
     migration = "remove-accidental-Samuel_Norton_10-v1"
-    if migration not in completed_cleanup_ids:
+    if _cloud_state_hydrated and migration not in completed_cleanup_ids:
         try:
             if await remove_agent_everywhere("Samuel_Norton_10"):
                 completed_cleanup_ids.add(migration)

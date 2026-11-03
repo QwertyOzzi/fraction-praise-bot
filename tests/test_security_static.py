@@ -68,7 +68,29 @@ class BotSecurityChecks(unittest.TestCase):
         section = SOURCE.split("async def main():", 1)[1]
         self.assertLess(section.index("await start_web_server()"), section.index("await asyncio.wait_for(sync_state_from_cloud(), timeout=20)"))
         self.assertIn('headers = {"Authorization": f"Bearer {token}"}', SOURCE)
-        self.assertIn('RELEASE_TAG = "agent-cleanup-v5"', SOURCE)
+        self.assertIn('RELEASE_TAG = "durable-admin-recovery-v6"', SOURCE)
+
+    def test_restart_restores_approved_admins_and_roles(self):
+        section = SOURCE.split("async def sync_state_from_cloud():", 1)[1].split("_state_sync_lock =", 1)[0]
+        self.assertIn('cloud_admins = cloud_data.get("admins", [])', section)
+        self.assertIn("admins_db[:] = sorted(approved_ids)", section)
+        self.assertIn('admin_roles[str(item)] = filtered_roles[str(item)]', section)
+        self.assertIn("save_json(ADMINS_FILE, admins_db)", section)
+        self.assertIn("hmac.compare_digest(", section)
+        self.assertIn("Unsigned historic admin list found", section)
+        self.assertIn("owner /recoveradmins approval required", section)
+
+    def test_refuse_cloud_overwrite_before_initial_read(self):
+        section = SOURCE.split("async def sync_state_to_cloud():", 1)[1].split("# ╔", 1)[0]
+        self.assertIn("if not _cloud_state_hydrated:", section)
+        self.assertLess(section.index("if not _cloud_state_hydrated:"), section.index("session.patch"))
+
+    def test_admin_acl_signature_and_recovery(self):
+        self.assertIn("def sign_admin_permissions(", SOURCE)
+        self.assertIn('"admin_acl_signature": sign_admin_permissions(admins_db, admin_roles)', SOURCE)
+        recovery = SOURCE.split("async def callback_recover_admins(", 1)[1].split("@dp.callback_query", 1)[0]
+        self.assertIn("if not is_owner(callback.from_user.id)", recovery)
+        self.assertIn("await sync_state_to_cloud()", recovery)
 
     def test_python_syntax(self):
         ast.parse(SOURCE)
