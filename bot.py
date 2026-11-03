@@ -96,11 +96,9 @@ _explicit_revoked_admins: set[int] = set()
 _pending_legacy_admins: Dict[int, str] = {}
 _pending_legacy_nonce: str = ""
 
-if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
-    cid = int(ADMIN_CHAT_ID)
-    if cid not in admins_db:
-        admins_db.append(cid)
-        save_json(ADMINS_FILE, admins_db)
+# ADMIN_CHAT_ID is a notification destination, NEVER an authorization grant.
+# A positive chat ID can also be a Telegram user ID; treating it as an admin
+# would let an environment configuration accidentally bypass owner approval.
 
 def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
     """Sign permission grants, so untrusted Firestore edits cannot grant admin."""
@@ -1452,7 +1450,13 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
         return
 
-    # 2. Ключ Заместителя / Лидера ()
+    # Never accept shared credentials in groups or channels: anyone present
+    # can read the message and reuse the key. Grant requests require a DM.
+    if uid not in OWNER_TELEGRAM_IDS and getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Авторизация доступна только в личном чате с ботом. Не отправляйте ключ в группу.")
+        return
+
+    # 2. Ключ заместителя (всегда требует подтверждения владельца)
     if DEPUTY_KEY and key == DEPUTY_KEY:
         if is_admin(uid):
             await message.answer(
@@ -1463,7 +1467,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             )
             return
 
-        # Only a fresh request backed by the deputy key can be confirmed.
+        # Key alone never grants access: the owner must approve a fresh request.
         nonce = uuid.uuid4().hex[:16]
         pending_admin_requests[uid] = {"expires": datetime.now(timezone.utc).timestamp() + 600,
                                        "nonce": nonce, "source": "deputy", "role": "deputy"}
