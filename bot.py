@@ -476,6 +476,7 @@ class FirebaseClient:
                 "description": {"stringValue": str(ticket_data.get("description", ""))},
                 "screenshot": {"stringValue": str(ticket_data.get("screenshot", ""))},
                 "photo_id": {"stringValue": str(ticket_data.get("photo_id", ""))},
+                "video_id": {"stringValue": str(ticket_data.get("video_id", ""))},
                 "status": {"stringValue": str(ticket_data.get("status", "Новое"))},
                 "source": {"stringValue": str(ticket_data.get("source", "telegram"))},
                 "createdAt": {"stringValue": str(ticket_data.get("createdAt", now_iso))},
@@ -742,7 +743,10 @@ async def record_admin_activity(action: str, actor_id: int, details: str, sheet:
     if not is_admin(actor_id):
         return
     actor_role = role_name(actor_id)
-    actor = f"{actor_role} (Telegram ID {actor_id})"
+    profile = users_db.get(str(actor_id), {})
+    nick = str(profile.get("nick") or "Не указан")[:70] if isinstance(profile, dict) else "Не указан"
+    username = str(profile.get("telegram_username") or "")[:40] if isinstance(profile, dict) else ""
+    actor = f"{actor_role}: {nick}" + (f" (@{username.lstrip('@')})" if username else "") + f" (Telegram ID {actor_id})"
     message = str(details)[:500]
     try:
         token = await firebase_client.get_token()
@@ -1110,32 +1114,47 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
     await state.update_data(reason=reason)
 
     await callback.message.edit_text(
-        "🔗 Отправьте <b>ссылку на доказательства</b> (ссылка на ваш отчет на форуме Arizona RP):\n\n"
-        "<i>(Если ссылок несколько, отправьте ссылку на тему/пост)</i>",
+        "📎 Отправьте доказательства: <b>ссылку на форум, фотографию или видео прямо в этот чат</b>.\n\n"
+        "<i>Можно добавить подпись к фото/видео. Один отчёт = одно вложение.</i>",
         parse_mode="HTML"
     )
     await state.set_state(ReportStates.waiting_for_proof)
 
 @dp.message(ReportStates.waiting_for_proof)
 async def process_report_proof(message: types.Message, state: FSMContext):
-    proof = (message.text or "").strip()
-    if not proof.startswith(("https://", "http://")) or len(proof) > 1000:
-        await message.answer("⚠️ Отправьте ссылку http(s) длиной не более 1000 символов.")
-        return
+    """Accept URL, Telegram photo or Telegram video without downloading media."""
+    media_type = ""
+    media_id = ""
+    proof_url = ""
+    if message.photo:
+        media_type = "photo"
+        media_id = message.photo[-1].file_id
+        proof = (message.caption or "").strip()[:500] or "Фотография в Telegram"
+    elif message.video:
+        media_type = "video"
+        media_id = message.video.file_id
+        proof = (message.caption or "").strip()[:500] or "Видео в Telegram"
+    else:
+        proof = (message.text or "").strip()
+        if not proof.startswith(("https://", "http://")) or len(proof) > 1000:
+            await message.answer("⚠️ Отправьте ссылку http(s), фотографию или видео (не файл-документ).")
+            return
+        proof_url = proof
+
     data = await state.get_data()
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id, {})
-
     rep_type_label = "/fractionrp (Отметка FRP)" if data["rep_type"] == "fractionrp" else "/praise (Похвала)"
-    
-    await state.update_data(proof=proof)
+    await state.update_data(proof=proof, proof_url=proof_url,
+                            proof_media_type=media_type, proof_file_id=media_id)
 
+    evidence_label = ("📸 Фото" if media_type == "photo" else "🎥 Видео") if media_type else "🔗 Ссылка"
     text = (
         "📋 <b>Проверьте данные вашего отчета:</b>\n\n"
         f"• <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
         f"• <b>Тип:</b> {rep_type_label} (+{data.get('quantity', 1)})\n"
         f"• <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
-        f"• <b>Доказательства:</b> {html.escape(proof)}\n\n"
+        f"• <b>Доказательства:</b> {evidence_label}: {html.escape(proof)}\n\n"
         "Отправить отчет на проверку руководству?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1185,6 +1204,18 @@ async def send_pending_report_to_admin(chat_id: int, req_id: str, req: Dict[str,
                                   disable_web_page_preview=True, parse_mode="HTML")
     refs = req.setdefault("admin_messages", [])
     refs.append({"chat_id": chat_id, "message_id": sent.message_id})
+    # Media is sent privately to the same authorized leadership recipients.
+    # Do not share a public URL or bot-token-backed download endpoint.
+    media_kind, media_id = req.get("proof_media_type"), req.get("proof_file_id")
+    if media_id and media_kind in ("photo", "video"):
+        try:
+            caption = f"📎 Вложение к заявке #{req_id} от {str(req.get('nick', 'Агент'))[:70]}"
+            if media_kind == "photo":
+                await bot.send_photo(chat_id, media_id, caption=caption, parse_mode=None)
+            else:
+                await bot.send_video(chat_id, media_id, caption=caption, parse_mode=None)
+        except Exception as exc:
+            logger.warning("Could not forward report evidence to administrator: %s", type(exc).__name__)
     try:
         await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id,
                                    disable_notification=True)
@@ -1261,6 +1292,8 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         "rep_type": data["rep_type"],
         "reason": data["reason"],
         "proof": data["proof"],
+        "proof_media_type": data.get("proof_media_type", ""),
+        "proof_file_id": data.get("proof_file_id", ""),
         "quantity": int(data.get("quantity", 1)),
         "admin_messages": [],
         "status": "pending",
@@ -2330,6 +2363,10 @@ async def agent_do_action(callback: types.CallbackQuery):
         else:
             await firebase_client.debit_one(sheet, action["nick"])
         action["status"] = "done"
+        activity = "panel_grant" if action["kind"] == "g" else "panel_debit"
+        amount = "+" + str(action["qty"]) if action["kind"] == "g" else "-1"
+        asyncio.create_task(record_admin_activity(activity, callback.from_user.id,
+            f"{action['nick']}: {amount}", sheet))
     except Exception as exc:
         # No blind retry after a possibly successful but timed-out write.
         action["status"] = "uncertain"
@@ -2532,7 +2569,7 @@ async def cmd_support(message: types.Message, state: FSMContext):
     await message.answer(
         "💬 <b>Служба поддержки и баг-трекер:</b>\n\n"
         "Опишите найденный баг, ошибку или предложение следующим сообщением.\n"
-        "<i>(Вы можете отправить текст или прикрепить скриншот — лидер получит ваше сообщение)</i>",
+        "<i>Можно отправить текст, фотографию или видео с подписью — руководство получит вложение в Telegram.</i>",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -2552,7 +2589,7 @@ async def process_support_msg(message: types.Message, state: FSMContext):
     rank = u_info.get("rank", "?")
     username_str = f"(@{message.from_user.username})" if message.from_user.username else ""
 
-    content_text = message.text or message.caption or "[Вложение без текста]"
+    content_text = (message.text or message.caption or "[Вложение без текста]")[:600]
 
     admin_msg = (
         "🚨 <b>Новое обращение в Службу Поддержки!</b>\n\n"
@@ -2569,11 +2606,14 @@ async def process_support_msg(message: types.Message, state: FSMContext):
         "description": content_text,
         "screenshot": "",
         "photo_id": message.photo[-1].file_id if message.photo else "",
+        "video_id": message.video.file_id if message.video else "",
         "status": "Новое",
         "source": "telegram"
     }
     ticket_id = await firebase_client.add_support_ticket(ticket_payload)
     ticket_label = f"#{ticket_id[-6:]}" if ticket_id else ""
+    if not ticket_id:
+        logger.warning("Support ticket was forwarded to leadership but not stored in Firestore")
 
     admin_msg_with_id = (
         f"🚨 <b>Новое обращение в Службу Поддержки {ticket_label}!</b>\n\n"
@@ -2590,19 +2630,22 @@ async def process_support_msg(message: types.Message, state: FSMContext):
 
     for adm_id in recipients:
         try:
+            await bot.send_message(adm_id, admin_msg_with_id[:3900], parse_mode="HTML")
+            short_caption = f"📎 Вложение к обращению {ticket_label} от {nick}"[:180]
             if message.photo:
-                await bot.send_photo(adm_id, message.photo[-1].file_id, caption=admin_msg_with_id, parse_mode="HTML")
-            else:
-                await bot.send_message(adm_id, admin_msg_with_id, parse_mode="HTML")
+                await bot.send_photo(adm_id, message.photo[-1].file_id, caption=short_caption, parse_mode=None)
+            elif message.video:
+                await bot.send_video(adm_id, message.video.file_id, caption=short_caption, parse_mode=None)
         except Exception as e:
             logger.warning(f"Could not forward support message to {adm_id}: {e}")
 
-    await message.answer(
-        "✅ <b>Ваше обращение успешно зарегистрировано и передано руководству!</b>\n\n"
-        "Оно добавлено в общую панель обращений и будет проверено лидером/тех. администратором. Спасибо за содействие!",
-        reply_markup=get_main_menu(uid),
-        parse_mode="HTML"
+    status_text = (
+        "✅ <b>Обращение сохранено в базе и передано руководству.</b>"
+        if ticket_id else
+        "⚠️ <b>Обращение отправлено руководству в Telegram, но Firebase не подтвердил сохранение.</b> "
+        "Попросите техадминистратора проверить правила и журнал."
     )
+    await message.answer(status_text, reply_markup=get_main_menu(uid), parse_mode="HTML")
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  DUMMY WEB SERVER ДЛЯ RENDER (STAY-ALIVE)                        ║
