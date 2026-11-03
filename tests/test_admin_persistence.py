@@ -49,6 +49,8 @@ class Session:
 class Logger:
     def __init__(self):
         self.errors = []
+    def info(self, *args):
+        pass
     def warning(self, *args):
         pass
     def error(self, *args):
