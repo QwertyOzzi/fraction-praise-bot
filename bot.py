@@ -881,9 +881,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if isinstance(user_data, dict) and user_data.get("nick"):
         new_username = message.from_user.username or ""
         if user_data.get("telegram_username", "") != new_username:
+            old_username = user_data.get("telegram_username", "")
             user_data["telegram_username"] = new_username
-            save_json(USERS_FILE, users_db)
-            notify_state_changed()
+            if await sync_state_to_cloud():
+                save_json(USERS_FILE, users_db)
+            else:
+                user_data["telegram_username"] = old_username
+                logger.warning("Could not confirm Telegram username update in Firebase")
 
     if not user_data or not user_data.get("nick"):
         await message.answer(
@@ -901,6 +905,32 @@ async def cmd_start(message: types.Message, state: FSMContext):
             reply_markup=get_main_menu(message.from_user.id),
             parse_mode="HTML"
         )
+        # Bot registrations live in config/bot_state; the two visible tables
+        # are independent. A website row deletion is NOT a profile deletion.
+        try:
+            frp_rows, praise_rows = await asyncio.wait_for(
+                asyncio.gather(
+                    firebase_client.get_sheet("fractionrp"),
+                    firebase_client.get_sheet("praise")
+                ), timeout=10
+            )
+            missing = [
+                sheet for sheet, rows in (("fractionrp", frp_rows), ("praise", praise_rows))
+                if not any(str(row.get("nick", "")).casefold() == str(user_data["nick"]).casefold()
+                           for row in rows)
+            ]
+            if missing:
+                await message.answer(
+                    "ℹ️ Профиль бота сохранён отдельно от таблиц. "
+                    "Сейчас для этого ника нет строки в: " +
+                    ", ".join("/" + sheet for sheet in missing) + ".\n"
+                    "Удаление строки через сайт не удаляет регистрацию Telegram. "
+                    "Для полного удаления обычного агента владелец использует /agents. "
+                    "Посмотрите «Мой статус» для балансов."
+                )
+        except Exception as exc:
+            logger.warning("Could not compare profile with Firestore sheets: %s",
+                           type(exc).__name__)
 
 # Регистрация ника
 @dp.message(RegistrationStates.waiting_for_nick)
@@ -1069,17 +1099,21 @@ async def cmd_my_status(message: types.Message):
         frp_rows = await firebase_client.get_sheet("fractionrp")
         praise_rows = await firebase_client.get_sheet("praise")
     except Exception as e:
-        logger.error(f"Error fetching sheets: {e}")
-        frp_rows, praise_rows = [], []
+        logger.error("Error fetching agent status sheets: %s", type(e).__name__)
+        await message.answer(
+            "⚠️ Не удалось получить актуальные данные Firebase. "
+            "Баланс не подтверждён, повторите «Мой статус» позднее."
+        )
+        return
 
     frp_item = next((r for r in frp_rows if r.get("nick", "").lower() == nick), None)
     praise_item = next((r for r in praise_rows if r.get("nick", "").lower() == nick), None)
 
     frp_qty = frp_item.get("qty", 0) if frp_item else 0
-    frp_status = frp_item.get("status", "Выдано") if frp_item else "Выдано"
+    frp_status = frp_item.get("status", "Выдано") if frp_item else "Нет записи"
 
     praise_qty = praise_item.get("qty", 0) if praise_item else 0
-    praise_status = praise_item.get("status", "Выдано") if praise_item else "Выдано"
+    praise_status = praise_item.get("status", "Выдано") if praise_item else "Нет записи"
 
     nick_esc = html.escape(user_data['nick'])
     rank_esc = html.escape(str(user_data.get('rank', '?')))
