@@ -1317,6 +1317,8 @@ async def callback_recover_admins(callback: types.CallbackQuery):
     if not nonce or nonce != _pending_legacy_nonce or not _pending_legacy_admins:
         await callback.answer("Запрос устарел.", show_alert=True)
         return
+    previous_admins = list(admins_db)
+    previous_roles = dict(admin_roles)
     for uid, role in _pending_legacy_admins.items():
         if uid not in admins_db:
             admins_db.append(uid)
@@ -1324,6 +1326,9 @@ async def callback_recover_admins(callback: types.CallbackQuery):
     admins_db.sort()
     _cloud_state_hydrated = True
     if not await sync_state_to_cloud():
+        admins_db[:] = previous_admins
+        admin_roles.clear()
+        admin_roles.update(previous_roles)
         _cloud_state_hydrated = False
         await callback.answer("⚠️ Восстановление не сохранено. Проверьте Firebase.", show_alert=True)
         return
