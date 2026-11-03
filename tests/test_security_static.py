@@ -73,8 +73,8 @@ class BotSecurityChecks(unittest.TestCase):
     def test_restart_restores_approved_admins_and_roles(self):
         section = SOURCE.split("async def sync_state_from_cloud():", 1)[1].split("_state_sync_lock =", 1)[0]
         self.assertIn('cloud_admins = cloud_data.get("admins", [])', section)
-        self.assertIn("admins_db[:] = sorted(approved_ids)", section)
-        self.assertIn('admin_roles[str(item)] = filtered_roles[str(item)]', section)
+        self.assertIn("admins_db[:] = filtered", section)
+        self.assertIn("admin_roles.update(filtered_roles)", section)
         self.assertIn("save_json(ADMINS_FILE, admins_db)", section)
         self.assertIn("hmac.compare_digest(", section)
         self.assertIn("Unsigned historic admin list found", section)
@@ -91,6 +91,15 @@ class BotSecurityChecks(unittest.TestCase):
         recovery = SOURCE.split("async def callback_recover_admins(", 1)[1].split("@dp.callback_query", 1)[0]
         self.assertIn("if not is_owner(callback.from_user.id)", recovery)
         self.assertIn("await sync_state_to_cloud()", recovery)
+
+    def test_rejected_or_revoked_admin_cannot_pass_security_check(self):
+        section = SOURCE.split("def is_admin(user_id: int)", 1)[1].split(
+            "def is_owner(", 1)[0]
+        self.assertIn("_cloud_state_hydrated and user_id in admins_db", section)
+        restore = SOURCE.split("async def sync_state_from_cloud()", 1)[1].split(
+            "_state_sync_lock =", 1)[0]
+        self.assertIn("admins_db[:] = filtered", restore)
+        self.assertNotIn("approved_ids.update(filtered)", restore)
 
     def test_notification_chat_never_grants_admin(self):
         initial = SOURCE.split("def sign_admin_permissions(", 1)[0]
