@@ -1730,6 +1730,8 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     pending_admin_requests.pop(target_id, None)
     save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
+    asyncio.create_task(record_admin_activity("admin_role_assigned", callback.from_user.id,
+        f"Назначена роль {role} для Telegram ID {target_id}"))
     target_user = users_db.get(str(target_id), {})
     try:
         await callback.message.edit_text(
