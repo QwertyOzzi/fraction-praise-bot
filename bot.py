@@ -29,7 +29,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-RELEASE_TAG = "agent-cleanup-v5"
+RELEASE_TAG = "durable-admin-recovery-v6"
 
 # Ключи доступа:
 # 1. Личный мастер-ключ владельца (мгновенный вход без ожидания)
@@ -90,6 +90,8 @@ admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 completed_cleanup_ids = set()
+_cloud_state_hydrated = False
+_explicit_revoked_admins: set[int] = set()
 
 if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
     cid = int(ADMIN_CHAT_ID)
@@ -484,7 +486,8 @@ firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE
 # ║  CLOUD STATE PERSISTENCE (FIRESTORE SYNC ДЛЯ RENDER)             ║
 # ╚══════════════════════════════════════════════════════════════════╝
 async def sync_state_from_cloud():
-    """Загрузка сохранённого состояния бота из Firestore при запуске."""
+    """Restore approved admins from the owner-restricted Firestore state document."""
+    global _cloud_state_hydrated
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
         token = await firebase_client.get_token()
@@ -504,19 +507,34 @@ async def sync_state_from_cloud():
                     )
 
                     cloud_users = cloud_data.get("users", {})
+                    if not isinstance(cloud_users, dict):
+                        raise RuntimeError("Invalid Firebase user list")
                     for uid, udata in cloud_users.items():
                         users_db[str(uid)] = udata
 
-                    cloud_roles = cloud_data.get("admin_roles", {})
-                    # Role labels are not grants: they apply only to IDs approved locally.
-                    if isinstance(cloud_roles, dict):
-                        for role_id, role in cloud_roles.items():
-                            if str(role_id).isdigit() and int(role_id) in admins_db and role in ("leader", "deputy"):
-                                admin_roles[str(role_id)] = role
-                        save_json("admin_roles.json", admin_roles)
-
+                    # config/bot_state must be OWNER-WRITE-ONLY in deployed Firebase rules.
+                    # Never use owner_ids or an arbitrary user rank to grant permissions.
                     cloud_admins = cloud_data.get("admins", [])
-                    # Cloud-stored admins are not a source of authorization.\n                    # Only previously approved local admins remain trusted.
+                    cloud_roles = cloud_data.get("admin_roles", {})
+                    if not isinstance(cloud_admins, list) or not isinstance(cloud_roles, dict):
+                        raise RuntimeError("Invalid Firebase admin state")
+                    approved_ids = set(admins_db)
+                    for item in cloud_admins:
+                        if type(item) is not int or item <= 0:
+                            continue
+                        # Accept only registered identities; users cannot choose their Telegram ID.
+                        if str(item) not in users_db and str(item) not in cloud_users:
+                            logger.warning("Skipping cloud admin with no registered Telegram account")
+                            continue
+                        approved_ids.add(item)
+                    admins_db[:] = sorted(approved_ids)
+                    for item in admins_db:
+                        role = cloud_roles.get(str(item))
+                        if role in ("leader", "deputy"):
+                            admin_roles[str(item)] = role
+                        elif str(item) not in admin_roles:
+                            admin_roles[str(item)] = "deputy"
+                    save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
 
@@ -528,7 +546,13 @@ async def sync_state_from_cloud():
                     save_json(ADMINS_FILE, admins_db)
                     save_json(OWNER_FILE, owner_cfg)
                     save_json(REQUESTS_FILE, requests_db)
+                    _cloud_state_hydrated = True
                     logger.info(f"Loaded cloud bot state: {len(users_db)} users, {len(admins_db)} admins, {len(owner_cfg.get('owner_ids', []))} owners")
+                elif resp.status == 404:
+                    # New installations can start without an existing state document.
+                    _cloud_state_hydrated = True
+                else:
+                    raise RuntimeError(f"Cloud state read failed: {resp.status}")
 
         # Также загружаем настройки системы (Лидер, назначенный через сайт, и ключ замов)
         settings_url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/settings"
@@ -565,9 +589,12 @@ def notify_state_changed():
         pass
 
 async def sync_state_to_cloud():
-    """Сохранение состояния бота в Firestore при любых изменениях."""
+    """Save state after confirming cloud auth state was successfully hydrated."""
     async with _state_sync_lock:
         try:
+            if not _cloud_state_hydrated:
+                logger.error("Refusing to overwrite cloud state: initial read was not confirmed")
+                return
             token = await firebase_client.get_token()
             if not token:
                 return
@@ -1566,6 +1593,7 @@ async def process_remove_admin(callback: types.CallbackQuery):
 
     if target_id in admins_db:
         admins_db.remove(target_id)
+        _explicit_revoked_admins.add(target_id)
         admin_roles.pop(str(target_id), None)
         save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
