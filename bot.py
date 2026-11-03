@@ -10,7 +10,8 @@ import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
+from urllib.parse import urlsplit
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
@@ -459,10 +460,12 @@ class FirebaseClient:
 
     async def add_support_ticket(self, ticket_data: Dict[str, Any]) -> Optional[str]:
         token = await self.get_token()
+        if not token:
+            logger.error("Ticket write denied: Firebase authentication unavailable")
+            return None
         url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/support_tickets"
         headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = f"Bearer {token}"
 
         now_iso = datetime.now(timezone.utc).isoformat()
         body = {
@@ -579,8 +582,14 @@ async def sync_state_from_cloud():
                     _cloud_state_hydrated = True
                     logger.info(f"Loaded cloud bot state: {len(users_db)} users, {len(admins_db)} admins, {len(owner_cfg.get('owner_ids', []))} owners")
                 elif resp.status == 404:
-                    # New installations can start without an existing state document.
+                    # Fail closed: deleted/missing cloud ACL must not resurrect stale local admins.
+                    # Owners retain their hardcoded Telegram identity to bootstrap the system.
+                    admins_db.clear()
+                    admin_roles.clear()
+                    save_json(ADMINS_FILE, admins_db)
+                    save_json("admin_roles.json", admin_roles)
                     _cloud_state_hydrated = True
+                    logger.warning("Cloud ACL missing: revoked all non-owner local administrator permissions")
                 else:
                     raise RuntimeError(f"Cloud state read failed: {resp.status}")
 
@@ -2508,27 +2517,34 @@ async def handle_ping(request):
     }
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=headers)
-    data = {
-        "status": "online",
-        "release": RELEASE_TAG,
-        "commit": os.getenv("RENDER_GIT_COMMIT", "").strip()[:12],
-        "service": "FractionRp Telegram Bot",
-        "bot_username": "frporp_bot",
-        "leader": LEADER_INFO.get("nick", "Не назначен"),
-        "time": datetime.now(timezone.utc).isoformat()
-    }
-    return web.json_response(data, headers=headers)
+    return web.json_response({"status": "online"}, headers={**headers, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 _support_rate_history: Dict[str, List[float]] = {}
+_support_global_attempts: List[float] = []
+
+
+def safe_support_url(value: str) -> bool:
+    if not value:
+        return True
+    try:
+        u = urlsplit(value)
+        return u.scheme in ("http", "https") and bool(u.hostname) and not u.username and not u.password
+    except ValueError:
+        return False
 
 async def handle_api_support(request):
+    origin = request.headers.get("Origin", "")
     headers = {
-        "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
     }
+    if origin == "https://qwertyozzi.github.io":
+        headers["Access-Control-Allow-Origin"] = origin
     if request.method == "OPTIONS":
-        return web.Response(status=204, headers=headers)
+        return web.Response(status=204 if origin == "https://qwertyozzi.github.io" else 403, headers=headers)
 
     client_ip = request.remote or "unknown"
     now = datetime.now(timezone.utc).timestamp()
@@ -2539,10 +2555,16 @@ async def handle_api_support(request):
             _support_rate_history[ip] = recent
         else:
             del _support_rate_history[ip]
+    _support_global_attempts[:] = [t for t in _support_global_attempts if now - t < 60]
+    if len(_support_global_attempts) >= 100:
+        return web.json_response({"error": "Temporarily unavailable"}, status=429, headers=headers)
     attempts = _support_rate_history.setdefault(client_ip, [])
     if len(attempts) >= 5:
         return web.json_response({"error": "Too many requests"}, status=429, headers=headers)
     attempts.append(now)
+    _support_global_attempts.append(now)
+    if request.content_type != "application/json":
+        return web.json_response({"error": "JSON required"}, status=415, headers=headers)
     if request.content_length is None or request.content_length > 12000:
         return web.json_response({"error": "Invalid request size"}, status=413, headers=headers)
     try:
@@ -2555,7 +2577,7 @@ async def handle_api_support(request):
         description = str(data.get("description", "")).strip()
         screenshot = str(data.get("screenshot", "")).strip()
 
-        if not nick or not description or len(nick) > 80 or len(description) > 4000 or len(contact) > 200 or len(category) > 80 or len(screenshot) > 1000:
+        if not nick or not description or len(nick) > 80 or len(description) > 4000 or len(contact) > 200 or len(category) > 80 or len(screenshot) > 1000 or not safe_support_url(screenshot):
             return web.json_response({"error": "Missing nick or description"}, status=400, headers=headers)
 
         ticket_payload = {
@@ -2568,6 +2590,8 @@ async def handle_api_support(request):
             "source": "site"
         }
         ticket_id = await firebase_client.add_support_ticket(ticket_payload)
+        if not ticket_id:
+            return web.json_response({"error": "Ticket storage unavailable"}, status=503, headers=headers)
 
         # Мгновенно уведомляем руководство в Telegram
         ticket_label = f"#{ticket_id[-6:]}" if ticket_id else ""
@@ -2597,7 +2621,7 @@ async def handle_api_support(request):
         return web.json_response({"status": "ok", "id": ticket_id}, headers=headers)
     except Exception as e:
         logger.error(f"Error handling /api/support: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers=headers)
+        return web.json_response({"error": "Internal server error"}, status=500, headers=headers)
 
 async def start_web_server():
     app = web.Application()
