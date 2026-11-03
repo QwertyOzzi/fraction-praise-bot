@@ -96,11 +96,9 @@ _explicit_revoked_admins: set[int] = set()
 _pending_legacy_admins: Dict[int, str] = {}
 _pending_legacy_nonce: str = ""
 
-if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip("-").isdigit():
-    cid = int(ADMIN_CHAT_ID)
-    if cid not in admins_db:
-        admins_db.append(cid)
-        save_json(ADMINS_FILE, admins_db)
+# ADMIN_CHAT_ID is a notification destination, NEVER an authorization grant.
+# A positive chat ID can also be a Telegram user ID; treating it as an admin
+# would let an environment configuration accidentally bypass owner approval.
 
 def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
     """Sign permission grants, so untrusted Firestore edits cannot grant admin."""
@@ -117,14 +115,15 @@ def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in OWNER_TELEGRAM_IDS or user_id in admins_db
+    # Fail closed while Firebase has not confirmed the signed access list.
+    return user_id in OWNER_TELEGRAM_IDS or (_cloud_state_hydrated and user_id in admins_db)
 
 def is_owner(user_id: int) -> bool:
     return user_id in OWNER_TELEGRAM_IDS
 
 
 def is_leader(user_id: int) -> bool:
-    return is_owner(user_id) or (user_id in admins_db and admin_roles.get(str(user_id)) == "leader")
+    return is_owner(user_id) or (is_admin(user_id) and admin_roles.get(str(user_id)) == "leader")
 
 
 def role_name(user_id: int) -> str:
@@ -559,13 +558,12 @@ async def sync_state_from_cloud():
                     if signature and not hmac.compare_digest(str(signature), expected):
                         logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
                         return
-                    approved_ids = set(admins_db)
-                    approved_ids.update(filtered)
-                    admins_db[:] = sorted(approved_ids)
-                    for item in filtered:
-                        admin_roles[str(item)] = filtered_roles[str(item)]
-                    for item in admins_db:
-                        admin_roles.setdefault(str(item), "deputy")
+                    # The authenticated, signed cloud ACL is authoritative.
+                    # Do not merge potentially stale local admin JSON into it:
+                    # doing so could resurrect a previously revoked administrator.
+                    admins_db[:] = filtered
+                    admin_roles.clear()
+                    admin_roles.update(filtered_roles)
                     save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
@@ -1282,6 +1280,39 @@ async def reject_report(callback: types.CallbackQuery):
 # ╚══════════════════════════════════════════════════════════════════╝
 
 # Авторизация: /admin ключ
+@dp.message(Command("security"))
+async def cmd_security_overview(message: types.Message):
+    """Owner-only overview of the actual in-memory Telegram ACL."""
+    if not is_owner(message.from_user.id) or getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Проверка прав доступна только владельцу в личных сообщениях.")
+        return
+    all_admins = sorted({
+        uid for uid in admins_db if type(uid) is int and uid not in OWNER_TELEGRAM_IDS
+    })
+    members = []
+    for uid in all_admins[:50]:
+        info = users_db.get(str(uid), {})
+        nick = html.escape(str(info.get("nick", "Не зарегистрирован")))
+        role = "👑 Лидер" if is_leader(uid) else "⭐ Заместитель"
+        members.append(f"• {nick} (ID <code>{uid}</code>) — {role}")
+    if len(all_admins) > 50:
+        members.append(f"…и ещё {len(all_admins)-50} администраторов")
+    if not members:
+        members.append("• Никого, кроме владельца")
+    state_label = "✅ Firebase загружена" if _cloud_state_hydrated else "⚠️ Firebase НЕ подтверждена"
+    await message.answer(
+        f"🔐 <b>Аудит доступа бота</b>\n"
+        f"Версия: <code>{html.escape(RELEASE_TAG)}</code>\n"
+        f"{state_label}\n"
+        f"Владелец: <code>{next(iter(OWNER_TELEGRAM_IDS))}</code>\n"
+        f"Администраторов: <b>{len(all_admins)}</b>\n\n"
+        + "\n".join(members)
+        + "\n\nДля снятия лишних прав используйте /admins. "
+          "Никто не получает доступ только по рангу, ключу или ADMIN_CHAT_ID.",
+        parse_mode="HTML"
+    )
+
+
 @dp.message(Command("recoveradmins"))
 async def cmd_recover_admins(message: types.Message):
     if not is_owner(message.from_user.id) or getattr(message.chat, "type", "") != "private":
@@ -1452,7 +1483,13 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
         )
         return
 
-    # 2. Ключ Заместителя / Лидера ()
+    # Never accept shared credentials in groups or channels: anyone present
+    # can read the message and reuse the key. Grant requests require a DM.
+    if uid not in OWNER_TELEGRAM_IDS and getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Авторизация доступна только в личном чате с ботом. Не отправляйте ключ в группу.")
+        return
+
+    # 2. Ключ заместителя (всегда требует подтверждения владельца)
     if DEPUTY_KEY and key == DEPUTY_KEY:
         if is_admin(uid):
             await message.answer(
@@ -1463,7 +1500,7 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             )
             return
 
-        # Only a fresh request backed by the deputy key can be confirmed.
+        # Key alone never grants access: the owner must approve a fresh request.
         nonce = uuid.uuid4().hex[:16]
         pending_admin_requests[uid] = {"expires": datetime.now(timezone.utc).timestamp() + 600,
                                        "nonce": nonce, "source": "deputy", "role": "deputy"}

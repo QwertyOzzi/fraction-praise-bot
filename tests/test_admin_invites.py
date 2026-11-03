@@ -98,6 +98,12 @@ class TestAdminInvites(unittest.IsolatedAsyncioTestCase):
         await self.env["cmd_admin_auth"](m, State())
         self.assertEqual(self.env["pending_admin_requests"], {})
 
+    async def test_deputy_key_in_group_cannot_request_access(self):
+        msg = Message("/admin deputy-key-for-tests", user_id=111, private=False)
+        await self.env["cmd_admin_auth"](msg, State())
+        self.assertEqual(self.env["pending_admin_requests"], {})
+        self.assertIn("только в личном чате", msg.answers[-1][0])
+
     async def test_group_invite_rejected(self):
         m = Message("/admin @Known_User", private=False)
         await self.env["cmd_admin_auth"](m, State())
