@@ -40,7 +40,7 @@ class Logger:
 
 env = {"Dict": Dict, "List": List, "Any": Any, "html": html,
        "InlineKeyboardButton": Button, "InlineKeyboardMarkup": Markup,
-       "bot": Bot(), "logger": Logger()}
+       "bot": Bot(), "logger": Logger(), "REPORT_MEDIA_LIMIT": 10}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "<feature helpers>", "exec"), env)
 
 
