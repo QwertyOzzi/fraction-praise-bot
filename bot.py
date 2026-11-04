@@ -3874,18 +3874,35 @@ AI_CONFIRM_TTL = 5 * 60
 
 
 async def gemini_json_request(url: str, headers: dict, body: dict) -> dict:
+    """Call Gemini with a bounded timeout and safe, actionable error messages."""
     async with _AI_SEMAPHORE:
-        async with ClientSession(timeout=ClientTimeout(total=20)) as session:
-            async with session.post(url, headers=headers, json=body) as response:
-                if response.status == 429:
-                    raise ParseError("Gemini достиг лимита запросов. Повторите позже.")
-                if response.status in (401, 403):
-                    raise ParseError("Gemini API-ключ недействителен или недоступен модели.")
-                if response.status == 404:
-                    raise ParseError(f"Модель {MODEL} недоступна для этого API-ключа.")
-                if response.status != 200:
-                    raise ParseError("Gemini временно недоступен. Повторите позже.")
-                return await response.json()
+        try:
+            # Gemini 3.8 can spend time on internal reasoning; thinkingLevel=low
+            # reduces latency. Keep a finite read timeout so polling stays live.
+            async with ClientSession(
+                timeout=ClientTimeout(total=45, connect=10, sock_read=40)
+            ) as session:
+                async with session.post(url, headers=headers, json=body) as response:
+                    if response.status == 429:
+                        raise ParseError("Лимит Gemini исчерпан. Попробуйте позже.")
+                    if response.status in (401, 403):
+                        raise ParseError("Gemini API-ключ недействителен или недоступен модели.")
+                    if response.status == 404:
+                        raise ParseError(f"Модель {MODEL} недоступна для этого API-ключа.")
+                    if response.status == 400:
+                        logger.warning("Gemini rejected request with HTTP 400; check model request schema")
+                        raise ParseError("Gemini отклонил формат запроса. Обратитесь к владельцу бота.")
+                    if response.status >= 500:
+                        raise ParseError("Сервис Gemini временно недоступен. Попробуйте позже.")
+                    if response.status != 200:
+                        raise ParseError("Gemini не принял запрос. Проверьте доступ и лимиты API.")
+                    return await response.json()
+        except asyncio.TimeoutError as exc:
+            logger.warning("Gemini request timed out after 45 seconds")
+            raise ParseError(
+                "Gemini слишком долго отвечает. Балансы не менялись. "
+                "Попробуйте ещё раз или используйте формат: нортон,гоммез фрп +1."
+            ) from exc
 
 
 async def handle_natural_command(message: types.Message, raw: str):
