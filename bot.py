@@ -1990,7 +1990,7 @@ async def cmd_list_admins(message: types.Message):
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await send_fbi_card(message, text, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("remove_admin_"))
 async def process_remove_admin(callback: types.CallbackQuery):
@@ -2144,12 +2144,12 @@ async def cmd_grant_menu(message: types.Message, state: FSMContext):
         await message.answer("⛔ Только для руководства.")
         return
     await state.set_state(GrantStates.waiting_for_details)
-    await message.answer(
+    await send_fbi_card(
+        message,
         "➕ <b>FBI · Начисление баллов</b>\n\n" "Введите тип, ник и количество (1–20):\n"
         "<code>frp Gomez_Addams 2</code>\n"
         "<code>praise Gomez_Addams 3</code>\n\n"
-        "Или используйте /grant praise Gomez_Addams 3. Для отмены: /cancel.",
-        parse_mode="HTML"
+        "Или используйте /grant praise Gomez_Addams 3. Для отмены: /cancel."
     )
 
 
@@ -2324,9 +2324,9 @@ async def agent_panel_list(message: types.Message, admin_id: int, page: int = 0,
         agents = [agent for agent in agents if term in agent["nick"].casefold()]
     text, kb = agent_list_markup(agents, page)
     if edit:
-        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await edit_fbi_card(message, text, reply_markup=kb)
     else:
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await send_fbi_card(message, text, reply_markup=kb)
 
 
 async def agent_panel_detail(message: types.Message, key: str, page: int):
@@ -2336,7 +2336,7 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
         await message.edit_text("⚠️ Агент больше не найден. Откройте список снова.")
         return
     text, kb = agent_detail_markup(agent, page)
-    await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await edit_fbi_card(message, text, reply_markup=kb)
 
 
 @dp.message(Command("agents"))
@@ -2655,7 +2655,7 @@ async def cmd_queue(message: types.Message):
     try:
         rows = await firebase_client.get_sheet("fractionrp")
         text, keyboard = render_queue(rows)
-        await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        await send_fbi_card(message, text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Could not load issue queue: {e}")
         await message.answer("⚠️ Не удалось загрузить очередь из Firebase.")
@@ -2694,12 +2694,12 @@ async def cmd_support(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_support")]
     ])
-    await message.answer(
+    await send_fbi_card(
+        message,
         "💬 <b>FBI · Центр поддержки</b>\n\n"
         "Опишите найденный баг, ошибку или предложение следующим сообщением.\n"
         "<i>Можно отправить текст, фотографию или видео с подписью — руководство получит вложение в Telegram.</i>",
-        reply_markup=kb,
-        parse_mode="HTML"
+        reply_markup=kb
     )
     await state.set_state(SupportStates.waiting_for_message)
 
