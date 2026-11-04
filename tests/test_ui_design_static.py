@@ -11,7 +11,7 @@ TREE = ast.parse(CODE)
 class TestTelegramUi(unittest.TestCase):
     def test_lea_only_on_noncritical_screens(self):
         self.assertEqual(DESIGN.count("https://lea-script.space/"), 1)
-        self.assertEqual(CODE.count("lea=True"), 3)
+        self.assertEqual(CODE.count("lea=True"), 5)
         for name in ("pending_report_text", "approve_report", "reject_report",
                      "cmd_admin_auth", "cmd_security_overview", "perform_manual_grant"):
             fn = next(n for n in TREE.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
