@@ -50,6 +50,10 @@ class Callback:
 
 
 def isolate(names, env):
+    # Annotated handlers reference aiogram types at function-definition time,
+    # even though these tests deliberately run without aiogram installed.
+    env["types"] = types.SimpleNamespace(Message=Message, CallbackQuery=Callback)
+    env["FSMContext"] = State
     funcs = []
     for node in TREE.body:
         if isinstance(node, ast.AsyncFunctionDef) and node.name in names:
