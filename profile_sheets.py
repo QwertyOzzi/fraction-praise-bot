@@ -66,22 +66,89 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
                     if stored is not None and not isinstance(stored, dict):
                         return False, "Профиль повреждён.", "", None
                     old = dict(stored or {})
+                    if old.get("verification_status") == "disabled":
+                        return False, "Доступ отключён руководством.", "", None
                     old_nick = str(old.get("nick") or "")
                     if old_nick.casefold() != str(expected_old_nick or "").casefold():
                         return False, "Профиль изменился. Откройте /start и повторите.", "", None
                     binding = str(old.get("profileId") or uuid.uuid4().hex)
                     if not re.fullmatch(r"[0-9a-f]{32}", binding):
                         return False, "Некорректная привязка профиля.", "", None
+                    conflicting_users = []
                     for uid, entry in users.items():
                         if str(uid) == user_id or not isinstance(entry, dict):
                             continue
                         other_nick = str(entry.get("nick") or "").casefold()
-                        if other_nick == nick.casefold() or (old_nick and other_nick == old_nick.casefold()):
-                            return False, "Ник принадлежит другому агенту.", "", None
+                        if old_nick and other_nick == old_nick.casefold():
+                            return False, "Конфликт текущей привязки агента.", "", None
+                        if other_nick == nick.casefold():
+                            conflicting_users.append(str(uid))
                         if entry.get("profileId") == binding:
                             return False, "Дублирующая привязка агента.", "", None
 
+                    # For first-time registrations, an occupied nickname must not
+                    # block entry to the bot. Keep the claim unverified until a
+                    # human reviewer makes an explicit decision. Never touch the
+                    # existing holder's profile, table rows or balances here.
+                    sheet_collision = False
+                    if not old_nick:
+                        for sheet in SHEETS:
+                            doc = docs["sheets/" + sheet]
+                            rows = client._parse_firestore_rows(doc.get("fields", {}).get(
+                                "rows", {}).get("arrayValue", {}).get("values", []))
+                            if any(str(row.get("nick") or "").casefold() == nick.casefold()
+                                   for row in rows):
+                                sheet_collision = True
+
+                    if not old_nick and (conflicting_users or sheet_collision):
+                        updated = dict(old)
+                        updated.update({
+                            "nick": "",
+                            "claimed_nick": nick,
+                            "rank": rank,
+                            "telegram_username": username[:32],
+                            "profileId": binding,
+                            "verification_status": "pending",
+                            "claim_id": uuid.uuid4().hex[:16],
+                            "registered_at": old.get("registered_at")
+                                             or datetime.now(timezone.utc).isoformat()
+                        })
+                        updated.pop("disconnected_nick", None)
+                        users[user_id] = updated
+                        state["users"] = users
+                        now = datetime.now(timezone.utc).isoformat()
+                        # Only the bot state document is written; the sheets and
+                        # conflicting user's registration remain untouched.
+                        write = {
+                            "update": {
+                                "name": f"projects/{project_id}/databases/(default)/documents/config/bot_state",
+                                "fields": {
+                                    "data": {"stringValue": json.dumps(state, ensure_ascii=False)},
+                                    "updatedAt": {"timestampValue": now}
+                                }
+                            },
+                            "updateMask": {"fieldPaths": ["data", "updatedAt"]},
+                            "currentDocument": {"updateTime": docs["config/bot_state"]["updateTime"]}
+                        }
+                        async with session.post(
+                            base + ":commit",
+                            headers={**headers, "Content-Type": "application/json"},
+                            json={"writes": [write]}
+                        ) as response:
+                            if response.status == 200:
+                                return True, "Заявка на проверку ника сохранена.", old_nick, updated
+                            if response.status not in (409, 412):
+                                return False, f"Firebase отказал в записи (HTTP {response.status}).", "", None
+                        continue
+                    if conflicting_users:
+                        # Renaming a verified profile cannot steal another nick.
+                        return False, "Ник принадлежит другому агенту.", "", None
+
                     updated = dict(old)
+                    for stale in ("claimed_nick", "claim_id", "verification_status",
+                                  "disconnected_nick", "proof_submitted", "proof_kind",
+                                  "proof_file_id", "proof_link", "proof_caption"):
+                        updated.pop(stale, None)
                     updated.update({
                         "nick": nick, "rank": rank, "telegram_username": username[:32],
                         "profileId": binding,
@@ -157,3 +224,171 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
             return False, "Ошибка связи с Firebase. Ничего не изменено.", "", None
         await asyncio.sleep(0.15 * (attempt + 1))
     return False, "Конфликт изменений, повторите действие.", "", None
+
+async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
+                                 signing_function, state_lock, protected_ids,
+                                 local_users=None):
+    """Atomically approve a pending nickname claim without changing balances.
+
+    Returns (success, message, claimant_profile, displaced_profiles).
+    Existing owner or approved-admin registrations cannot be displaced.
+    """
+    base = (f"https://firestore.googleapis.com/v1/projects/{project_id}"
+            "/databases/(default)/documents")
+    claimant_uid = str(claimant_uid)
+    for attempt in range(5):
+        try:
+            async with state_lock:
+                token = await client.get_token()
+                if not token:
+                    return False, "Firebase недоступен.", None, {}
+                headers = {"Authorization": f"Bearer {token}",
+                           "Content-Type": "application/json"}
+                async with ClientSession(timeout=ClientTimeout(total=22)) as session:
+                    paths = ["config/bot_state", "sheets/fractionrp", "sheets/praise"]
+
+                    async def fetch(path):
+                        async with session.get(base + "/" + path, headers=headers) as response:
+                            if response.status != 200:
+                                raise RuntimeError("Firestore read failed")
+                            data = await response.json()
+                            if not data.get("updateTime"):
+                                raise RuntimeError("Firestore version missing")
+                            return data
+
+                    docs = dict(zip(paths, await asyncio.gather(
+                        *(fetch(path) for path in paths)
+                    )))
+                    raw = docs["config/bot_state"].get("fields", {}).get(
+                        "data", {}).get("stringValue")
+                    if not raw:
+                        return False, "Отсутствует состояние бота.", None, {}
+                    state = json.loads(raw)
+                    users = state.get("users")
+                    admins = state.get("admins", [])
+                    roles = state.get("admin_roles", {})
+                    if not isinstance(users, dict) or not isinstance(admins, list) or not isinstance(roles, dict):
+                        return False, "Повреждены данные профилей.", None, {}
+                    signature = str(state.get("admin_acl_signature") or "")
+                    if ((admins and not signature) or
+                            (signature and not hmac.compare_digest(
+                                signature, signing_function(admins, roles)))):
+                        return False, "Не удалось проверить подпись прав.", None, {}
+
+                    applicant = users.get(claimant_uid)
+                    if not isinstance(applicant, dict):
+                        return False, "Профиль заявителя не найден.", None, {}
+                    if (applicant.get("claim_id") != claim_id
+                            or applicant.get("verification_status") not in (
+                                "pending", "needs_proof", "proof_submitted")):
+                        return False, "Заявка уже обработана или устарела.", None, {}
+                    nick = str(applicant.get("claimed_nick") or "")
+                    rank = str(applicant.get("rank") or "")
+                    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick) or "_" not in nick:
+                        return False, "Некорректный ник.", None, {}
+                    if rank not in ("X", "9", "8", "7", "6", "5", "4", "1"):
+                        return False, "Некорректный ранг.", None, {}
+                    holders = [
+                        (str(uid), row) for uid, row in users.items()
+                        if str(uid) != claimant_uid and isinstance(row, dict)
+                        and str(row.get("nick") or "").casefold() == nick.casefold()
+                    ]
+                    if len(holders) > 1:
+                        return False, "Обнаружены дубли профилей. Требуется ручная проверка.", None, {}
+                    protected = {str(item) for item in protected_ids} | {
+                        str(item) for item in admins if type(item) is int
+                    }
+                    if any(uid in protected for uid, _ in holders):
+                        return False, "Нельзя переназначить ник владельца или руководителя.", None, {}
+
+                    displaced = {}
+                    current_binding = str(applicant.get("profileId") or uuid.uuid4().hex)
+                    if not re.fullmatch(r"[0-9a-f]{32}", current_binding):
+                        return False, "Некорректная привязка профиля.", None, {}
+                    if holders:
+                        previous_uid, previous = holders[0]
+                        displaced_profile = dict(previous)
+                        displaced_profile["nick"] = ""
+                        displaced_profile["disconnected_nick"] = nick
+                        displaced_profile["verification_status"] = "disconnected"
+                        displaced_profile["profileId"] = uuid.uuid4().hex
+                        users[previous_uid] = displaced_profile
+                        displaced[previous_uid] = displaced_profile
+
+                    applicant = dict(applicant)
+                    applicant.update({"nick": nick, "verification_status": "verified"})
+                    applicant.pop("claimed_nick", None)
+                    applicant.pop("claim_id", None)
+                    for key in ("proof_submitted", "proof_kind", "proof_file_id",
+                                "proof_link", "proof_caption"):
+                        applicant.pop(key, None)
+                    users[claimant_uid] = applicant
+                    state["users"] = users
+
+                    now = datetime.now(timezone.utc).isoformat()
+                    writes = []
+                    for sheet in SHEETS:
+                        doc = docs["sheets/" + sheet]
+                        rows = client._parse_firestore_rows(doc.get("fields", {}).get(
+                            "rows", {}).get("arrayValue", {}).get("values", []))
+                        matches = [row for row in rows
+                                   if str(row.get("nick") or "").casefold() == nick.casefold()]
+                        if len(matches) > 1:
+                            return False, "Дубли в таблицах. Нужна ручная проверка.", None, {}
+                        if matches:
+                            row = matches[0]
+                        else:
+                            row = {
+                                "id": uuid.uuid4().hex, "nick": nick, "rank": rank,
+                                "fullName": f"{nick} ({rank})", "qty": 0,
+                                "status": "Выдано", "proof": {"text": "", "links": []}
+                            }
+                            rows.append(row)
+                        row.update({
+                            "nick": nick, "rank": rank,
+                            "fullName": f"{nick} ({rank})",
+                            "profileId": current_binding
+                        })
+                        writes.append({
+                            "update": {
+                                "name": f"projects/{project_id}/databases/(default)/documents/sheets/{sheet}",
+                                "fields": {
+                                    "rows": {"arrayValue": {"values": [
+                                        client._row_to_firestore(item) for item in rows
+                                    ]}},
+                                    "updatedAt": {"timestampValue": now}
+                                }
+                            },
+                            "updateMask": {"fieldPaths": ["rows", "updatedAt"]},
+                            "currentDocument": {"updateTime": doc["updateTime"]}
+                        })
+                    writes.append({
+                        "update": {
+                            "name": f"projects/{project_id}/databases/(default)/documents/config/bot_state",
+                            "fields": {
+                                "data": {"stringValue": json.dumps(state, ensure_ascii=False)},
+                                "updatedAt": {"timestampValue": now}
+                            }
+                        },
+                        "updateMask": {"fieldPaths": ["data", "updatedAt"]},
+                        "currentDocument": {"updateTime": docs["config/bot_state"]["updateTime"]}
+                    })
+                    async with session.post(base + ":commit", headers=headers,
+                                            json={"writes": writes}) as response:
+                        if response.status == 200:
+                            # Update the in-process profiles before releasing the
+                            # state lock, so a concurrent state sync cannot resurrect
+                            # the previous nickname ownership.
+                            if local_users is not None:
+                                local_users[claimant_uid] = applicant
+                                for displaced_uid, displaced_profile in displaced.items():
+                                    local_users[displaced_uid] = displaced_profile
+                            return True, "Ник закреплён. Балансы сохранены.", applicant, displaced
+                        if response.status not in (409, 412):
+                            return False, "Firebase не подтвердил решение.", None, {}
+        except Exception as exc:
+            logger.warning("Nickname claim resolution failed: %s", type(exc).__name__)
+            return False, "Ошибка Firebase. Ничего не изменено.", None, {}
+        await asyncio.sleep(0.15 * (attempt + 1))
+    return False, "Конфликт изменений, повторите позже.", None, {}
+

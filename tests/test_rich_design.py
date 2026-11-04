@@ -70,7 +70,7 @@ class TestHtmlCards(unittest.TestCase):
 class TestInlineMenu(unittest.TestCase):
     def setUp(self):
         self.env = load_functions(BOT, {"get_main_menu", "home_card_text"}, {
-            "Dict": Dict, "Any": Any, "html": html,
+            "Dict": Dict, "Any": Any, "html": html, "users_db": {},
             "InlineKeyboardButton": Button, "InlineKeyboardMarkup": Markup,
             "WebAppInfo": Button, "WEBAPP_URL": "https://example.org",
             "is_admin": lambda uid: uid == 10,
