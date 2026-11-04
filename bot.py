@@ -14,6 +14,9 @@ from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile, resolve_nickname_claim
+from natural_commands import (interpret as interpret_natural, resolve_names,
+                              looks_like_operation, simple_parse, ParseError, MODEL)
+from natural_balance import apply_batch, BalanceConflict
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
@@ -717,6 +720,10 @@ _report_media_locks: Dict[tuple[int, int], asyncio.Lock] = {}
 class GrantStates(StatesGroup):
     waiting_for_details = State()
 
+
+class AiStates(StatesGroup):
+    waiting_for_text = State()
+
 class SupportStates(StatesGroup):
     waiting_for_message = State()
 
@@ -753,6 +760,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📌 Заявки", callback_data="main:pending"),
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
+            [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
             [InlineKeyboardButton(text="◀️ Личный кабинет", callback_data="main:home")],
         ]
     else:
@@ -832,6 +840,7 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="grant", description="Начислить FRP / похвалы"),
     BotCommand(command="admins", description="Список руководства"),
     BotCommand(command="claims", description="Проверка спорных регистраций"),
+    BotCommand(command="ai", description="ИИ-команды: начисление и списание FRP"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
@@ -1332,7 +1341,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("report", "status", "nick", "rank", "support"))
+@dp.message(Command("report", "status", "nick", "rank", "support", "ai"))
 async def cmd_quick_navigation(message: types.Message, state: FSMContext):
     """Run public commands even when a registration/report state is active."""
     if getattr(message.chat, "type", "") != "private":
@@ -1350,6 +1359,8 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await cmd_change_rank(message, state)
     elif command == "support":
         await cmd_support(message, state)
+    elif command == "ai":
+        await cmd_ai(message, state)
 
 
 @dp.message(Command("notifications"))
@@ -1460,7 +1471,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins"}
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai"}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1510,6 +1521,20 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         await send_fbi_card(
             callback.message, home_card_text(profile, uid),
             reply_markup=get_main_menu(uid), lea=True
+        )
+        await callback.answer()
+        return
+
+    if action == "ai":
+        await state.clear()
+        await state.set_state(AiStates.waiting_for_text)
+        await callback.message.answer(
+            "🤖 <b>FBI · ИИ-команда</b>\n\n"
+            "Напишите обычным языком, например:\n"
+            "<code>норто, гоммез -3 фрп</code>\n"
+            "<code>дай гоммезу 2 похвалы</code>\n\n"
+            "<i>Перед изменением баланса будет проверка ников и подтверждение.</i>",
+            parse_mode="HTML"
         )
         await callback.answer()
         return
@@ -3836,6 +3861,243 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"Web health check server started on port {PORT}")
+
+
+# --- Gemini-assisted admin commands ------------------------------------------
+# Tokens are ephemeral: no API key, user IDs or Firestore balances go to Gemini.
+# All operations require an authenticated human confirmation.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+AI_ACTIONS: Dict[str, Dict[str, Any]] = {}
+_AI_LIMIT: Dict[int, List[float]] = {}
+_AI_SEMAPHORE = asyncio.Semaphore(3)
+AI_CONFIRM_TTL = 5 * 60
+
+
+async def gemini_json_request(url: str, headers: dict, body: dict) -> dict:
+    async with _AI_SEMAPHORE:
+        async with ClientSession(timeout=ClientTimeout(total=20)) as session:
+            async with session.post(url, headers=headers, json=body) as response:
+                if response.status == 429:
+                    raise ParseError("Gemini достиг лимита запросов. Повторите позже.")
+                if response.status in (401, 403):
+                    raise ParseError("Gemini API-ключ недействителен или недоступен модели.")
+                if response.status == 404:
+                    raise ParseError(f"Модель {MODEL} недоступна для этого API-ключа.")
+                if response.status != 200:
+                    raise ParseError("Gemini временно недоступен. Повторите позже.")
+                return await response.json()
+
+
+async def handle_natural_command(message: types.Message, raw: str):
+    uid = message.from_user.id
+    if (not is_admin(uid) or message.chat.type != "private"
+            or message.chat.id != uid):
+        await message.answer("⛔ ИИ-команды доступны только руководству в личном чате.")
+        return
+    raw = raw.strip()
+    if not raw:
+        await message.answer("Напишите команду, например: <code>норто, гоммез -3 фрп</code>",
+                             parse_mode="HTML")
+        return
+    # Avoid unexpected API usage on an unbounded message flood.
+    now = datetime.now(timezone.utc).timestamp()
+    recent = [t for t in _AI_LIMIT.get(uid, []) if now - t < 60]
+    if len(recent) >= 6:
+        await message.answer("⏳ Максимум 6 разборов в минуту. Повторите позже.")
+        return
+    recent.append(now)
+    _AI_LIMIT[uid] = recent
+    try:
+        plan, origin = await interpret_natural(raw, GEMINI_API_KEY, gemini_json_request)
+    except ParseError as exc:
+        await message.answer("⚠️ " + html.escape(str(exc)))
+        return
+    except Exception as exc:
+        logger.warning("Gemini parsing request failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось получить ответ Gemini. Попробуйте ещё раз.")
+        return
+    try:
+        rows = await firebase_client.get_sheet(plan["sheet"])
+    except Exception as exc:
+        logger.warning("AI lookup failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось получить свежую таблицу Firebase.")
+        return
+    targets, errors = resolve_names(plan["names"], rows)
+    if errors:
+        await message.answer(
+            "🔎 <b>Нужно уточнить ники:</b>\n" +
+            "\n".join("• " + html.escape(err) for err in errors) +
+            "\n\n<i>Изменений в Firebase нет. Укажите точные игровые ники.</i>",
+            parse_mode="HTML"
+        )
+        return
+    if plan["action"] == "debit":
+        lacking = [t for t in targets if t["qty"] < plan["amount"]]
+        if lacking:
+            await message.answer(
+                "⚠️ Недостаточно баллов для списания:\n" +
+                "\n".join(f"• {html.escape(t['nick'])}: {t['qty']}"
+                          for t in lacking) +
+                "\n\n<i>Никому ничего не списано.</i>",
+                parse_mode="HTML"
+            )
+            return
+
+    # Keep only short-lived, confirmed and Telegram-identity-bound operations.
+    for old_key, value in list(AI_ACTIONS.items()):
+        if now - value["created"] > AI_CONFIRM_TTL:
+            AI_ACTIONS.pop(old_key, None)
+    token = uuid.uuid4().hex[:20]
+    AI_ACTIONS[token] = {
+        "uid": uid, "chat_id": message.chat.id,
+        "created": now, "status": "new",
+        "plan": plan, "targets": targets,
+        "operation_id": "ai-" + uuid.uuid4().hex
+    }
+    sheet_label = "FRP" if plan["sheet"] == "fractionrp" else "похвал"
+    sign = "+" if plan["action"] == "credit" else "−"
+    summary = "\n".join(
+        f"• <code>{html.escape(t['nick'])}</code>: "
+        f"<b>{sign}{plan['amount']} {sheet_label}</b> "
+        f"(сейчас {t['qty']})"
+        for t in targets
+    )
+    source = "правила" if origin == "local" else "Gemini 3.8 Flash"
+    buttons = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Подтвердить для всех", callback_data=f"aiconfirm:{token}",
+            style="success")],
+        [InlineKeyboardButton(
+            text="❌ Отмена", callback_data=f"aicancel:{token}")]
+    ])
+    await message.answer(
+        "🤖 <b>FBI · Проверка ИИ-команды</b>\n\n" +
+        summary +
+        f"\n\n<blockquote>Агентов: <b>{len(targets)}</b>\n"
+        f"Источник разбора: {source}</blockquote>\n"
+        "<i>Firebase изменится только после нажатия «Подтвердить».</i>",
+        reply_markup=buttons, parse_mode="HTML"
+    )
+
+
+@dp.message(Command("ai"))
+async def cmd_ai(message: types.Message, state: FSMContext):
+    if (not is_admin(message.from_user.id) or message.chat.type != "private"
+            or message.chat.id != message.from_user.id):
+        await message.answer("⛔ Доступно только руководству.")
+        return
+    text = (message.text or "").split(maxsplit=1)
+    await state.clear()
+    if len(text) > 1:
+        await handle_natural_command(message, text[1])
+        return
+    await state.set_state(AiStates.waiting_for_text)
+    await message.answer(
+        "🤖 <b>FBI · ИИ-команды</b>\n\n"
+        "Напишите: <code>норто, гоммез -3 фрп</code> "
+        "или <code>дай гоммезу 2 похвалы</code>.\n\n"
+        "<i>Команда будет показана для подтверждения. /cancel — отменить.</i>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(AiStates.waiting_for_text)
+async def receive_ai_command(message: types.Message, state: FSMContext):
+    await state.clear()
+    await handle_natural_command(message, message.text or "")
+
+
+@dp.callback_query(F.data.startswith("aiconfirm:") | F.data.startswith("aicancel:"))
+async def confirm_natural_command(callback: types.CallbackQuery):
+    if (not is_admin(callback.from_user.id)
+            or not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    action, _, token = (callback.data or "").partition(":")
+    task = AI_ACTIONS.get(token)
+    if (not task or task["uid"] != callback.from_user.id
+            or task["chat_id"] != callback.message.chat.id
+            or datetime.now(timezone.utc).timestamp() - task["created"] > AI_CONFIRM_TTL
+            or task["status"] != "new"):
+        await callback.answer("Операция уже обработана или устарела.", show_alert=True)
+        return
+    if action == "aicancel":
+        task["status"] = "cancelled"
+        await callback.answer("Операция отменена.")
+        await callback.message.edit_text("❌ ИИ-команда отменена. Балансы не менялись.")
+        return
+    if action != "aiconfirm":
+        await callback.answer("Некорректное действие.", show_alert=True)
+        return
+
+    # Claim the token before the first network await: double-click safe.
+    task["status"] = "processing"
+    await callback.answer("Проверяю Firebase и выполняю операцию...")
+    plan = task["plan"]
+    try:
+        result = await apply_batch(
+            firebase_client, plan["sheet"], task["targets"],
+            plan["action"], plan["amount"], task["operation_id"],
+            ClientSession
+        )
+        task["status"] = "done"
+    except BalanceConflict as exc:
+        task["status"] = "stale"
+        await callback.message.edit_text(
+            "⚠️ <b>Операция отменена:</b> " + html.escape(str(exc)) +
+            "\n\nБаланс или привязка изменились после проверки. Подайте команду заново.",
+            parse_mode="HTML"
+        )
+        return
+    except Exception as exc:
+        # Never blindly repeat a possibly successful Firebase write.
+        task["status"] = "uncertain"
+        logger.warning("Natural-command write not confirmed: %s", type(exc).__name__)
+        await callback.message.edit_text(
+            "⚠️ Firebase не подтвердила результат. "
+            "Сначала проверьте баланс в таблице; повторно нажимать нельзя."
+        )
+        return
+
+    sign = "+" if plan["action"] == "credit" else "−"
+    label = "FRP" if plan["sheet"] == "fractionrp" else "похвал"
+    for target in task["targets"]:
+        asyncio.create_task(record_admin_activity(
+            "ai_grant" if plan["action"] == "credit" else "ai_debit",
+            callback.from_user.id,
+            f"{target['nick']}: {sign}{plan['amount']}; op={task['operation_id']}",
+            plan["sheet"]
+        ))
+    try:
+        await callback.message.edit_text(
+            "✅ <b>Операция подтверждена Firebase</b>\n\n" +
+            "\n".join(
+                f"• <code>{html.escape(t['nick'])}</code>: "
+                f"<b>{sign}{plan['amount']} {label}</b>"
+                for t in task["targets"]
+            ) +
+            ("\n\n<i>Операция уже была учтена (повторно не применена).</i>"
+             if result == "already_applied" else ""),
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.warning("Cannot refresh AI confirmation: %s", type(exc).__name__)
+
+
+# A plain natural-language instruction in a private admin chat works without /ai.
+# State-specific registration/report/support handlers are registered earlier and
+# continue to take priority; this late handler never handles agent messages.
+@dp.message(F.text)
+async def conversational_admin_command(message: types.Message):
+    if (message.chat.type != "private" or message.chat.id != message.from_user.id
+            or not is_admin(message.from_user.id)):
+        return
+    if looks_like_operation(message.text or ""):
+        await handle_natural_command(message, message.text)
+
+
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  MAIN ENTRY POINT                                               ║
