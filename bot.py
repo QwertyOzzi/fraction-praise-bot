@@ -17,6 +17,7 @@ from profile_sheets import register_profile, resolve_nickname_claim
 from natural_commands import (interpret as interpret_natural, resolve_names,
                               looks_like_operation, simple_parse, ParseError, MODEL)
 from natural_balance import apply_batch, BalanceConflict
+from natural_aliases import load_alias_memory, resolve_with_memory, AliasMemoryError
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
@@ -1348,6 +1349,12 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await message.answer("Используйте команды в личном чате с ботом.")
         return
     command = (message.text or "").split(maxsplit=1)[0].split("@", 1)[0].lstrip("/")
+    if command == "ai" and await state.get_state():
+        await message.answer(
+            "⏳ ИИ отключён, пока бот ждёт данные для текущего действия. "
+            "Завершите его или введите /cancel."
+        )
+        return
     await state.clear()
     if command == "report":
         await start_report(message, state)
@@ -1526,7 +1533,12 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         return
 
     if action == "ai":
-        await state.clear()
+        if await state.get_state():
+            await callback.answer(
+                "Сначала завершите текущее действие или используйте /cancel.",
+                show_alert=True
+            )
+            return
         await state.set_state(AiStates.waiting_for_text)
         await callback.message.answer(
             "🤖 <b>FBI · ИИ-команда</b>\n\n"
@@ -3934,12 +3946,20 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⚠️ Не удалось получить ответ Gemini. Попробуйте ещё раз.")
         return
     try:
+        # Memory is never sent to Gemini. Each operation uses the current sheet
+        # AND persisted aliases from both sheets to revalidate identity.
         rows = await firebase_client.get_sheet(plan["sheet"])
-    except Exception as exc:
-        logger.warning("AI lookup failed: %s", type(exc).__name__)
-        await message.answer("⚠️ Не удалось получить свежую таблицу Firebase.")
+        remembered = await load_alias_memory(firebase_client, ClientSession)
+    except (AliasMemoryError, Exception) as exc:
+        logger.warning("AI agent lookup/memory failed: %s", type(exc).__name__)
+        await message.answer(
+            "⚠️ Не удалось проверить актуальную таблицу и память ников Firebase. "
+            "Никому ничего не начислено. Повторите позже."
+        )
         return
-    targets, errors = resolve_names(plan["names"], rows)
+    targets, errors = resolve_with_memory(
+        plan["names"], rows, remembered, plan["sheet"]
+    )
     if errors:
         await message.answer(
             "🔎 <b>Нужно уточнить ники:</b>\n" +
@@ -3969,6 +3989,7 @@ async def handle_natural_command(message: types.Message, raw: str):
         "uid": uid, "chat_id": message.chat.id,
         "created": now, "status": "new",
         "plan": plan, "targets": targets,
+        "raw": raw,
         "operation_id": "ai-" + uuid.uuid4().hex
     }
     sheet_label = "FRP" if plan["sheet"] == "fractionrp" else "похвал"
@@ -4057,7 +4078,7 @@ async def confirm_natural_command(callback: types.CallbackQuery):
         result = await apply_batch(
             firebase_client, plan["sheet"], task["targets"],
             plan["action"], plan["amount"], task["operation_id"],
-            ClientSession
+            ClientSession, aliases=plan["names"], original_text=task["raw"]
         )
         task["status"] = "done"
     except BalanceConflict as exc:
@@ -4096,7 +4117,8 @@ async def confirm_natural_command(callback: types.CallbackQuery):
                 for t in task["targets"]
             ) +
             ("\n\n<i>Операция уже была учтена (повторно не применена).</i>"
-             if result == "already_applied" else ""),
+             if result == "already_applied"
+             else "\n\n<i>🧠 Подтверждённые сокращения ников сохранены в Firebase.</i>"),
             parse_mode="HTML"
         )
     except Exception as exc:
@@ -4107,7 +4129,12 @@ async def confirm_natural_command(callback: types.CallbackQuery):
 # State-specific registration/report/support handlers are registered earlier and
 # continue to take priority; this late handler never handles agent messages.
 @dp.message(F.text)
-async def conversational_admin_command(message: types.Message):
+async def conversational_admin_command(message: types.Message, state: FSMContext):
+    # The last-resort handler must not interpret evidence links, rank selection,
+    # nicknames, report quantities, praise counts or manual-grant input as AI.
+    # This also protects states that expect callback buttons rather than text.
+    if await state.get_state() is not None:
+        return
     if (message.chat.type != "private" or message.chat.id != message.from_user.id
             or not is_admin(message.from_user.id)):
         return

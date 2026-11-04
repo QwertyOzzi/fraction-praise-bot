@@ -7,12 +7,20 @@ preconditions and persisted transaction IDs protect against duplicate callbacks.
 import asyncio
 from datetime import datetime, timezone
 
+from natural_aliases import (
+    MEMORY_FIELD, decode_alias_book, encode_alias_book,
+    learn_confirmed_aliases
+)
+from natural_commands import simplified
+
 class BalanceConflict(ValueError):
     """Inputs were changed after preview, or a balance would be negative."""
 
 
 async def apply_batch(client, sheet: str, targets: list[dict], action: str,
-                      amount: int, transaction_id: str, session_factory) -> str:
+                      amount: int, transaction_id: str, session_factory,
+                      *, aliases: list[str] | None = None,
+                      original_text: str = "") -> str:
     """Return 'applied' or 'already_applied', otherwise raise.
 
     No partial updates are possible: all players share one Firestore document
@@ -29,6 +37,21 @@ async def apply_batch(client, sheet: str, targets: list[dict], action: str,
         raise ValueError("Invalid operation id")
     if len({str(t["nick"]).casefold() for t in targets}) != len(targets):
         raise ValueError("Duplicate agents")
+    if aliases is not None and (
+            not isinstance(aliases, list)
+            or len(aliases) != len(targets)
+            or not isinstance(original_text, str)
+            or len(original_text) > 400):
+        raise ValueError("Invalid approved aliases")
+
+    # Reject any model-created association that wasn't in the original
+    # administrator message. The confirmed operation may still proceed, but
+    # invented spelling must never become a trusted cached identity.
+    raw_key = simplified(original_text)
+    learned_aliases = [
+        name if isinstance(name, str) and simplified(name) in raw_key else ""
+        for name in (aliases or [])
+    ]
 
     token = await client.get_token()
     if not token:
@@ -87,6 +110,16 @@ async def apply_batch(client, sheet: str, targets: list[dict], action: str,
                     row["status"] = "На выдаче"
                 elif new_qty == 0:
                     row["status"] = "Выдано"
+            # Learn only after a successful confirmed operation, in the SAME
+            # atomic Firestore PATCH as the balances and idempotency marker.
+            old_aliases = decode_alias_book(
+                data.get("fields", {}).get(MEMORY_FIELD, {}).get("stringValue", ""),
+                sheet=sheet
+            )
+            updated_aliases = (
+                learn_confirmed_aliases(old_aliases, learned_aliases, targets, sheet)
+                if aliases is not None else old_aliases
+            )
             # Retain other metadata (including appliedReportIds) with updateMask.
             # Keep enough recent IDs to cover all pending confirmation tokens.
             recent = [*previously_applied[-1499:], transaction_id]
@@ -99,12 +132,18 @@ async def apply_batch(client, sheet: str, targets: list[dict], action: str,
                     {"stringValue": item} for item in recent
                 ]}}
             }}
+            if updated_aliases != old_aliases:
+                payload["fields"][MEMORY_FIELD] = {
+                    "stringValue": encode_alias_book(updated_aliases)
+                }
             params = [
                 ("currentDocument.updateTime", revision),
                 ("updateMask.fieldPaths", "rows"),
                 ("updateMask.fieldPaths", "updatedAt"),
                 ("updateMask.fieldPaths", "appliedNaturalIds")
             ]
+            if updated_aliases != old_aliases:
+                params.append(("updateMask.fieldPaths", MEMORY_FIELD))
             async with session.patch(url, headers=headers, params=params, json=payload) as response:
                 if response.status == 200:
                     return "applied"

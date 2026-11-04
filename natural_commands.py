@@ -98,6 +98,54 @@ def simple_parse(text: str) -> dict[str, Any] | None:
 
 
 
+# Frequent Russian-language phrases can also be parsed offline. Unknown grammar
+# still falls back to Gemini, but learned nicknames do not require another API call.
+_NATURAL_VERB = (
+    r"дай|дайте|выдай|выдайте|начисли|начислите|добавь|добавьте|"
+    r"прибавь|прибавьте|сними|снимите|спиши|спишите|вычти|"
+    r"вычтите|отними|отнимите|убери|уберите"
+)
+_DEBIT_VERBS = {
+    "сними", "снимите", "спиши", "спишите", "вычти", "вычтите",
+    "отними", "отнимите", "убери", "уберите"
+}
+_COUNT_WORDS = {
+    "один": 1, "одна": 1, "одну": 1, "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7,
+    "восемь": 8, "девять": 9, "десять": 10, "одиннадцать": 11,
+    "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
+    "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17,
+    "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20
+}
+_AMOUNT_WORD_RE = "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
+_NATURAL_PATTERN = re.compile(
+    rf"^\s*(?P<verb>{_NATURAL_VERB})\s+(?:у\s+)?"
+    rf"(?P<names>[\w\s,;.\-]{{3,230}}?)\s+"
+    rf"(?:по\s+)?(?P<amount>\d{{1,2}}|{_AMOUNT_WORD_RE})\s+"
+    rf"(?P<kind>{_KIND_PATTERN})\s*[.!]*\s*$",
+    re.I
+)
+
+
+def natural_phrase_parse(text: str) -> dict[str, Any] | None:
+    match = _NATURAL_PATTERN.fullmatch(text)
+    if not match:
+        return None
+    raw_names = match["names"].strip()
+    # A short conjunction may separate two people; punctuation is also valid.
+    names = [name.strip() for name in re.split(r"[,;]|\s+и\s+", raw_names, flags=re.I)
+             if name.strip()]
+    amount_text = match["amount"].casefold()
+    amount = int(amount_text) if amount_text.isdecimal() else _COUNT_WORDS[amount_text]
+    kind = match["kind"].casefold()
+    return validate_plan({
+        "action": "debit" if match["verb"].casefold() in _DEBIT_VERBS else "credit",
+        "sheet": "praise" if kind.startswith(("похвал", "praise")) else "fractionrp",
+        "amount": amount,
+        "names": names,
+    })
+
+
 def validate_plan(obj: Any, *, original: str | None = None) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise ParseError("Не удалось распознать команду.")
@@ -140,7 +188,7 @@ async def interpret(text: str, api_key: str, request):
     """
     if not text or not 3 <= len(text) <= MAX_TEXT:
         raise ParseError("Команда слишком длинная или пустая (максимум 400 символов).")
-    result = simple_parse(text)
+    result = simple_parse(text) or natural_phrase_parse(text)
     if result:
         return result, "local"
     if not api_key:
@@ -199,22 +247,40 @@ def _candidate_score(alias: str, nick: str) -> tuple[int, float] | None:
         return None
     full = simplified(nick)
     tokens = [simplified(p) for p in re.split(r"[_\s]+", nick)]
-    if key == full:
-        return (4, 1.0)
-    if key in tokens:
-        return (3, 1.0)
-    if len(key) >= 4 and any(t.startswith(key) and len(key) >= len(t) - 2
-                             for t in tokens):
-        return (2, 1.0)
-    # One character typo in a distinct token; deliberately stricter than
-    # arbitrary fuzzy ranking. More than one match => human clarification.
-    if len(key) >= 5:
-        for token in tokens:
-            if abs(len(key) - len(token)) <= 1:
-                similarity = difflib.SequenceMatcher(None, key, token).ratio()
-                if similarity >= 0.82:
-                    return (1, similarity)
-    return None
+    # Typical Russian grammatical forms ("гоммезу", "нортона") can be
+    # recognized locally. Exact names always outrank inflected forms.
+    variants = [key]
+    if re.fullmatch(r"[а-яё]{5,40}", alias.casefold()):
+        stem = alias.casefold()
+        if stem.endswith(("ом", "ем")) and len(stem) >= 7:
+            variants.append(simplified(stem[:-2]))
+        elif stem.endswith(("а", "у", "е", "ы", "ю", "я")) and len(stem) >= 6:
+            variants.append(simplified(stem[:-1]))
+    best = None
+    for form in variants:
+        if form == full:
+            candidate = (4 if form == key else 2, 1.0)
+        elif form in tokens:
+            candidate = (3 if form == key else 2, 1.0)
+        elif len(form) >= 4 and any(
+                t.startswith(form) and len(form) >= len(t) - 2
+                for t in tokens):
+            candidate = (2, 1.0)
+        else:
+            candidate = None
+            if len(form) >= 5:
+                for token in tokens:
+                    if abs(len(form) - len(token)) <= 1:
+                        similarity = difflib.SequenceMatcher(
+                            None, form, token
+                        ).ratio()
+                        if similarity >= 0.82:
+                            score = (1, similarity)
+                            if candidate is None or score > candidate:
+                                candidate = score
+        if candidate is not None and (best is None or candidate > best):
+            best = candidate
+    return best
 
 
 def resolve_names(names: list[str], available_rows: list[dict]) -> tuple[list[dict], list[str]]:
