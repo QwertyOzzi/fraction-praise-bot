@@ -27,6 +27,8 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     WebAppInfo,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 
 # Load environment variables
@@ -701,6 +703,12 @@ class ReportStates(StatesGroup):
     waiting_for_proof = State()
     confirm = State()
 
+
+# Serialize evidence updates per Telegram conversation. Aiogram may dispatch
+# all items of an album concurrently, even before the FSM state changes.
+REPORT_MEDIA_LIMIT = 10
+_report_media_locks: Dict[tuple[int, int], asyncio.Lock] = {}
+
 class GrantStates(StatesGroup):
     waiting_for_details = State()
 
@@ -1331,61 +1339,179 @@ async def process_report_quantity_text(message: types.Message, state: FSMContext
 @dp.callback_query(ReportStates.waiting_for_reason, F.data.startswith("reason_"))
 async def process_report_reason(callback: types.CallbackQuery, state: FSMContext):
     reason = callback.data.replace("reason_", "")
-    await state.update_data(reason=reason)
+    await state.update_data(
+        reason=reason, report_session=uuid.uuid4().hex[:12],
+        proof_media=[], proof_progress_message_id=None,
+    )
 
     await edit_fbi_card(
         callback.message,
-        "📎 <b>Новый отчёт · Доказательства</b>\n\n" "Отправьте <b>ссылку на форум, фото или видео</b> прямо сюда.\n\n"
-        "<i>Можно добавить подпись к фото/видео. Один отчёт = одно вложение.</i>"
+        "📎 <b>Новый отчёт · Доказательства</b>\n\n"
+        "Отправьте ссылку на форум или <b>до 10 фото/видео</b>.\n\n"
+        "<i>Фото можно отправить альбомом или по отдельности. "
+        "После загрузки нажмите «Готово, проверить отчёт».</i>"
     )
     await state.set_state(ReportStates.waiting_for_proof)
 
+def report_preview_text(data: Dict[str, Any], user_data: Dict[str, Any],
+                        evidence_label: str, proof: str) -> str:
+    """One review card for both an uploaded album and a single link."""
+    label = ("/fractionrp (Отметка FRP)" if data.get("rep_type") == "fractionrp"
+             else "/praise (Похвала)")
+    return (
+        "📋 <b>FBI · Проверка отчёта</b>\n\n"
+        f"• <b>Агент:</b> <code>{html.escape(str(user_data.get('nick', '')))}</code> "
+        f"[{html.escape(str(user_data.get('rank', '?')))}]\n"
+        f"• <b>Тип:</b> {label} (+{data.get('quantity', 1)})\n"
+        f"• <b>Причина:</b> {html.escape(str(data.get('reason', '')).capitalize())}\n"
+        f"• <b>Доказательства:</b> {evidence_label}: {html.escape(proof)}\n\n"
+        "<i>Проверьте данные перед отправкой.</i>\n\n"
+        "Отправить отчёт руководству?"
+    )
+
+
+def report_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(style="success", text="✅ Отправить руководству",
+                              callback_data="send_report_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
+    ])
+
+
+def report_media_progress_text(media: List[Dict[str, Any]]) -> str:
+    photo_count = sum(1 for item in media if item["type"] == "photo")
+    video_count = len(media) - photo_count
+    parts = []
+    if photo_count:
+        parts.append(f"📸 Фото: <b>{photo_count}</b>")
+    if video_count:
+        parts.append(f"🎥 Видео: <b>{video_count}</b>")
+    return (
+        "📎 <b>FBI · Доказательства собраны</b>\n\n"
+        + "\n".join(parts)
+        + f"\n\n<i>Можно добавить ещё вложения, всего до {REPORT_MEDIA_LIMIT}. "
+          "Когда всё отправлено, нажмите кнопку ниже.</i>"
+    )
+
+
 @dp.message(ReportStates.waiting_for_proof)
 async def process_report_proof(message: types.Message, state: FSMContext):
-    """Accept URL, Telegram photo or Telegram video without downloading media."""
+    """Collect multiple Telegram album items as ONE report, with ONE confirmation."""
     if (message.text or "").strip().split("@", 1)[0] == "/cancel":
         await cmd_cancel(message, state)
         return
-    media_type = ""
-    media_id = ""
-    proof_url = ""
-    if message.photo:
-        media_type = "photo"
-        media_id = message.photo[-1].file_id
-        proof = (message.caption or "").strip()[:500] or "Фотография в Telegram"
-    elif message.video:
-        media_type = "video"
-        media_id = message.video.file_id
-        proof = (message.caption or "").strip()[:500] or "Видео в Telegram"
-    else:
-        proof = (message.text or "").strip()
-        if not proof.startswith(("https://", "http://")) or len(proof) > 1000:
-            await message.answer("⚠️ Отправьте ссылку http(s), фотографию или видео (не файл-документ).")
-            return
-        proof_url = proof
 
+    if message.photo or message.video:
+        kind = "photo" if message.photo else "video"
+        file_id = message.photo[-1].file_id if message.photo else message.video.file_id
+        key = (message.chat.id, message.from_user.id)
+        # Covers album items delivered in parallel and individually sent photos.
+        async with _report_media_locks.setdefault(key, asyncio.Lock()):
+            if await state.get_state() != ReportStates.waiting_for_proof.state:
+                return
+            data = await state.get_data()
+            media = list(data.get("proof_media") or [])
+            # Retries of the same Telegram update should not duplicate a picture.
+            if any(item.get("message_id") == message.message_id for item in media):
+                return
+            if len(media) >= REPORT_MEDIA_LIMIT:
+                await message.answer("⚠️ К одному отчёту можно прикрепить не больше 10 фото/видео. "
+                                     "Нажмите «Готово, проверить отчёт».")
+                return
+            media.append({
+                "type": kind, "file_id": file_id, "message_id": message.message_id,
+                "caption": (message.caption or "").strip()[:500]
+            })
+            media.sort(key=lambda item: item["message_id"])
+            await state.update_data(proof_media=media)
+            session = data.get("report_session")
+            if not session:
+                # Do not produce a control with an unbound/guessable session.
+                await message.answer("⚠️ Сессия отчёта устарела. Начните подачу заново.")
+                return
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✅ Готово, проверить отчёт",
+                    callback_data=f"repfinish:{session}", style="success"
+                )],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
+            ])
+            progress_id = data.get("proof_progress_message_id")
+            if progress_id:
+                try:
+                    await bot.edit_message_text(
+                        report_media_progress_text(media),
+                        chat_id=message.chat.id, message_id=int(progress_id),
+                        reply_markup=kb, parse_mode="HTML"
+                    )
+                except Exception as exc:
+                    logger.info("Could not refresh report media counter: %s", type(exc).__name__)
+            else:
+                preview = await send_fbi_card(
+                    message, report_media_progress_text(media), reply_markup=kb
+                )
+                await state.update_data(proof_progress_message_id=preview.message_id)
+        return
+
+    proof = (message.text or "").strip()
+    if not proof.startswith(("https://", "http://")) or len(proof) > 1000:
+        await message.answer("⚠️ Отправьте ссылку http(s), фото или видео.")
+        return
     data = await state.get_data()
-    user_id = str(message.from_user.id)
-    user_data = users_db.get(user_id, {})
-    rep_type_label = "/fractionrp (Отметка FRP)" if data["rep_type"] == "fractionrp" else "/praise (Похвала)"
-    await state.update_data(proof=proof, proof_url=proof_url,
-                            proof_media_type=media_type, proof_file_id=media_id)
-
-    evidence_label = ("📸 Фото" if media_type == "photo" else "🎥 Видео") if media_type else "🔗 Ссылка"
-    text = (
-        "📋 <b>FBI · Проверка отчёта</b>\n\n"
-        f"• <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
-        f"• <b>Тип:</b> {rep_type_label} (+{data.get('quantity', 1)})\n"
-        f"• <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
-        f"• <b>Доказательства:</b> {evidence_label}: {html.escape(proof)}\n\n"
-        "<i>Проверьте данные перед отправкой.</i>\n\nОтправить отчёт руководству?"
+    if data.get("proof_media"):
+        await message.answer("📎 Фото уже добавлены. Нажмите «Готово, проверить отчёт» "
+                             "в сообщении со счётчиком вложений.")
+        return
+    await state.update_data(
+        proof=proof, proof_url=proof, proof_media_type="", proof_file_id="",
+        proof_media=[]
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(style="success", text="✅ Отправить руководству", callback_data="send_report_confirm")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
-    ])
-    await send_fbi_card(message, text, reply_markup=kb)
+    user_data = users_db.get(str(message.from_user.id), {})
+    text = report_preview_text(data, user_data, "🔗 Ссылка", proof)
+    await send_fbi_card(message, text, reply_markup=report_confirm_keyboard())
     await state.set_state(ReportStates.confirm)
+
+
+@dp.callback_query(ReportStates.waiting_for_proof, F.data.startswith("repfinish:"))
+async def finish_report_proof(callback: types.CallbackQuery, state: FSMContext):
+    """Only the active report owner can finish; stale buttons are rejected."""
+    key = (callback.message.chat.id, callback.from_user.id)
+    async with _report_media_locks.setdefault(key, asyncio.Lock()):
+        if await state.get_state() != ReportStates.waiting_for_proof.state:
+            await callback.answer("Отчёт уже обработан.", show_alert=True)
+            return
+        data = await state.get_data()
+        if callback.data.removeprefix("repfinish:") != data.get("report_session"):
+            await callback.answer("Кнопка устарела. Используйте текущий отчёт.", show_alert=True)
+            return
+        media = sorted(data.get("proof_media") or [],
+                       key=lambda item: item["message_id"])
+        if not media:
+            await callback.answer("Сначала отправьте фото или видео.", show_alert=True)
+            return
+
+        caption = next((item.get("caption") for item in media if item.get("caption")), "")
+        if all(item["type"] == "photo" for item in media):
+            evidence = f"📸 Фото ({len(media)} шт.)"
+        elif all(item["type"] == "video" for item in media):
+            evidence = f"🎥 Видео ({len(media)} шт.)"
+        else:
+            evidence = f"📎 Фото и видео ({len(media)} шт.)"
+        proof = caption or f"Вложения в Telegram: {len(media)}"
+        # Keep existing legacy metadata and persist every attachment.
+        await state.update_data(
+            proof=proof, proof_url="",
+            proof_media_type=media[0]["type"], proof_file_id=media[0]["file_id"],
+            proof_media=[{"type": item["type"], "file_id": item["file_id"]}
+                         for item in media]
+        )
+        user_data = users_db.get(str(callback.from_user.id), {})
+        text = report_preview_text(data, user_data, evidence, proof)
+        await edit_fbi_card(callback.message, text,
+                            reply_markup=report_confirm_keyboard())
+        await state.set_state(ReportStates.confirm)
+    await callback.answer()
+
 
 @dp.callback_query(F.data == "cancel_report")
 async def cancel_report(callback: types.CallbackQuery, state: FSMContext):
@@ -1416,8 +1542,10 @@ def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
         f"[{html.escape(str(req.get('rank') or '?'))}]\n"
         f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
         f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
-        f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
-        + "<i>Измените количество кнопками ➖/➕ и выберите решение.</i>"
+        f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n"
+        + (f"📎 <b>Вложений:</b> {len(req.get('proof_media') or [])}\n"
+           if req.get("proof_media") else "")
+        + "\n<i>Измените количество кнопками ➖/➕ и выберите решение.</i>"
     )
 
 
@@ -1427,18 +1555,40 @@ async def send_pending_report_to_admin(chat_id: int, req_id: str, req: Dict[str,
                                   disable_web_page_preview=True, parse_mode="HTML")
     refs = req.setdefault("admin_messages", [])
     refs.append({"chat_id": chat_id, "message_id": sent.message_id})
-    # Media is sent privately to the same authorized leadership recipients.
-    # Do not share a public URL or bot-token-backed download endpoint.
+    # Send every photo/video in the report to authorized leadership only.
+    # Albums are sent as a single Telegram media group when possible.
+    items = req.get("proof_media") or []
+    if not isinstance(items, list):
+        items = []
+    valid = [item for item in items[:REPORT_MEDIA_LIMIT]
+             if isinstance(item, dict)
+             and item.get("type") in ("photo", "video")
+             and isinstance(item.get("file_id"), str)
+             and item["file_id"]]
     media_kind, media_id = req.get("proof_media_type"), req.get("proof_file_id")
-    if media_id and media_kind in ("photo", "video"):
+    # Compatibility with reports submitted before the multi-photo update.
+    if not valid and media_id and media_kind in ("photo", "video"):
+        valid = [{"type": media_kind, "file_id": media_id}]
+    if valid:
+        caption = f"📎 Вложение к заявке #{req_id} от {str(req.get('nick', 'Агент'))[:70]}"
         try:
-            caption = f"📎 Вложение к заявке #{req_id} от {str(req.get('nick', 'Агент'))[:70]}"
-            if media_kind == "photo":
-                await bot.send_photo(chat_id, media_id, caption=caption, parse_mode=None)
+            if len(valid) > 1:
+                attachments = [
+                    InputMediaPhoto(media=item["file_id"])
+                    if item["type"] == "photo"
+                    else InputMediaVideo(media=item["file_id"])
+                    for item in valid
+                ]
+                await bot.send_media_group(chat_id=chat_id, media=attachments)
+            elif valid[0]["type"] == "photo":
+                await bot.send_photo(chat_id, valid[0]["file_id"],
+                                     caption=caption, parse_mode=None)
             else:
-                await bot.send_video(chat_id, media_id, caption=caption, parse_mode=None)
+                await bot.send_video(chat_id, valid[0]["file_id"],
+                                     caption=caption, parse_mode=None)
         except Exception as exc:
-            logger.warning("Could not forward report evidence to administrator: %s", type(exc).__name__)
+            logger.warning("Could not forward report evidence to administrator: %s",
+                           type(exc).__name__)
     try:
         await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id,
                                    disable_notification=True)
@@ -1517,6 +1667,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         "proof": data["proof"],
         "proof_media_type": data.get("proof_media_type", ""),
         "proof_file_id": data.get("proof_file_id", ""),
+        "proof_media": data.get("proof_media", []),
         "quantity": int(data.get("quantity", 1)),
         "admin_messages": [],
         "status": "pending",
