@@ -22,7 +22,7 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
     """Returns (success, message, previous_nick, updated_profile)."""
     if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick or "") or "_" not in nick:
         return False, "Ник должен быть в формате Name_Surname.", "", None
-    if rank not in ("X", "9", "8", "7", "6", "5", "4", "1"):
+    if rank not in ("X", "9", "8", "7", "6", "5", "4", "3", "2", "1"):
         return False, "Неизвестный ранг.", "", None
     base = (f"https://firestore.googleapis.com/v1/projects/{project_id}"
             "/databases/(default)/documents")
@@ -92,6 +92,12 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
                     # The current verified nickname and rank stay intact until
                     # leadership approves the new binding.
                     requested_new_nick = old_nick.casefold() != nick.casefold()
+                    # Rank changes always require leadership approval even
+                    # when a registered agent keeps exactly the same nickname.
+                    requested_rank_change = (
+                        bool(old_nick)
+                        and str(old.get("rank") or "") != rank
+                    )
                     sheet_collision = False
                     if requested_new_nick:
                         for sheet in SHEETS:
@@ -102,7 +108,8 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
                                    and row.get("profileId") != binding for row in rows):
                                 sheet_collision = True
 
-                    if requested_new_nick and (conflicting_users or sheet_collision):
+                    if (requested_rank_change or
+                            (requested_new_nick and (conflicting_users or sheet_collision))):
                         updated = dict(old)
                         updated.update({
                             "nick": old_nick,
@@ -150,7 +157,8 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
 
                     updated = dict(old)
                     for stale in ("claimed_nick", "claimed_rank", "claim_id", "verification_status",
-                                  "disconnected_nick", "proof_submitted", "proof_kind",
+                                  "disconnected_nick", "cooldown_until",
+                                  "proof_submitted", "proof_kind",
                                   "proof_file_id", "proof_link", "proof_caption"):
                         updated.pop(stale, None)
                     updated.update({
@@ -290,7 +298,7 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                     rank = str(applicant.get("claimed_rank") or applicant.get("rank") or "")
                     if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick) or "_" not in nick:
                         return False, "Некорректный ник.", None, {}
-                    if rank not in ("X", "9", "8", "7", "6", "5", "4", "1"):
+                    if rank not in ("X", "9", "8", "7", "6", "5", "4", "3", "2", "1"):
                         return False, "Некорректный ранг.", None, {}
                     holders = [
                         (str(uid), row) for uid, row in users.items()
