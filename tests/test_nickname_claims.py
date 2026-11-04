@@ -282,6 +282,32 @@ class TestNicknameClaimTransaction(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["qty"], quantity)
         self.assertEqual(self.store.users["111"]["nick"], "Samuel_Norton")
 
+    async def test_approved_rank_and_free_nickname_change_keeps_balance(self):
+        previous_binding = self.add_existing_claimant()
+        result = await register_profile(
+            self.client, "test", 222, "New_Gomeza", "8",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(result[0], result[1])
+        self.assertEqual(result[3]["verification_status"], "pending")
+        approved, reason, profile, displaced = await resolve_nickname_claim(
+            self.client, "test", 222, result[3]["claim_id"],
+            self.signer, self.lock, {1}, local_users=self.store.users
+        )
+        self.assertTrue(approved, reason)
+        self.assertFalse(displaced)
+        self.assertEqual(profile["nick"], "New_Gomeza")
+        self.assertEqual(profile["rank"], "8")
+        self.assertEqual(profile["profileId"], previous_binding)
+        for sheet, qty in (("fractionrp", 5), ("praise", 2)):
+            rows = self.store.rows[sheet]
+            self.assertEqual(len(rows), 2)
+            renamed = next(row for row in rows if row["nick"] == "New_Gomeza")
+            self.assertEqual(renamed["qty"], qty)
+            self.assertEqual(renamed["rank"], "8")
+            self.assertEqual(renamed["profileId"], previous_binding)
+            self.assertFalse(any(row["nick"] == "Test2_Gomeza" for row in rows))
+
     async def test_first_registration_allows_rank_two(self):
         result = await register_profile(
             self.client, "test", 222, "Brand_New", "2",
