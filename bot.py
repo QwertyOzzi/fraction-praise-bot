@@ -1112,7 +1112,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         if not isinstance(profile, dict) or not profile.get("nick"):
             await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
             return
-        await edit_fbi_card(
+        await send_fbi_card(
             callback.message, home_card_text(profile, uid),
             reply_markup=get_main_menu(uid), lea=True
         )
@@ -1120,7 +1120,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         return
 
     if action == "admin":
-        await edit_fbi_card(
+        await send_fbi_card(
             callback.message,
             "👑 <b>FBI · Панель руководства</b>\n\n"
             "Управляйте агентами, начислениями и заявками.\n"
