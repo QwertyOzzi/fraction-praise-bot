@@ -1341,7 +1341,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("report", "status", "nick", "rank", "support"))
+@dp.message(Command("report", "status", "nick", "rank", "support", "ai"))
 async def cmd_quick_navigation(message: types.Message, state: FSMContext):
     """Run public commands even when a registration/report state is active."""
     if getattr(message.chat, "type", "") != "private":
@@ -1359,6 +1359,8 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await cmd_change_rank(message, state)
     elif command == "support":
         await cmd_support(message, state)
+    elif command == "ai":
+        await cmd_ai(message, state)
 
 
 @dp.message(Command("notifications"))
