@@ -1187,47 +1187,6 @@ async def review_claim(callback: types.CallbackQuery):
             logger.warning("Claim decision notification failed: %s", type(exc).__name__)
 
 
-@dp.message(lambda message: isinstance(users_db.get(str(message.from_user.id)), dict)
-            and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof")
-async def receive_claim_proof(message: types.Message):
-    if getattr(message.chat, "type", "") != "private":
-        return
-    uid = str(message.from_user.id)
-    if message.text and message.text.startswith("/"):
-        await message.answer("Для подтверждения отправьте скриншот или ссылку.")
-        return
-    photo = bool(message.photo)
-    video = bool(message.video)
-    document = bool(message.document and
-                    (message.document.mime_type or "").startswith("image/"))
-    link = (message.text or "").strip()
-    if not (photo or video or document or
-            (link.startswith(("https://", "http://")) and len(link) <= 1000)):
-        await message.answer(
-            "Пришлите скриншот игрового профиля, фото, видео или ссылку http(s). "
-            "Не отправляйте персональные документы."
-        )
-        return
-    async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
-        profile = users_db.get(uid)
-        if not isinstance(profile, dict) or profile.get("verification_status") != "needs_proof":
-            return
-        previous = dict(profile)
-        updated = dict(profile)
-        updated["verification_status"] = "proof_submitted"
-        updated["proof_submitted"] = datetime.now(timezone.utc).isoformat()
-        users_db[uid] = updated
-        if not await sync_state_to_cloud():
-            users_db[uid] = previous
-            await message.answer("⚠️ Не получилось сохранить доказательства. Повторите позже.")
-            return
-        save_json(USERS_FILE, users_db)
-    await message.answer(
-        "✅ Доказательства отправлены руководству. Ожидайте решения."
-    )
-    await notify_claim_reviewers(uid, updated, evidence_message=message)
-
-
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     """Registered before all state handlers so /cancel cannot be swallowed by report input."""
@@ -1328,6 +1287,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 user_data["telegram_username"] = old_username
                 logger.warning("Could not confirm Telegram username update in Firebase")
 
+    if (isinstance(user_data, dict)
+            and user_data.get("verification_status") in
+            ("pending", "needs_proof", "proof_submitted", "disconnected")):
+        await send_fbi_card(
+            message, pending_claim_card_text(user_data),
+            reply_markup=get_main_menu(message.from_user.id)
+        )
+        return
     if not user_data or not user_data.get("nick"):
         await send_fbi_card(
             message,
@@ -1391,8 +1358,29 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Доступно только руководству.", show_alert=True)
         return
 
+    if action == "claim_status":
+        profile = users_db.get(str(uid), {})
+        if not isinstance(profile, dict) or profile.get("verification_status") not in (
+                "pending", "needs_proof", "proof_submitted", "disconnected"):
+            await callback.answer("Нет активной проверки ника.", show_alert=True)
+            return
+        await send_fbi_card(
+            callback.message, pending_claim_card_text(profile),
+            reply_markup=get_main_menu(uid)
+        )
+        await callback.answer()
+        return
+
     if action == "open":
         profile = users_db.get(str(uid), {})
+        if isinstance(profile, dict) and profile.get("verification_status") in (
+                "pending", "needs_proof", "proof_submitted", "disconnected"):
+            await send_fbi_card(
+                callback.message, pending_claim_card_text(profile),
+                reply_markup=get_main_menu(uid)
+            )
+            await callback.answer()
+            return
         if not isinstance(profile, dict) or not profile.get("nick"):
             await callback.answer("Для начала регистрации используйте /start.", show_alert=True)
             return
@@ -1406,6 +1394,14 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
 
     if action == "home":
         profile = users_db.get(str(uid), {})
+        if isinstance(profile, dict) and profile.get("verification_status") in (
+                "pending", "needs_proof", "proof_submitted", "disconnected"):
+            await send_fbi_card(
+                callback.message, pending_claim_card_text(profile),
+                reply_markup=get_main_menu(uid)
+            )
+            await callback.answer()
+            return
         if not isinstance(profile, dict) or not profile.get("nick"):
             await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
             return
@@ -1554,6 +1550,30 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer(reason[:190], show_alert=True)
         return
 
+    if saved_profile.get("verification_status") == "pending":
+        users_db[user_key] = saved_profile
+        save_json(USERS_FILE, users_db)
+        await state.clear()
+        await callback.message.edit_text(
+            "✅ <b>Вход в бот разрешён</b>\n\n"
+            f"👤 Ник: <code>{html.escape(nick)}</code>\n"
+            "🕒 Статус: <b>проверка руководства</b>\n\n"
+            "Никакие чужие балансы и привязки не изменены. "
+            "Подать отчёт можно будет после подтверждения.",
+            parse_mode="HTML"
+        )
+        await send_fbi_card(
+            callback.message, pending_claim_card_text(saved_profile),
+            reply_markup=get_main_menu(callback.from_user.id)
+        )
+        await callback.answer()
+        asyncio.create_task(record_profile_activity(
+            callback.from_user.id, "nickname_claim_opened", old_nick,
+            nick, rank, username
+        ))
+        await notify_claim_reviewers(user_key, saved_profile)
+        return
+
     users_db[user_key] = saved_profile
     save_json(USERS_FILE, users_db)
     await state.clear()
@@ -1611,7 +1631,9 @@ async def cmd_my_status(message: types.Message):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
     if not user_data or not user_data.get("nick"):
-        await message.answer("Сначала укажите ник через /start!")
+        await message.answer(
+            "🕒 Ник ожидает проверки. Пока нельзя смотреть чужие балансы."
+        )
         return
 
     nick = user_data["nick"].lower()
@@ -1675,7 +1697,10 @@ async def start_report(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
     if not user_data or not user_data.get("nick"):
-        await message.answer("⚠️ Сначала укажите ник через /start!")
+        await message.answer(
+            "🕒 Ник ещё проверяется руководством. "
+            "Вы можете открыть /menu, но отчёты пока недоступны."
+        )
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2074,6 +2099,12 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     data = await state.get_data()
     user_id = str(callback.from_user.id)
     user_data = users_db.get(user_id, {})
+    if (not isinstance(user_data, dict) or not user_data.get("nick")
+            or user_data.get("verification_status") in (
+                "pending", "needs_proof", "proof_submitted", "disabled", "disconnected")):
+        await state.clear()
+        await callback.answer("Ваш игровой ник ещё не подтверждён.", show_alert=True)
+        return
     await state.clear()
 
     req_id = uuid.uuid4().hex[:12]
@@ -2125,6 +2156,18 @@ async def approve_report(callback: types.CallbackQuery):
     req = requests_db.get(req_id)
     if not req or req.get("status") != "pending":
         await callback.answer("Заявка уже была обработана ранее!", show_alert=True)
+        return
+
+    holder = users_db.get(str(req.get("user_id")), {})
+    if (not isinstance(holder, dict)
+            or str(holder.get("nick") or "").casefold()
+               != str(req.get("nick") or "").casefold()
+            or holder.get("verification_status") in
+               ("pending", "needs_proof", "proof_submitted", "disabled", "disconnected")):
+        await callback.answer(
+            "Ник заявителя больше не подтверждён. Заявку нельзя начислять.",
+            show_alert=True
+        )
         return
 
     quantity = int(req.get("quantity", 1))
@@ -3446,6 +3489,48 @@ async def process_support_msg(message: types.Message, state: FSMContext):
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  DUMMY WEB SERVER ДЛЯ RENDER (STAY-ALIVE)                        ║
 # ╚══════════════════════════════════════════════════════════════════╝
+@dp.message(lambda message: isinstance(users_db.get(str(message.from_user.id)), dict)
+            and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof")
+async def receive_claim_proof(message: types.Message):
+    if getattr(message.chat, "type", "") != "private":
+        return
+    uid = str(message.from_user.id)
+    if message.text and message.text.startswith("/"):
+        await message.answer("Для подтверждения отправьте скриншот или ссылку.")
+        return
+    photo = bool(message.photo)
+    video = bool(message.video)
+    document = bool(message.document and
+                    (message.document.mime_type or "").startswith("image/"))
+    link = (message.text or "").strip()
+    if not (photo or video or document or
+            (link.startswith(("https://", "http://")) and len(link) <= 1000)):
+        await message.answer(
+            "Пришлите скриншот игрового профиля, фото, видео или ссылку http(s). "
+            "Не отправляйте персональные документы."
+        )
+        return
+    async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
+        profile = users_db.get(uid)
+        if not isinstance(profile, dict) or profile.get("verification_status") != "needs_proof":
+            return
+        previous = dict(profile)
+        updated = dict(profile)
+        updated["verification_status"] = "proof_submitted"
+        updated["proof_submitted"] = datetime.now(timezone.utc).isoformat()
+        users_db[uid] = updated
+        if not await sync_state_to_cloud():
+            users_db[uid] = previous
+            await message.answer("⚠️ Не получилось сохранить доказательства. Повторите позже.")
+            return
+        save_json(USERS_FILE, users_db)
+    await message.answer(
+        "✅ Доказательства отправлены руководству. Ожидайте решения."
+    )
+    await notify_claim_reviewers(uid, updated, evidence_message=message)
+
+
+
 async def handle_ping(request):
     headers = {
         "Access-Control-Allow-Origin": "*",
