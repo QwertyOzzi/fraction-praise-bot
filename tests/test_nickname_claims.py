@@ -1,14 +1,33 @@
 """Occupied nicknames must create a safe provisional claim, not steal profiles."""
+import ast
 import asyncio
 import copy
-import html
+import hmac
 import json
+import logging
+import re
 import unittest
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from profile_sheets import register_profile, resolve_nickname_claim
-
 ROOT = Path(__file__).resolve().parents[1]
+PROFILE_SOURCE = (ROOT / "profile_sheets.py").read_text("utf-8")
+PROFILE_TREE = ast.parse(PROFILE_SOURCE)
+NODES = [node for node in PROFILE_TREE.body
+         if isinstance(node, ast.AsyncFunctionDef)
+         and node.name in ("register_profile", "resolve_nickname_claim")]
+PROFILE_ENV = {
+    "asyncio": asyncio, "hmac": hmac, "json": json, "re": re, "uuid": uuid,
+    "datetime": datetime, "timezone": timezone,
+    "logger": logging.getLogger("test-claims"),
+    "ClientTimeout": lambda **kwargs: None,
+    "SHEETS": ("fractionrp", "praise")
+}
+exec(compile(ast.fix_missing_locations(ast.Module(body=NODES, type_ignores=[])),
+             "isolated profile helpers", "exec"), PROFILE_ENV)
+register_profile = PROFILE_ENV["register_profile"]
+resolve_nickname_claim = PROFILE_ENV["resolve_nickname_claim"]
 
 
 class Response:
@@ -132,14 +151,8 @@ class TestNicknameClaimTransaction(unittest.IsolatedAsyncioTestCase):
         self.client = Client(self.store)
         self.lock = asyncio.Lock()
         self.signer = lambda admins, roles: "signed-acl"
-        # Avoid real aiohttp; replace only the module's session factory.
-        import profile_sheets
-        self.original_factory = profile_sheets.ClientSession
-        profile_sheets.ClientSession = lambda **kwargs: Session(self.store)
-
-    async def asyncTearDown(self):
-        import profile_sheets
-        profile_sheets.ClientSession = self.original_factory
+        # CI's static-test environment does not install aiohttp.
+        PROFILE_ENV["ClientSession"] = lambda **kwargs: Session(self.store)
 
     async def claim(self, nick="Samuel_Norton"):
         return await register_profile(
