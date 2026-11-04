@@ -99,9 +99,14 @@ class TestDurableProfile(unittest.IsolatedAsyncioTestCase):
         writes = []
         audit_events = []
 
-        async def persist():
+        async def persist(*args):
             writes.append("cloud")
-            return persist_success
+            if not persist_success:
+                return False, "Firebase error", "", None
+            return True, "Saved", "Old_Nick", {
+                "nick": "New_Nick", "rank": "8", "telegram_username": "someusername",
+                "registered_at": "2026-01-01", "profileId": "a" * 32
+            }
 
         async def audit(*args):
             audit_events.append(args)
@@ -111,7 +116,10 @@ class TestDurableProfile(unittest.IsolatedAsyncioTestCase):
             "FSMContext": object,
             "datetime": datetime, "html": html, "asyncio": asyncio,
             "users_db": user_data, "USERS_FILE": "test-users.json",
-            "sync_state_to_cloud": persist,
+            "_cloud_state_hydrated": True, "_state_sync_lock": asyncio.Lock(),
+            "firebase_client": object(), "FIREBASE_PROJECT_ID": "test",
+            "sign_admin_permissions": lambda *a: "valid",
+            "register_profile": persist,
             "save_json": lambda *args: writes.append("local"),
             "record_profile_activity": audit,
             "get_main_menu": lambda uid: "TEST MENU",
@@ -128,7 +136,7 @@ class TestDurableProfile(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db["12345"]["registered_at"], "2026-01-01")
         self.assertEqual(writes, ["cloud", "local"])
         self.assertTrue(state.cleared)
-        self.assertIn("сохранён в Firebase", cb.message.edited[0][0][0])
+        self.assertIn("Профиль и таблицы синхронизированы", cb.message.edited[0][0][0])
         self.assertEqual(events[0][1], "profile_changed")
 
     async def test_failure_rolls_back_and_allows_retry(self):

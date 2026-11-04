@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
+from profile_sheets import register_profile
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -416,7 +417,8 @@ class FirebaseClient:
                 "rank": mv.get("rank", {}).get("stringValue", ""),
                 "status": mv.get("status", {}).get("stringValue", "Выдано"),
                 "qty": qty_val,
-                "proof": proof_data
+                "proof": proof_data,
+                "profileId": mv.get("profileId", {}).get("stringValue", "")
             })
         return rows
 
@@ -440,6 +442,8 @@ class FirebaseClient:
         return {
             "mapValue": {
                 "fields": {
+                    **({"profileId": {"stringValue": str(r["profileId"])}}
+                       if r.get("profileId") else {}),
                     "id": {"stringValue": str(r.get("id", ""))},
                     "fullName": {"stringValue": str(r.get("fullName", ""))},
                     "nick": {"stringValue": str(r.get("nick", ""))},
@@ -925,8 +929,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     "Сейчас для этого ника нет строки в: " +
                     ", ".join("/" + sheet for sheet in missing) + ".\n"
                     "Удаление строки через сайт не удаляет регистрацию Telegram. "
-                    "Для полного удаления обычного агента владелец использует /agents. "
-                    "Посмотрите «Мой статус» для балансов."
+                    "Чтобы безопасно вернуть строку, откройте «⚙️ Мой никнейм», "
+                    "введите свой ник и подтвердите ранг. "
+                    "Для полного удаления агента владелец использует /agents."
                 )
         except Exception as exc:
             logger.warning("Could not compare profile with Firestore sheets: %s",
@@ -1009,50 +1014,48 @@ async def process_nick(message: types.Message, state: FSMContext):
 async def process_rank(callback: types.CallbackQuery, state: FSMContext):
     rank = callback.data.replace("rank_", "")
     data = await state.get_data()
-    nick = data.get("nick", "")
+    nick = str(data.get("nick") or "")
     if not nick:
         await callback.answer("Регистрация устарела. Введите /start.", show_alert=True)
         await state.clear()
         return
-
-    user_id = str(callback.from_user.id)
-    previous = users_db.get(user_id)
-    old_profile = dict(previous) if isinstance(previous, dict) else None
-    old_nick = str((old_profile or {}).get("nick") or "")
-    username = callback.from_user.username or ""
-    updated = {
-        **(old_profile or {}),
-        "nick": nick,
-        "rank": rank,
-        "telegram_username": username,
-        "registered_at": (old_profile or {}).get("registered_at") or datetime.now().isoformat()
-    }
-    users_db[user_id] = updated
-    # Do not claim success until the owner-authenticated cloud write is confirmed.
-    if not await sync_state_to_cloud():
-        if old_profile is not None:
-            users_db[user_id] = old_profile
-        else:
-            users_db.pop(user_id, None)
-        await callback.answer("Не удалось подтвердить сохранение в Firebase. Повторите выбор ранга.", show_alert=True)
+    if not _cloud_state_hydrated:
+        await callback.answer("Firebase ещё не загрузил список пользователей.", show_alert=True)
         return
+
+    user_key = str(callback.from_user.id)
+    previous = users_db.get(user_key, {})
+    expected_old = str(previous.get("nick") or "") if isinstance(previous, dict) else ""
+    username = callback.from_user.username or ""
+    success, reason, old_nick, saved_profile = await register_profile(
+        firebase_client, FIREBASE_PROJECT_ID, callback.from_user.id,
+        nick, rank, username, expected_old, sign_admin_permissions, _state_sync_lock
+    )
+    if not success:
+        await callback.answer(reason[:190], show_alert=True)
+        return
+
+    users_db[user_key] = saved_profile
     save_json(USERS_FILE, users_db)
     await state.clear()
-    activity = "profile_changed" if old_nick else "profile_registered"
+    action = "profile_changed" if old_nick else "profile_registered"
     asyncio.create_task(record_profile_activity(
-        callback.from_user.id, activity, old_nick, nick, rank, username
+        callback.from_user.id, action, old_nick, nick, rank, username
     ))
-    extra = (
-        "\n\nℹ️ Ранее выданные баллы и ники в таблицах не переименовываются автоматически. "
-        "Таблицы редактируются отдельно администратором."
-        if old_nick and old_nick.casefold() != nick.casefold() else ""
+    note = (
+        "\n\n🔁 Строки в /fractionrp и /praise переименованы, "
+        "существующие баллы сохранены."
+        if old_nick and old_nick.casefold() != nick.casefold()
+        else "\n\n📊 Ник добавлен в обе таблицы (баланс 0, если записи ещё не было)."
     )
     await callback.message.edit_text(
-        f"✅ Профиль сохранён в Firebase!\n\n👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n"
-        f"🎖️ <b>Ранг:</b> {html.escape(rank)}" + extra, parse_mode="HTML"
+        f"✅ <b>Профиль и таблицы синхронизированы!</b>\n\n"
+        f"👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n"
+        f"🎖️ <b>Ранг:</b> {html.escape(rank)}" + note,
+        parse_mode="HTML"
     )
     await callback.message.answer(
-        "Теперь вы можете подавать отчеты через меню:",
+        "Теперь данные должны отображаться на сайте без подачи отчёта.",
         reply_markup=get_main_menu(callback.from_user.id)
     )
     await callback.answer()
