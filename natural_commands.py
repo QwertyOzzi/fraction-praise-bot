@@ -247,22 +247,40 @@ def _candidate_score(alias: str, nick: str) -> tuple[int, float] | None:
         return None
     full = simplified(nick)
     tokens = [simplified(p) for p in re.split(r"[_\s]+", nick)]
-    if key == full:
-        return (4, 1.0)
-    if key in tokens:
-        return (3, 1.0)
-    if len(key) >= 4 and any(t.startswith(key) and len(key) >= len(t) - 2
-                             for t in tokens):
-        return (2, 1.0)
-    # One character typo in a distinct token; deliberately stricter than
-    # arbitrary fuzzy ranking. More than one match => human clarification.
-    if len(key) >= 5:
-        for token in tokens:
-            if abs(len(key) - len(token)) <= 1:
-                similarity = difflib.SequenceMatcher(None, key, token).ratio()
-                if similarity >= 0.82:
-                    return (1, similarity)
-    return None
+    # Typical Russian grammatical forms ("гоммезу", "нортона") can be
+    # recognized locally. Exact names always outrank inflected forms.
+    variants = [key]
+    if re.fullmatch(r"[а-яё]{5,40}", alias.casefold()):
+        stem = alias.casefold()
+        if stem.endswith(("ом", "ем")) and len(stem) >= 7:
+            variants.append(simplified(stem[:-2]))
+        elif stem.endswith(("а", "у", "е", "ы", "ю", "я")) and len(stem) >= 6:
+            variants.append(simplified(stem[:-1]))
+    best = None
+    for form in variants:
+        if form == full:
+            candidate = (4 if form == key else 2, 1.0)
+        elif form in tokens:
+            candidate = (3 if form == key else 2, 1.0)
+        elif len(form) >= 4 and any(
+                t.startswith(form) and len(form) >= len(t) - 2
+                for t in tokens):
+            candidate = (2, 1.0)
+        else:
+            candidate = None
+            if len(form) >= 5:
+                for token in tokens:
+                    if abs(len(form) - len(token)) <= 1:
+                        similarity = difflib.SequenceMatcher(
+                            None, form, token
+                        ).ratio()
+                        if similarity >= 0.82:
+                            score = (1, similarity)
+                            if candidate is None or score > candidate:
+                                candidate = score
+        if candidate is not None and (best is None or candidate > best):
+            best = candidate
+    return best
 
 
 def resolve_names(names: list[str], available_rows: list[dict]) -> tuple[list[dict], list[str]]:
