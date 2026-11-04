@@ -1182,9 +1182,9 @@ async def show_report_reason_menu(message: types.Message, state: FSMContext, edi
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     if edit:
-        await message.edit_text("📑 <b>Новый отчёт · Причина</b>\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
+        await edit_fbi_card(message, "📑 <b>Новый отчёт · Причина</b>\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb)
     else:
-        await message.answer("📑 <b>Новый отчёт · Причина</b>\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
+        await send_fbi_card(message, "📑 <b>Новый отчёт · Причина</b>\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb)
     await state.set_state(ReportStates.waiting_for_reason)
 
 
@@ -1200,10 +1200,10 @@ async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(style="primary", text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
-    await callback.message.edit_text(
+    await edit_fbi_card(
+        callback.message,
         f"{icon} <b>Новый отчёт · Количество</b>\n\n" f"Сколько {label} указать в заявке?\n<i>Допустимо от 1 до 20.</i>",
-        reply_markup=kb,
-        parse_mode="HTML"
+        reply_markup=kb
     )
     await state.set_state(ReportStates.waiting_for_quantity)
 
@@ -1242,10 +1242,10 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
     reason = callback.data.replace("reason_", "")
     await state.update_data(reason=reason)
 
-    await callback.message.edit_text(
+    await edit_fbi_card(
+        callback.message,
         "📎 <b>Новый отчёт · Доказательства</b>\n\n" "Отправьте <b>ссылку на форум, фото или видео</b> прямо сюда.\n\n"
-        "<i>Можно добавить подпись к фото/видео. Один отчёт = одно вложение.</i>",
-        parse_mode="HTML"
+        "<i>Можно добавить подпись к фото/видео. Один отчёт = одно вложение.</i>"
     )
     await state.set_state(ReportStates.waiting_for_proof)
 
@@ -1293,7 +1293,7 @@ async def process_report_proof(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(style="success", text="✅ Отправить руководству", callback_data="send_report_confirm")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
-    await message.answer(text, reply_markup=kb, disable_web_page_preview=True, parse_mode="HTML")
+    await send_fbi_card(message, text, reply_markup=kb)
     await state.set_state(ReportStates.confirm)
 
 @dp.callback_query(F.data == "cancel_report")
@@ -1434,10 +1434,10 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     save_json(REQUESTS_FILE, requests_db)
     notify_state_changed()
 
-    await callback.message.edit_text(
+    await edit_fbi_card(
+        callback.message,
         f"✅ <b>FBI · Отчёт #{req_id} отправлен</b>\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
-        "Как только лидер или заместитель проверит его, вам придет уведомление.",
-        parse_mode="HTML"
+        "Как только лидер или заместитель проверит его, вам придет уведомление."
     )
 
     # Every pending request gets its own pinned administrator message.
