@@ -86,26 +86,29 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
                         if entry.get("profileId") == binding:
                             return False, "Дублирующая привязка агента.", "", None
 
-                    # For first-time registrations, an occupied nickname must not
-                    # block entry to the bot. Keep the claim unverified until a
-                    # human reviewer makes an explicit decision. Never touch the
-                    # existing holder's profile, table rows or balances here.
+                    # A taken nickname must be reviewable both for newcomers
+                    # AND for agents changing their existing nickname.
+                    # Never modify the previous account, rows or balances here.
+                    # The current verified nickname and rank stay intact until
+                    # leadership approves the new binding.
+                    requested_new_nick = old_nick.casefold() != nick.casefold()
                     sheet_collision = False
-                    if not old_nick:
+                    if requested_new_nick:
                         for sheet in SHEETS:
                             doc = docs["sheets/" + sheet]
                             rows = client._parse_firestore_rows(doc.get("fields", {}).get(
                                 "rows", {}).get("arrayValue", {}).get("values", []))
                             if any(str(row.get("nick") or "").casefold() == nick.casefold()
-                                   for row in rows):
+                                   and row.get("profileId") != binding for row in rows):
                                 sheet_collision = True
 
-                    if not old_nick and (conflicting_users or sheet_collision):
+                    if requested_new_nick and (conflicting_users or sheet_collision):
                         updated = dict(old)
                         updated.update({
-                            "nick": "",
+                            "nick": old_nick,
                             "claimed_nick": nick,
-                            "rank": rank,
+                            "claimed_rank": rank,
+                            "rank": old.get("rank", rank) if old_nick else rank,
                             "telegram_username": username[:32],
                             "profileId": binding,
                             "verification_status": "pending",
@@ -141,11 +144,12 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
                                 return False, f"Firebase отказал в записи (HTTP {response.status}).", "", None
                         continue
                     if conflicting_users:
-                        # Renaming a verified profile cannot steal another nick.
-                        return False, "Ник принадлежит другому агенту.", "", None
+                        # A contradictory duplicate of the user's current
+                        # verified name still requires a manual database fix.
+                        return False, "Конфликт существующих профилей.", "", None
 
                     updated = dict(old)
-                    for stale in ("claimed_nick", "claim_id", "verification_status",
+                    for stale in ("claimed_nick", "claimed_rank", "claim_id", "verification_status",
                                   "disconnected_nick", "proof_submitted", "proof_kind",
                                   "proof_file_id", "proof_link", "proof_caption"):
                         updated.pop(stale, None)
@@ -283,7 +287,7 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                                 "pending", "needs_proof", "proof_submitted")):
                         return False, "Заявка уже обработана или устарела.", None, {}
                     nick = str(applicant.get("claimed_nick") or "")
-                    rank = str(applicant.get("rank") or "")
+                    rank = str(applicant.get("claimed_rank") or applicant.get("rank") or "")
                     if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick) or "_" not in nick:
                         return False, "Некорректный ник.", None, {}
                     if rank not in ("X", "9", "8", "7", "6", "5", "4", "1"):
@@ -305,6 +309,15 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                     current_binding = str(applicant.get("profileId") or uuid.uuid4().hex)
                     if not re.fullmatch(r"[0-9a-f]{32}", current_binding):
                         return False, "Некорректная привязка профиля.", None, {}
+                    old_verified_nick = str(applicant.get("nick") or "")
+                    changing_existing_nick = (
+                        bool(old_verified_nick)
+                        and old_verified_nick.casefold() != nick.casefold()
+                    )
+                    # Do not let the new nick share a binding with the user's
+                    # previous nickname: that would make the tables ambiguous.
+                    target_binding = (uuid.uuid4().hex
+                                      if changing_existing_nick else current_binding)
                     if holders:
                         previous_uid, previous = holders[0]
                         displaced_profile = dict(previous)
@@ -316,9 +329,12 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                         displaced[previous_uid] = displaced_profile
 
                     applicant = dict(applicant)
-                    applicant.update({"nick": nick, "verification_status": "verified"})
-                    applicant.pop("claimed_nick", None)
-                    applicant.pop("claim_id", None)
+                    applicant.update({
+                        "nick": nick, "rank": rank, "profileId": target_binding,
+                        "verification_status": "verified"
+                    })
+                    for key in ("claimed_nick", "claimed_rank", "claim_id"):
+                        applicant.pop(key, None)
                     for key in ("proof_submitted", "proof_kind", "proof_file_id",
                                 "proof_link", "proof_caption"):
                         applicant.pop(key, None)
@@ -335,6 +351,19 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                                    if str(row.get("nick") or "").casefold() == nick.casefold()]
                         if len(matches) > 1:
                             return False, "Дубли в таблицах. Нужна ручная проверка.", None, {}
+                        if changing_existing_nick:
+                            old_bound = [
+                                row for row in rows
+                                if row.get("profileId") == current_binding
+                                and str(row.get("nick") or "").casefold()
+                                    == old_verified_nick.casefold()
+                            ]
+                            if len(old_bound) > 1:
+                                return False, "Дубли прежней привязки. Нужна проверка.", None, {}
+                            # Retain previous FRP/praise, evidence and history
+                            # on the OLD row. Only detach its obsolete profileId.
+                            for old_row in old_bound:
+                                old_row.pop("profileId", None)
                         if matches:
                             row = matches[0]
                         else:
@@ -347,7 +376,7 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                         row.update({
                             "nick": nick, "rank": rank,
                             "fullName": f"{nick} ({rank})",
-                            "profileId": current_binding
+                            "profileId": target_binding
                         })
                         writes.append({
                             "update": {
