@@ -781,12 +781,14 @@ def pending_claim_card_text(profile: Dict[str, Any]) -> str:
         note = "Этот ник переназначен по решению руководства. Вы можете указать другой."
     else:
         note = "Вы вошли в бот. Ник ожидает проверки руководством."
+    previous_nick = html.escape(str(profile.get("nick") or ""))
     return (
         "🛡️ <b>FBI · Проверка регистрации</b>\n\n"
         f"👤 <b>Заявленный ник:</b> <code>{nick}</code>\n"
-        f"🎖️ <b>Ранг:</b> {html.escape(str(profile.get('rank') or '?'))}\n\n"
-        f"<i>{note}</i>\n\n"
-        "До подтверждения чужие балансы и отчёты недоступны."
+        f"🎖️ <b>Ранг:</b> {html.escape(str(profile.get('claimed_rank') or profile.get('rank') or '?'))}\n"
+        + (f"📌 <b>Прежний ник:</b> <code>{previous_nick}</code>\n" if previous_nick else "")
+        + f"\n<i>{note}</i>\n\n"
+        + "До подтверждения чужие балансы и отчёты недоступны."
     )
 
 
@@ -1001,7 +1003,8 @@ def claim_review_keyboard(uid: str, claim_id: str) -> InlineKeyboardMarkup:
 
 def claim_review_text(uid: str, profile: Dict[str, Any]) -> str:
     name = html.escape(str(profile.get("claimed_nick") or "Не указан"))
-    rank = html.escape(str(profile.get("rank") or "?"))
+    rank = html.escape(str(profile.get("claimed_rank") or profile.get("rank") or "?"))
+    old_nick = html.escape(str(profile.get("nick") or ""))
     username = html.escape(str(profile.get("telegram_username") or "").lstrip("@"))
     holders = [
         (key, entry) for key, entry in users_db.items()
@@ -1016,6 +1019,7 @@ def claim_review_text(uid: str, profile: Dict[str, Any]) -> str:
         f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
         f"🎮 <b>Ник:</b> <code>{name}</code>\n"
         f"🎖️ <b>Заявленный ранг:</b> {rank}\n"
+        + (f"📌 <b>Старый ник пользователя:</b> <code>{old_nick}</code>\n" if old_nick else "")
         + (f"💬 <b>Telegram:</b> @{username}\n" if username else "")
         + holder_note + "\n\n"
         "Проверьте, действительно ли агент владеет игровым аккаунтом. "
@@ -1230,6 +1234,13 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     profile = users_db.get(str(user_id))
+    if isinstance(profile, dict) and profile.get("verification_status") in (
+            "pending", "needs_proof", "proof_submitted", "disconnected"):
+        await send_fbi_card(
+            message, pending_claim_card_text(profile),
+            reply_markup=get_main_menu(user_id)
+        )
+        return
     if not isinstance(profile, dict) or not profile.get("nick"):
         await cmd_start(message, state)
         return
@@ -1656,9 +1667,11 @@ async def cancel_nick_change(callback: types.CallbackQuery, state: FSMContext):
 async def cmd_my_status(message: types.Message):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
-    if not user_data or not user_data.get("nick"):
+    if (not isinstance(user_data, dict) or not user_data.get("nick")
+            or user_data.get("verification_status") in (
+                "pending", "needs_proof", "proof_submitted", "disconnected")):
         await message.answer(
-            "🕒 Ник ожидает проверки. Пока нельзя смотреть чужие балансы."
+            "🕒 Ник ожидает проверки. Просмотр баланса пока недоступен."
         )
         return
 
@@ -1722,7 +1735,9 @@ async def cmd_my_status(message: types.Message):
 async def start_report(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
-    if not user_data or not user_data.get("nick"):
+    if (not isinstance(user_data, dict) or not user_data.get("nick")
+            or user_data.get("verification_status") in (
+                "pending", "needs_proof", "proof_submitted", "disconnected")):
         await message.answer(
             "🕒 Ник ещё проверяется руководством. "
             "Вы можете открыть /menu, но отчёты пока недоступны."
