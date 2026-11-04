@@ -15,7 +15,7 @@ env = {
     "re": re,
     "TITLE_RE": re.compile(r"^([^\n<]*)<b>([^<\n]+)</b>\n(?:━+\n)?\n*"),
     "LEA_URL": "https://lea-script.space/",
-    "LEA_LABEL": "↗ ЛЕА · помощник ФБР"
+    "LEA_LABEL": "🧩 ЛЕА ↗"
 }
 exec(compile(ast.Module(body=helpers, type_ignores=[]), "isolated rich design", "exec"), env)
 
@@ -28,7 +28,7 @@ class TestRichCards(unittest.TestCase):
         output = env["rich_card_html"](sample, lea=True)
         self.assertIn("<h2>🛡️ FBI · Личный кабинет</h2>", output)
         self.assertIn('<tg-button type="url" url="https://lea-script.space/">', output)
-        self.assertIn("ЛЕА · помощник ФБР</tg-button>", output)
+        self.assertIn("🧩 ЛЕА ↗</tg-button>", output)
         self.assertIn("<code>QA_TestAgent2</code>", output)
         self.assertNotIn("━", output)
 
