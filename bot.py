@@ -725,9 +725,9 @@ MENU_BUTTONS = [
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     admin_mode = is_admin(user_id)
     buttons = [
-        [KeyboardButton(text="📝 Подать отчет на FRP / Похвалу")],
+        [KeyboardButton(text="📝 Подать отчет на FRP / Похвалу", style="primary")],
         [
-            KeyboardButton(text="📊 Мой статус"),
+            KeyboardButton(text="📊 Мой статус", style="primary"),
             KeyboardButton(text="🌐 Открыть таблицу", web_app=WebAppInfo(url=WEBAPP_URL)),
         ],
         [
@@ -737,8 +737,8 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     ]
     if admin_mode:
         buttons.append([KeyboardButton(text="📋 Очередь на выдачу (Админ)"), KeyboardButton(text="👥 Список админов")])
-        buttons.append([KeyboardButton(text="📌 Ожидающие заявки"), KeyboardButton(text="➕ Начислить FRP / Похвалу")])
-        buttons.append([KeyboardButton(text="🧑‍💼 Управление агентами")])
+        buttons.append([KeyboardButton(text="📌 Ожидающие заявки"), KeyboardButton(text="➕ Начислить FRP / Похвалу", style="success")])
+        buttons.append([KeyboardButton(text="🧑‍💼 Управление агентами", style="primary")])
 
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -872,10 +872,10 @@ async def cmd_owner_notifications(message: types.Message):
 @dp.message(Command("version"))
 async def cmd_version(message: types.Message):
     commit = os.getenv("RENDER_GIT_COMMIT", "").strip()
-    version_text = f"Версия бота: {RELEASE_TAG}"
+    version_text = f"🛡️ <b>FBI · Версия системы</b>\n━━━━━━━━━━━━━━\n\n<code>{html.escape(RELEASE_TAG)}</code>"
     if commit:
-        version_text += f"\nRender commit: {commit[:12]}"
-    await message.answer(version_text)
+        version_text += f"\nСборка: <code>{html.escape(commit[:12])}</code>"
+    await message.answer(version_text, parse_mode="HTML")
 
 
 @dp.message(CommandStart())
@@ -895,8 +895,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if not user_data or not user_data.get("nick"):
         await message.answer(
-            "👋 Приветствую в боте автоматизации выдачи похвалы и отметок <b>Arizona RP</b>!\n\n"
-            "Для начала работы введите ваш игровой никнейм (например: <code>Samuel_Norton</code>):",
+            "🛡️ <b>FBI · СИСТЕМА УЧЁТА</b>\n━━━━━━━━━━━━━━\n\n"
+            "Добро пожаловать в систему FRP и похвал Arizona RP.\n\n" "👤 <b>Шаг 1 из 2 · Регистрация</b>\n" "Введите игровой ник в формате <code>Имя_Фамилия</code>.\n" "<i>Пример: Samuel_Norton</i>",
             parse_mode="HTML"
         )
         await state.set_state(RegistrationStates.waiting_for_nick)
@@ -904,10 +904,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         nick_esc = html.escape(user_data['nick'])
         rank_esc = html.escape(str(user_data.get('rank', '?')))
         await message.answer(
-            f"👋 С возвращением, <b>{nick_esc}</b> [{rank_esc}]!\n\n"
-            "Выберите нужное действие в меню ниже:",
+            f"🛡️ <b>FBI · Личный кабинет</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <b>Агент:</b> <code>{nick_esc}</code>\n" f"🎖️ <b>Ранг:</b> {rank_esc}\n" f"🔐 <b>Доступ:</b> {html.escape(role_name(message.from_user.id))}\n\n"
+            "Выберите действие на клавиатуре ниже.\n\n" "<i>↗ <a href=\"https://lea-script.space/\">ЛЕА · помощник ФБР</a></i>",
             reply_markup=get_main_menu(message.from_user.id),
-            parse_mode="HTML"
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
         # Bot registrations live in config/bot_state; the two visible tables
         # are independent. A website row deletion is NOT a profile deletion.
@@ -1007,7 +1008,7 @@ async def process_nick(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="6 ранг", callback_data="rank_6"), InlineKeyboardButton(text="5 ранг", callback_data="rank_5")],
         [InlineKeyboardButton(text="4 ранг", callback_data="rank_4"), InlineKeyboardButton(text="1-3 ранг", callback_data="rank_1")]
     ])
-    await message.answer(f"Отлично, ник: <code>{html.escape(nick)}</code>!\nТеперь укажите ваш текущий ранг:", reply_markup=kb, parse_mode="HTML")
+    await message.answer(f"👤 <b>Регистрация · Шаг 2 из 2</b>\n━━━━━━━━━━━━━━\n\n" f"Ник: <code>{html.escape(nick)}</code>\n\n" "🎖️ Выберите ваш текущий ранг:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_rank)
 
 @dp.callback_query(RegistrationStates.waiting_for_rank, F.data.startswith("rank_"))
@@ -1049,7 +1050,7 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
         else "\n\n📊 Ник добавлен в обе таблицы (баланс 0, если записи ещё не было)."
     )
     await callback.message.edit_text(
-        f"✅ <b>Профиль и таблицы синхронизированы!</b>\n\n"
+        f"✅ <b>Профиль и таблицы синхронизированы!</b>\n━━━━━━━━━━━━━━\n\n"
         f"👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n"
         f"🎖️ <b>Ранг:</b> {html.escape(rank)}" + note,
         parse_mode="HTML"
@@ -1074,7 +1075,7 @@ async def cmd_change_nick(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_nick_change")]
     ])
     await message.answer(
-        f"Ваш текущий профиль:\n👤 <b>Ник:</b> <code>{html.escape(current_nick)}</code>\n🎖️ <b>Ранг:</b> {html.escape(str(current_rank))}\n\n"
+        f"⚙️ <b>FBI · Настройки профиля</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <b>Ник:</b> <code>{html.escape(current_nick)}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(current_rank))}\n\n"
         "Если хотите изменить ник, напишите новый (в формате <code>Имя_Фамилия</code>):",
         reply_markup=kb,
         parse_mode="HTML"
@@ -1128,24 +1129,25 @@ async def cmd_my_status(message: types.Message):
     praise_status_esc = html.escape(str(praise_status))
 
     text = (
-        f"📊 <b>Статус агента {nick_esc} [{rank_esc}]:</b>\n\n"
+        f"📊 <b>FBI · Карточка агента</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <code>{nick_esc}</code> · ранг <b>{rank_esc}</b>\n\n"
         f"🎖️ <b>/fractionrp (Отметки):</b>\n"
         f"• Количество: <b>{frp_qty}</b> шт.\n"
         f"• Статус: <b>{frp_status_esc}</b>\n\n"
         f"🌟 <b>/praise (Похвала):</b>\n"
         f"• Количество: <b>{praise_qty}</b> шт.\n"
         f"• Статус: <b>{praise_status_esc}</b>\n\n"
-        f"🌐 Таблицу в реальном времени можно посмотреть по кнопке ниже:"
+        f"🌐 Таблица обновляется в реальном времени. Откройте её кнопкой ниже."
     )
     if not frp_item or not praise_item:
         text += (
             "\n\nℹ️ «Нет записи» означает отсутствие строки с этим ником в соответствующей "
             "таблице. Регистрация в боте хранится отдельно; удаление на сайте её не отменяет."
         )
+    text += "\n\n<i>↗ <a href=\"https://lea-script.space/\">ЛЕА · помощник ФБР</a></i>"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Открыть сайт таблицы", web_app=WebAppInfo(url=WEBAPP_URL))]
+        [InlineKeyboardButton(style="primary", text="🌐 Открыть сайт таблицы", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  ПОДАЧА ОТЧЕТА НА ВЫДАЧУ                                         ║
@@ -1159,8 +1161,8 @@ async def start_report(message: types.Message, state: FSMContext):
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎖️ /fractionrp (Отметка FRP)", callback_data="type_fractionrp")],
-        [InlineKeyboardButton(text="🌟 /praise (Похвала)", callback_data="type_praise")],
+        [InlineKeyboardButton(style="primary", text="🎖️ /fractionrp (Отметка FRP)", callback_data="type_fractionrp")],
+        [InlineKeyboardButton(style="primary", text="🌟 /praise (Похвала)", callback_data="type_praise")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     await message.answer(
@@ -1194,7 +1196,7 @@ async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
     icon = "🎖️" if rep_type == "fractionrp" else "🌟"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=str(n), callback_data=f"repqty_{n}") for n in (1, 2, 3, 5, 10)],
-        [InlineKeyboardButton(text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
+        [InlineKeyboardButton(style="primary", text="✏️ Другое число (1–20)", callback_data="repqty_custom")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     await callback.message.edit_text(
@@ -1286,7 +1288,7 @@ async def process_report_proof(message: types.Message, state: FSMContext):
         "Отправить отчет на проверку руководству?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Отправить руководству", callback_data="send_report_confirm")],
+        [InlineKeyboardButton(style="success", text="✅ Отправить руководству", callback_data="send_report_confirm")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     await message.answer(text, reply_markup=kb, disable_web_page_preview=True, parse_mode="HTML")
@@ -1304,11 +1306,11 @@ def pending_report_keyboard(req_id: str, req: Dict[str, Any]) -> InlineKeyboardM
         controls.append([
             InlineKeyboardButton(text="➖ 1", callback_data=f"qtyminus_{req_id}"),
             InlineKeyboardButton(text=f"{'🎖️' if req.get('rep_type') == 'fractionrp' else '🌟'} {qty}", callback_data=f"qtyshow_{req_id}"),
-            InlineKeyboardButton(text="➕ 1", callback_data=f"qtyplus_{req_id}")
+            InlineKeyboardButton(style="success", text="➕ 1", callback_data=f"qtyplus_{req_id}")
         ])
     controls.append([
-        InlineKeyboardButton(text=f"✅ Одобрить (+{qty})", callback_data=f"approve_{req_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{req_id}")
+        InlineKeyboardButton(style="success", text=f"✅ Одобрить (+{qty})", callback_data=f"approve_{req_id}"),
+        InlineKeyboardButton(style="danger", text="❌ Отклонить", callback_data=f"reject_{req_id}")
     ])
     return InlineKeyboardMarkup(inline_keyboard=controls)
 
@@ -1584,7 +1586,7 @@ async def cmd_recover_admins(message: types.Message):
         nick = html.escape(str(profile.get("nick", "Неизвестно")))
         lines.append(f"• {nick} — ID {uid} — {role}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Восстановить перечисленных", callback_data=f"aclrestore:{_pending_legacy_nonce}")],
+        [InlineKeyboardButton(style="success", text="✅ Восстановить перечисленных", callback_data=f"aclrestore:{_pending_legacy_nonce}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="aclrestorecancel")]
     ])
     await message.answer(
@@ -1688,8 +1690,8 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
             "nonce": nonce, "source": "owner", "role": None
         }
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👑 Лидер", callback_data=f"adm_role_{target_id}_{nonce}_leader")],
-            [InlineKeyboardButton(text="⭐ Заместитель", callback_data=f"adm_role_{target_id}_{nonce}_deputy")],
+            [InlineKeyboardButton(style="primary", text="👑 Лидер", callback_data=f"adm_role_{target_id}_{nonce}_leader")],
+            [InlineKeyboardButton(style="primary", text="⭐ Заместитель", callback_data=f"adm_role_{target_id}_{nonce}_deputy")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_deny_{target_id}_{nonce}")]
         ])
         await message.answer(
@@ -1781,8 +1783,8 @@ async def cmd_admin_auth(message: types.Message, state: FSMContext):
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Одобрить доступ", callback_data=f"adm_grant_{uid}_{nonce}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_deny_{uid}_{nonce}")
+                InlineKeyboardButton(style="success", text="✅ Одобрить доступ", callback_data=f"adm_grant_{uid}_{nonce}"),
+                InlineKeyboardButton(style="danger", text="❌ Отклонить", callback_data=f"adm_deny_{uid}_{nonce}")
             ]
         ])
 
@@ -1851,7 +1853,7 @@ async def callback_admin_select_role(callback: types.CallbackQuery):
         return
     request["role"] = role
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить назначение", callback_data=f"adm_grant_{target_id}_{nonce}")],
+        [InlineKeyboardButton(style="success", text="✅ Подтвердить назначение", callback_data=f"adm_grant_{target_id}_{nonce}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm_deny_{target_id}_{nonce}")]
     ])
     await callback.message.edit_reply_markup(reply_markup=kb)
@@ -1975,7 +1977,7 @@ async def cmd_list_admins(message: types.Message):
 
         # Снимать замов может только Главный Владелец
         if not is_me and not is_own and is_owner(message.from_user.id):
-            kb_rows.append([InlineKeyboardButton(text=f"❌ Снять {nick}", callback_data=f"remove_admin_{adm_id}")])
+            kb_rows.append([InlineKeyboardButton(style="danger", text=f"❌ Снять {nick}", callback_data=f"remove_admin_{adm_id}")])
 
     text += (
         "💡 <b>Как добавить нового заместителя:</b>\n"
@@ -2281,10 +2283,10 @@ def agent_list_markup(agents: List[Dict[str, Any]], page: int):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"agpage:{page + 1}"))
     keyboard.append(nav)
     keyboard.append([
-        InlineKeyboardButton(text="🔎 Поиск", callback_data="agsearch"),
+        InlineKeyboardButton(style="primary", text="🔎 Поиск", callback_data="agsearch"),
         InlineKeyboardButton(text="Сбросить поиск", callback_data="agreset")
     ])
-    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"agpage:{page}")])
+    keyboard.append([InlineKeyboardButton(style="primary", text="🔄 Обновить", callback_data=f"agpage:{page}")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -2297,18 +2299,18 @@ def agent_detail_markup(agent: Dict[str, Any], page: int):
         "Выберите действие. Начисление и списание потребуют подтверждения:"
     )
     keyboard = [
-        [InlineKeyboardButton(text="🎖️ FRP +1", callback_data=f"agask:g:f:{key}:1:{page}"),
-         InlineKeyboardButton(text="🎖️ FRP +5", callback_data=f"agask:g:f:{key}:5:{page}"),
+        [InlineKeyboardButton(style="success", text="🎖️ FRP +1", callback_data=f"agask:g:f:{key}:1:{page}"),
+         InlineKeyboardButton(style="success", text="🎖️ FRP +5", callback_data=f"agask:g:f:{key}:5:{page}"),
          InlineKeyboardButton(text="🎖️ FRP −1", callback_data=f"agask:d:f:{key}:1:{page}")],
-        [InlineKeyboardButton(text="🌟 Похвала +1", callback_data=f"agask:g:p:{key}:1:{page}"),
-         InlineKeyboardButton(text="🌟 Похвала +5", callback_data=f"agask:g:p:{key}:5:{page}"),
+        [InlineKeyboardButton(style="success", text="🌟 Похвала +1", callback_data=f"agask:g:p:{key}:1:{page}"),
+         InlineKeyboardButton(style="success", text="🌟 Похвала +5", callback_data=f"agask:g:p:{key}:5:{page}"),
          InlineKeyboardButton(text="🌟 Похвала −1", callback_data=f"agask:d:p:{key}:1:{page}")]
     ]
     if agent.get("uid") is not None:
-        keyboard.append([InlineKeyboardButton(text="🎖️ Изменить ранг", callback_data=f"agranks:{key}:{page}")])
-    keyboard.append([InlineKeyboardButton(text="🗑️ Удалить запись (владелец)", callback_data=f"agdelete:{key}:{page}")])
+        keyboard.append([InlineKeyboardButton(style="primary", text="🎖️ Изменить ранг", callback_data=f"agranks:{key}:{page}")])
+    keyboard.append([InlineKeyboardButton(style="danger", text="🗑️ Удалить запись (владелец)", callback_data=f"agdelete:{key}:{page}")])
     keyboard.append([InlineKeyboardButton(text="🔙 К списку", callback_data=f"agpage:{page}"),
-                     InlineKeyboardButton(text="🔄 Обновить", callback_data=f"agview:{key}:{page}")])
+                     InlineKeyboardButton(style="primary", text="🔄 Обновить", callback_data=f"agview:{key}:{page}")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -2449,7 +2451,7 @@ async def agent_ask_action(callback: types.CallbackQuery):
         operation = f"+{qty}" if kind == "g" else "−1"
         type_name = "FRP" if which == "f" else "похвалы"
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"✅ Подтвердить {operation}", callback_data=f"agdo:{token}")],
+            [InlineKeyboardButton(style="success", text=f"✅ Подтвердить {operation}", callback_data=f"agdo:{token}")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{key}:{page}")]
         ])
         await callback.message.edit_text(
@@ -2526,7 +2528,7 @@ async def agent_delete_prompt(callback: types.CallbackQuery):
             await callback.answer("Баланс не равен нулю. Удаление запрещено.", show_alert=True)
             return
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑️ Да, удалить", callback_data=f"agdeleteok:{key}:{page}")],
+            [InlineKeyboardButton(style="danger", text="🗑️ Да, удалить", callback_data=f"agdeleteok:{key}:{page}")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{key}:{page}")]
         ])
         await callback.message.edit_text(
@@ -2634,7 +2636,7 @@ def render_queue(rows: List[Dict[str, Any]]):
         rank_text = f" [{rank}]" if rank else ""
         text += (f"{i}. <b>{html.escape(nick)}</b>{html.escape(rank_text)} — <b>{qty} шт.</b>\n"
                  f"Команда: <code>/fractionrp {html.escape(nick)}</code>\n\n")
-        buttons.append([InlineKeyboardButton(text=f"✓ Выдать 1 для {nick}", callback_data=f"issue_1_{nick}")])
+        buttons.append([InlineKeyboardButton(style="success", text=f"✓ Выдать 1 для {nick}", callback_data=f"issue_1_{nick}")])
     if len(pending) > 15:
         text += f"…Ещё {len(pending) - 15} игроков.\n"
     text += "<i>Список обновляется после каждого списания.</i>"
