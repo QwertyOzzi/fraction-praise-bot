@@ -14,7 +14,8 @@ from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile
-from telegram_design import send_fbi_card, edit_fbi_card, hide_old_reply_keyboard
+from telegram_design import (send_fbi_card, edit_fbi_card,
+                             hide_old_reply_keyboard, with_home_button)
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -29,6 +30,10 @@ from aiogram.types import (
     WebAppInfo,
     InputMediaPhoto,
     InputMediaVideo,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
+    MenuButtonCommands,
 )
 
 # Load environment variables
@@ -769,6 +774,73 @@ def home_card_text(profile: Dict[str, Any], user_id: int) -> str:
     )
 
 
+# These labels appear in the native Telegram "Меню" button beside chat input.
+# Universal commands are shown to everyone. Leadership commands are scoped to
+# users with current owner-approved Telegram ACL; display does not grant access.
+PUBLIC_BOT_COMMANDS = [
+    BotCommand(command="start", description="Открыть личный кабинет"),
+    BotCommand(command="menu", description="Показать главное меню внизу чата"),
+    BotCommand(command="report", description="Подать отчёт FRP / похвала"),
+    BotCommand(command="status", description="Мои FRP и похвалы"),
+    BotCommand(command="nick", description="Изменить игровой ник"),
+    BotCommand(command="support", description="Поддержка и баг-репорт"),
+    BotCommand(command="help", description="Помощь и разделы бота"),
+    BotCommand(command="cancel", description="Отменить текущее действие"),
+]
+ADMIN_BOT_COMMANDS = [
+    BotCommand(command="agents", description="Управление агентами"),
+    BotCommand(command="pending", description="Ожидающие заявки"),
+    BotCommand(command="queue", description="Очередь на выдачу"),
+    BotCommand(command="grant", description="Начислить FRP / похвалы"),
+    BotCommand(command="admins", description="Список руководства"),
+]
+OWNER_BOT_COMMANDS = [
+    BotCommand(command="security", description="Проверить права доступа"),
+    BotCommand(command="notifications", description="Уведомления руководства"),
+]
+
+
+def commands_for_user(user_id: int) -> List[BotCommand]:
+    commands = list(PUBLIC_BOT_COMMANDS)
+    if is_admin(user_id):
+        commands.extend(ADMIN_BOT_COMMANDS)
+    if is_owner(user_id):
+        commands.extend(OWNER_BOT_COMMANDS)
+    return commands
+
+
+async def sync_user_command_scope(user_id: int) -> None:
+    """Reflect confirmed role changes in Telegram's native slash menu.
+
+    ACL checks remain in handlers. Removing a user drops their custom menu.
+    """
+    if type(user_id) is not int or user_id <= 0:
+        return
+    try:
+        scope = BotCommandScopeChat(chat_id=user_id)
+        if is_admin(user_id):
+            await bot.set_my_commands(commands_for_user(user_id), scope=scope)
+        else:
+            await bot.delete_my_commands(scope=scope)
+    except Exception as exc:
+        logger.warning("Telegram command scope update failed: %s", type(exc).__name__)
+
+
+async def register_native_command_menu() -> None:
+    """Set the persistent Telegram Menu control for the bot."""
+    try:
+        await bot.set_my_commands(PUBLIC_BOT_COMMANDS,
+                                  scope=BotCommandScopeDefault())
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as exc:
+        logger.warning("Could not register the Telegram native menu: %s",
+                       type(exc).__name__)
+    # Admin permissions have already been hydrated from Firebase at this point.
+    known = OWNER_TELEGRAM_IDS | (set(admins_db) if _cloud_state_hydrated else set())
+    for uid in sorted(uid for uid in known if type(uid) is int and uid > 0):
+        await sync_user_command_scope(uid)
+
+
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  AIOGRAM DISPATCHER                                              ║
 # ╚══════════════════════════════════════════════════════════════════╝
@@ -867,6 +939,43 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
                          reply_markup=get_main_menu(message.from_user.id))
 
 
+@dp.message(Command("menu", "help"))
+async def cmd_menu(message: types.Message, state: FSMContext):
+    """Always send a fresh menu at the bottom, irrespective of current FSM state."""
+    if getattr(message.chat, "type", "") != "private":
+        await message.answer("Откройте бота в личном чате.")
+        return
+    await state.clear()
+    user_id = message.from_user.id
+    profile = users_db.get(str(user_id))
+    if not isinstance(profile, dict) or not profile.get("nick"):
+        await cmd_start(message, state)
+        return
+    await sync_user_command_scope(user_id)
+    await send_fbi_card(
+        message, home_card_text(profile, user_id),
+        reply_markup=get_main_menu(user_id), lea=True
+    )
+
+
+@dp.message(Command("report", "status", "nick", "support"))
+async def cmd_quick_navigation(message: types.Message, state: FSMContext):
+    """Run public commands even when a registration/report state is active."""
+    if getattr(message.chat, "type", "") != "private":
+        await message.answer("Используйте команды в личном чате с ботом.")
+        return
+    command = (message.text or "").split(maxsplit=1)[0].split("@", 1)[0].lstrip("/")
+    await state.clear()
+    if command == "report":
+        await start_report(message, state)
+    elif command == "status":
+        await cmd_my_status(message)
+    elif command == "nick":
+        await cmd_change_nick(message, state)
+    elif command == "support":
+        await cmd_support(message, state)
+
+
 @dp.message(Command("notifications"))
 async def cmd_owner_notifications(message: types.Message):
     """Owner-only private /notifications on|off; mirrored by the site toggle."""
@@ -910,6 +1019,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
     await hide_old_reply_keyboard(message)
+    await sync_user_command_scope(message.from_user.id)
     if isinstance(user_data, dict) and user_data.get("nick"):
         new_username = message.from_user.username or ""
         if user_data.get("telegram_username", "") != new_username:
@@ -982,6 +1092,19 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     if action in MAIN_MENU_ADMIN_ACTIONS and not is_admin(uid):
         await callback.answer("Доступно только руководству.", show_alert=True)
+        return
+
+    if action == "open":
+        profile = users_db.get(str(uid), {})
+        if not isinstance(profile, dict) or not profile.get("nick"):
+            await callback.answer("Для начала регистрации используйте /start.", show_alert=True)
+            return
+        await state.clear()
+        await send_fbi_card(
+            callback.message, home_card_text(profile, uid),
+            reply_markup=get_main_menu(uid), lea=True
+        )
+        await callback.answer()
         return
 
     if action == "home":
@@ -3175,6 +3298,7 @@ async def main():
         except Exception as exc:
             logger.warning(f"Could not clean up accidental duplicate: {exc}")
 
+    await register_native_command_menu()
     logger.info("Bot polling starting...")
     await dp.start_polling(bot)
 
