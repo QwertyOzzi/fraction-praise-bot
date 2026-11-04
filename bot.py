@@ -1181,9 +1181,9 @@ async def show_report_reason_menu(message: types.Message, state: FSMContext, edi
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     if edit:
-        await message.edit_text("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb)
+        await message.edit_text("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
     else:
-        await message.answer("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb)
+        await message.answer("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(ReportStates.waiting_for_reason)
 
 
@@ -1201,7 +1201,8 @@ async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
     ])
     await callback.message.edit_text(
         f"{icon} <b>Новый отчёт · Количество</b>\n━━━━━━━━━━━━━━\n\n" f"Сколько {label} указать в заявке?\n<i>Допустимо от 1 до 20.</i>",
-        reply_markup=kb
+        reply_markup=kb,
+        parse_mode="HTML"
     )
     await state.set_state(ReportStates.waiting_for_quantity)
 
