@@ -53,6 +53,34 @@ class TestFastParser(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(looks_like_operation("норто,гоммез фрп −3"))
         self.assertFalse(looks_like_operation("Добрый день!"))
 
+    async def test_repeated_spoken_command_needs_no_gemini(self):
+        calls = []
+        async def unused_api(*args):
+            calls.append(args)
+            raise AssertionError("Common spoken commands should parse locally")
+        plan, origin = await interpret("дай гоммезу 2 похвалы", "", unused_api)
+        self.assertEqual(origin, "local")
+        self.assertEqual(calls, [])
+        self.assertEqual(plan["action"], "credit")
+        self.assertEqual(plan["sheet"], "praise")
+        self.assertEqual(plan["amount"], 2)
+        self.assertEqual(plan["names"], ["гоммезу"])
+
+    async def test_spoken_plural_and_number_word_parse_locally(self):
+        async def unused_api(*args):
+            raise AssertionError("No Gemini call expected")
+        plan, origin = await interpret(
+            "сними у нортона и гоммеза три фрп", "", unused_api
+        )
+        self.assertEqual(origin, "local")
+        self.assertEqual(plan, {
+            "action": "debit", "sheet": "fractionrp", "amount": 3,
+            "names": ["нортона", "гоммеза"]
+        })
+
+    def test_spoken_command_does_not_change_rank(self):
+        self.assertFalse(looks_like_operation("повысь нортона на ранг 8"))
+
     def test_praise_and_plus(self):
         output = simple_parse("Gomez_Addams +5 похвалы")
         self.assertEqual(output["action"], "credit")
@@ -127,6 +155,12 @@ class TestNickResolver(unittest.TestCase):
             {"id": "b", "nick": "Gomez_Addams", "rank": "8",
              "profileId": "bind2", "qty": 4},
         ]
+
+    def test_russian_declensions_are_found_without_api(self):
+        matched, errors = resolve_names(["нортона", "гоммезу"], self.rows)
+        self.assertEqual(errors, [])
+        self.assertEqual([row["nick"] for row in matched],
+                         ["Samuel_Norton", "Gomez_Addams"])
 
     def test_russian_prefix_and_typo(self):
         matched, errors = resolve_names(["норто", "гоммез"], self.rows)
