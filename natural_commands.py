@@ -34,7 +34,7 @@ def simplified(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", transliterate(value))
 
 
-_KIND_PATTERN = r"(?:фрп|frp|отметк[иауы]?|похвал[аы]?|praise)"
+_KIND_PATTERN = r"(?:фрп|frp|отметк[иауы]?|отметок|похвал(?:а|у|ы|е|ой|ою|ами|ам|ах)?|praise)"
 # Two equally safe syntaxes: "ники -3 фрп" and "ники фрп -3".
 _SIMPLE_PATTERNS = (
     re.compile(
