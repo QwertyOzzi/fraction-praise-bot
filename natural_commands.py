@@ -98,6 +98,54 @@ def simple_parse(text: str) -> dict[str, Any] | None:
 
 
 
+# Frequent Russian-language phrases can also be parsed offline. Unknown grammar
+# still falls back to Gemini, but learned nicknames do not require another API call.
+_NATURAL_VERB = (
+    r"дай|дайте|выдай|выдайте|начисли|начислите|добавь|добавьте|"
+    r"прибавь|прибавьте|сними|снимите|спиши|спишите|вычти|"
+    r"вычтите|отними|отнимите|убери|уберите"
+)
+_DEBIT_VERBS = {
+    "сними", "снимите", "спиши", "спишите", "вычти", "вычтите",
+    "отними", "отнимите", "убери", "уберите"
+}
+_COUNT_WORDS = {
+    "один": 1, "одна": 1, "одну": 1, "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7,
+    "восемь": 8, "девять": 9, "десять": 10, "одиннадцать": 11,
+    "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
+    "пятнадцать": 15, "шестнадцать": 16, "семнадцать": 17,
+    "восемнадцать": 18, "девятнадцать": 19, "двадцать": 20
+}
+_AMOUNT_WORD_RE = "|".join(sorted(_COUNT_WORDS, key=len, reverse=True))
+_NATURAL_PATTERN = re.compile(
+    rf"^\s*(?P<verb>{_NATURAL_VERB})\s+(?:у\s+)?"
+    rf"(?P<names>[\w\s,;.\-]{{3,230}}?)\s+"
+    rf"(?:по\s+)?(?P<amount>\d{{1,2}}|{_AMOUNT_WORD_RE})\s+"
+    rf"(?P<kind>{_KIND_PATTERN})\s*[.!]*\s*$",
+    re.I
+)
+
+
+def natural_phrase_parse(text: str) -> dict[str, Any] | None:
+    match = _NATURAL_PATTERN.fullmatch(text)
+    if not match:
+        return None
+    raw_names = match["names"].strip()
+    # A short conjunction may separate two people; punctuation is also valid.
+    names = [name.strip() for name in re.split(r"[,;]|\s+и\s+", raw_names, flags=re.I)
+             if name.strip()]
+    amount_text = match["amount"].casefold()
+    amount = int(amount_text) if amount_text.isdecimal() else _COUNT_WORDS[amount_text]
+    kind = match["kind"].casefold()
+    return validate_plan({
+        "action": "debit" if match["verb"].casefold() in _DEBIT_VERBS else "credit",
+        "sheet": "praise" if kind.startswith(("похвал", "praise")) else "fractionrp",
+        "amount": amount,
+        "names": names,
+    })
+
+
 def validate_plan(obj: Any, *, original: str | None = None) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise ParseError("Не удалось распознать команду.")
@@ -140,7 +188,7 @@ async def interpret(text: str, api_key: str, request):
     """
     if not text or not 3 <= len(text) <= MAX_TEXT:
         raise ParseError("Команда слишком длинная или пустая (максимум 400 символов).")
-    result = simple_parse(text)
+    result = simple_parse(text) or natural_phrase_parse(text)
     if result:
         return result, "local"
     if not api_key:
