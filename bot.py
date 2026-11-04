@@ -1166,8 +1166,8 @@ async def start_report(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     await message.answer(
-        f"👤 Подача отчета от агента: <code>{html.escape(user_data['nick'])}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n\n"
-        "Выберите тип выдачи:",
+        f"📝 <b>FBI · Новый отчёт</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
+        "Выберите категорию начисления:",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -1181,9 +1181,9 @@ async def show_report_reason_menu(message: types.Message, state: FSMContext, edi
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     if edit:
-        await message.edit_text("Выберите причину / категорию выдачи:", reply_markup=kb)
+        await message.edit_text("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb)
     else:
-        await message.answer("Выберите причину / категорию выдачи:", reply_markup=kb)
+        await message.answer("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb)
     await state.set_state(ReportStates.waiting_for_reason)
 
 
@@ -1200,7 +1200,7 @@ async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     await callback.message.edit_text(
-        f"{icon} Сколько {label} указать в заявке? Выберите число от 1 до 20:",
+        f"{icon} <b>Новый отчёт · Количество</b>\n━━━━━━━━━━━━━━\n\n" f"Сколько {label} указать в заявке?\n<i>Допустимо от 1 до 20.</i>",
         reply_markup=kb
     )
     await state.set_state(ReportStates.waiting_for_quantity)
@@ -1241,7 +1241,7 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
     await state.update_data(reason=reason)
 
     await callback.message.edit_text(
-        "📎 Отправьте доказательства: <b>ссылку на форум, фотографию или видео прямо в этот чат</b>.\n\n"
+        "📎 <b>Новый отчёт · Доказательства</b>\n━━━━━━━━━━━━━━\n\n" "Отправьте <b>ссылку на форум, фото или видео</b> прямо сюда.\n\n"
         "<i>Можно добавить подпись к фото/видео. Один отчёт = одно вложение.</i>",
         parse_mode="HTML"
     )
@@ -1280,12 +1280,12 @@ async def process_report_proof(message: types.Message, state: FSMContext):
 
     evidence_label = ("📸 Фото" if media_type == "photo" else "🎥 Видео") if media_type else "🔗 Ссылка"
     text = (
-        "📋 <b>Проверьте данные вашего отчета:</b>\n\n"
+        "📋 <b>FBI · Проверка отчёта</b>\n━━━━━━━━━━━━━━\n\n"
         f"• <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
         f"• <b>Тип:</b> {rep_type_label} (+{data.get('quantity', 1)})\n"
         f"• <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
         f"• <b>Доказательства:</b> {evidence_label}: {html.escape(proof)}\n\n"
-        "Отправить отчет на проверку руководству?"
+        "<i>Проверьте данные перед отправкой.</i>\n\nОтправить отчёт руководству?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(style="success", text="✅ Отправить руководству", callback_data="send_report_confirm")],
@@ -1318,13 +1318,13 @@ def pending_report_keyboard(req_id: str, req: Dict[str, Any]) -> InlineKeyboardM
 def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
     qty = int(req.get("quantity", 1))
     return (
-        f"📨 <b>Заявка #{html.escape(req_id)} ожидает решения</b>\n\n"
+        f"📨 <b>FBI · Заявка #{html.escape(req_id)}</b>\n━━━━━━━━━━━━━━\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
         f"👤 <b>Агент:</b> <code>{html.escape(str(req.get('nick') or ''))}</code> "
         f"[{html.escape(str(req.get('rank') or '?'))}]\n"
         f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
         f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
         f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
-        + "Измените количество кнопками ➖/➕, затем одобрите или отклоните заявку."
+        + "<i>Измените количество кнопками ➖/➕ и выберите решение.</i>"
     )
 
 
@@ -1433,7 +1433,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     notify_state_changed()
 
     await callback.message.edit_text(
-        f"✅ <b>Отчет #{req_id} успешно отправлен руководству!</b>\n\n"
+        f"✅ <b>FBI · Отчёт #{req_id} отправлен</b>\n━━━━━━━━━━━━━━\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
         "Как только лидер или заместитель проверит его, вам придет уведомление.",
         parse_mode="HTML"
     )
@@ -1497,7 +1497,8 @@ async def approve_report(callback: types.CallbackQuery):
     )
     try:
         await bot.send_message(int(req["user_id"]),
-                               f"✅ Отчет #{req_id} одобрен. Начислено +{quantity} балл(ов).")
+                               f"✅ <b>FBI · Отчёт одобрен</b>\n━━━━━━━━━━━━━━\n\n" f"Заявка: <code>#{html.escape(req_id)}</code>\n" f"Начислено: <b>+{quantity}</b>\n\n<i>Баланс обновлён руководством.</i>",
+                               parse_mode="HTML")
     except Exception as exc:
         logger.warning(f"Could not notify reporter: {exc}")
 
@@ -1526,7 +1527,7 @@ async def reject_report(callback: types.CallbackQuery):
     try:
         await bot.send_message(
             int(req["user_id"]),
-            f"❌ <b>Ваш отчет #{req_id} на /{req['rep_type']} был отклонен руководством.</b>\n"
+            f"❌ <b>FBI · Отчёт #{html.escape(req_id)} отклонён</b>\n━━━━━━━━━━━━━━\n\n" f"Категория: /{html.escape(str(req['rep_type']))}\n"
             "Проверьте правильность ссылок или обратитесь к лидеру.",
             parse_mode="HTML"
         )
