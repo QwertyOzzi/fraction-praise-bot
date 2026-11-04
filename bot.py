@@ -8,7 +8,7 @@ import hashlib
 import hmac
 import re
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
@@ -740,7 +740,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
     """Compact inline navigation. Sensitive actions still check access server-side."""
     profile = users_db.get(str(user_id), {})
     claim_status = profile.get("verification_status") if isinstance(profile, dict) else ""
-    if claim_status in ("pending", "needs_proof", "proof_submitted", "disconnected"):
+    if claim_status in ("pending", "needs_proof", "proof_submitted", "disconnected", "retry_ready", "cooldown"):
         buttons = [
             [InlineKeyboardButton(text="🕒 Проверка профиля", callback_data="main:claim_status")],
             [InlineKeyboardButton(text="⚙️ Указать другой ник", callback_data="main:nick")],
@@ -760,7 +760,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📝 Подать отчёт", callback_data="main:report", style="primary"),
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
-             InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
+             InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
+            [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
             [InlineKeyboardButton(text="🌐 Таблица", web_app=WebAppInfo(url=WEBAPP_URL))],
         ]
         if is_admin(user_id):
@@ -779,6 +780,10 @@ def pending_claim_card_text(profile: Dict[str, Any]) -> str:
         note = "Доказательства получены. Ожидайте решения руководства."
     elif status == "disconnected":
         note = "Этот ник переназначен по решению руководства. Вы можете указать другой."
+    elif status == "retry_ready":
+        note = "Ограничение закончилось. Можно повторно указать ник и ранг."
+    elif status == "cooldown":
+        note = "Временное ограничение после отказа руководства."
     else:
         note = "Вы вошли в бот. Ник ожидает проверки руководством."
     previous_nick = html.escape(str(profile.get("nick") or ""))
@@ -815,6 +820,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="report", description="Подать отчёт FRP / похвала"),
     BotCommand(command="status", description="Мои FRP и похвалы"),
     BotCommand(command="nick", description="Изменить игровой ник"),
+    BotCommand(command="rank", description="Запросить смену ранга"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
@@ -881,19 +887,73 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+CLAIM_COOLDOWN_SECONDS = 5 * 60
+
+
+def claim_cooldown_remaining(profile: Dict[str, Any]) -> int:
+    """Remaining cooldown seconds; historical permanent blocks are retryable."""
+    timestamp = profile.get("cooldown_until")
+    if not isinstance(timestamp, str) or not timestamp:
+        return 0
+    try:
+        until = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if until.tzinfo is None:
+            return 0
+        return max(0, int((until - datetime.now(timezone.utc)).total_seconds() + 0.999))
+    except ValueError:
+        return 0
+
+
+async def finish_expired_claim_cooldown(user_id: str) -> bool:
+    """Release only the rejected claim, not any verified admin permissions."""
+    async with _claim_action_locks.setdefault(user_id, asyncio.Lock()):
+        profile = users_db.get(user_id)
+        if not isinstance(profile, dict):
+            return True
+        if profile.get("verification_status") not in ("disabled", "cooldown"):
+            return True
+        if claim_cooldown_remaining(profile):
+            return False
+        previous = dict(profile)
+        updated = dict(profile)
+        updated["verification_status"] = "retry_ready"
+        updated.pop("cooldown_until", None)
+        updated.pop("claim_id", None)
+        for key in ("proof_submitted", "proof_kind", "proof_file_id",
+                    "proof_link", "proof_caption"):
+            updated.pop(key, None)
+        users_db[user_id] = updated
+        if not await sync_state_to_cloud():
+            users_db[user_id] = previous
+            return False
+        save_json(USERS_FILE, users_db)
+        return True
+
+
 class DisabledClaimMiddleware(BaseMiddleware):
-    """Telegram cannot ban someone from writing, but we can reject every action."""
+    """Allow a new attempt after five minutes; old disabled users recover too."""
     async def __call__(self, handler, event, data):
         sender = getattr(event, "from_user", None)
         profile = users_db.get(str(sender.id)) if sender else None
-        if isinstance(profile, dict) and profile.get("verification_status") == "disabled":
+        if isinstance(profile, dict) and (
+                profile.get("verification_status") == "disabled"
+                or profile.get("verification_status") == "cooldown"):
+            remaining = claim_cooldown_remaining(profile)
+            if remaining > 0:
+                minutes, seconds = divmod(remaining, 60)
+                text = (f"⏳ Заявка отклонена. Повторно попробовать можно через "
+                        f"{minutes}:{seconds:02d}.")
+            elif await finish_expired_claim_cooldown(str(sender.id)):
+                return await handler(event, data)
+            else:
+                text = "⚠️ Не удалось сохранить окончание блокировки. Повторите позже."
             try:
                 if isinstance(event, types.CallbackQuery):
-                    await event.answer("⛔ Доступ отключён руководством.", show_alert=True)
+                    await event.answer(text, show_alert=True)
                 else:
-                    await event.answer("⛔ Доступ к боту отключён руководством.")
+                    await event.answer(text)
             except Exception as exc:
-                logger.info("Could not inform disconnected user: %s", type(exc).__name__)
+                logger.info("Could not notify cooldown status: %s", type(exc).__name__)
             return None
         return await handler(event, data)
 
@@ -1326,7 +1386,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if (isinstance(user_data, dict)
             and user_data.get("verification_status") in
-            ("pending", "needs_proof", "proof_submitted", "disconnected")):
+            ("pending", "needs_proof", "proof_submitted", "disconnected", "retry_ready", "cooldown")):
         await send_fbi_card(
             message, pending_claim_card_text(user_data),
             reply_markup=get_main_menu(message.from_user.id)
@@ -2204,7 +2264,7 @@ async def approve_report(callback: types.CallbackQuery):
             or str(holder.get("nick") or "").casefold()
                != str(req.get("nick") or "").casefold()
             or holder.get("verification_status") in
-               ("pending", "needs_proof", "proof_submitted", "disabled", "disconnected")):
+               ("pending", "needs_proof", "proof_submitted", "disabled", "disconnected", "retry_ready", "cooldown")):
         await callback.answer(
             "Ник заявителя больше не подтверждён. Заявку нельзя начислять.",
             show_alert=True
