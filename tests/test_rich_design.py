@@ -81,7 +81,7 @@ class TestInlineMenu(unittest.TestCase):
         menu = self.env["get_main_menu"](20)
         codes = [button.callback_data for row in menu.inline_keyboard
                  for button in row if getattr(button, "callback_data", None)]
-        self.assertEqual(codes, ["main:report", "main:status", "main:nick", "main:support"])
+        self.assertEqual(codes, ["main:report", "main:status", "main:nick", "main:rank", "main:support"])
         self.assertFalse(any("admin" in code for code in codes))
 
     def test_admin_gets_separate_panel(self):
