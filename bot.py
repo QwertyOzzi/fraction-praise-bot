@@ -14,6 +14,7 @@ from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile
+from telegram_design import send_fbi_card, edit_fbi_card
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -872,10 +873,10 @@ async def cmd_owner_notifications(message: types.Message):
 @dp.message(Command("version"))
 async def cmd_version(message: types.Message):
     commit = os.getenv("RENDER_GIT_COMMIT", "").strip()
-    version_text = f"🛡️ <b>FBI · Версия системы</b>\n━━━━━━━━━━━━━━\n\n<code>{html.escape(RELEASE_TAG)}</code>"
+    version_text = f"🛡️ <b>FBI · Версия системы</b>\n\n<code>{html.escape(RELEASE_TAG)}</code>"
     if commit:
         version_text += f"\nСборка: <code>{html.escape(commit[:12])}</code>"
-    await message.answer(version_text, parse_mode="HTML")
+    await send_fbi_card(message, version_text)
 
 
 @dp.message(CommandStart())
@@ -894,21 +895,21 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 logger.warning("Could not confirm Telegram username update in Firebase")
 
     if not user_data or not user_data.get("nick"):
-        await message.answer(
-            "🛡️ <b>FBI · СИСТЕМА УЧЁТА</b>\n━━━━━━━━━━━━━━\n\n"
-            "Добро пожаловать в систему FRP и похвал Arizona RP.\n\n" "👤 <b>Шаг 1 из 2 · Регистрация</b>\n" "Введите игровой ник в формате <code>Имя_Фамилия</code>.\n" "<i>Пример: Samuel_Norton</i>",
-            parse_mode="HTML"
+        await send_fbi_card(
+            message,
+            "🛡️ <b>FBI · СИСТЕМА УЧЁТА</b>\n\n"
+            "Добро пожаловать в систему FRP и похвал Arizona RP.\n\n" "👤 <b>Шаг 1 из 2 · Регистрация</b>\n" "Введите игровой ник в формате <code>Имя_Фамилия</code>.\n" "<i>Пример: Samuel_Norton</i>"
         )
         await state.set_state(RegistrationStates.waiting_for_nick)
     else:
         nick_esc = html.escape(user_data['nick'])
         rank_esc = html.escape(str(user_data.get('rank', '?')))
-        await message.answer(
-            f"🛡️ <b>FBI · Личный кабинет</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <b>Агент:</b> <code>{nick_esc}</code>\n" f"🎖️ <b>Ранг:</b> {rank_esc}\n" f"🔐 <b>Доступ:</b> {html.escape(role_name(message.from_user.id))}\n\n"
-            "Выберите действие на клавиатуре ниже.\n\n" "<i>↗ <a href=\"https://lea-script.space/\">ЛЕА · помощник ФБР</a></i>",
+        await send_fbi_card(
+            message,
+            f"🛡️ <b>FBI · Личный кабинет</b>\n\n" f"👤 <b>Агент:</b> <code>{nick_esc}</code>\n" f"🎖️ <b>Ранг:</b> {rank_esc}\n" f"🔐 <b>Доступ:</b> {html.escape(role_name(message.from_user.id))}\n\n"
+            "Выберите действие на клавиатуре ниже.",
             reply_markup=get_main_menu(message.from_user.id),
-            parse_mode="HTML",
-            disable_web_page_preview=True
+            lea=True
         )
         # Bot registrations live in config/bot_state; the two visible tables
         # are independent. A website row deletion is NOT a profile deletion.
@@ -1008,7 +1009,7 @@ async def process_nick(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="6 ранг", callback_data="rank_6"), InlineKeyboardButton(text="5 ранг", callback_data="rank_5")],
         [InlineKeyboardButton(text="4 ранг", callback_data="rank_4"), InlineKeyboardButton(text="1-3 ранг", callback_data="rank_1")]
     ])
-    await message.answer(f"👤 <b>Регистрация · Шаг 2 из 2</b>\n━━━━━━━━━━━━━━\n\n" f"Ник: <code>{html.escape(nick)}</code>\n\n" "🎖️ Выберите ваш текущий ранг:", reply_markup=kb, parse_mode="HTML")
+    await message.answer(f"👤 <b>Регистрация · Шаг 2 из 2</b>\n\n" f"Ник: <code>{html.escape(nick)}</code>\n\n" "🎖️ Выберите ваш текущий ранг:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_rank)
 
 @dp.callback_query(RegistrationStates.waiting_for_rank, F.data.startswith("rank_"))
@@ -1050,7 +1051,7 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
         else "\n\n📊 Ник добавлен в обе таблицы (баланс 0, если записи ещё не было)."
     )
     await callback.message.edit_text(
-        f"✅ <b>Профиль и таблицы синхронизированы!</b>\n━━━━━━━━━━━━━━\n\n"
+        f"✅ <b>Профиль и таблицы синхронизированы!</b>\n\n"
         f"👤 <b>Ник:</b> <code>{html.escape(nick)}</code>\n"
         f"🎖️ <b>Ранг:</b> {html.escape(rank)}" + note,
         parse_mode="HTML"
@@ -1074,11 +1075,11 @@ async def cmd_change_nick(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_nick_change")]
     ])
-    await message.answer(
-        f"⚙️ <b>FBI · Настройки профиля</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <b>Ник:</b> <code>{html.escape(current_nick)}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(current_rank))}\n\n"
+    await send_fbi_card(
+        message,
+        f"⚙️ <b>FBI · Настройки профиля</b>\n\n" f"👤 <b>Ник:</b> <code>{html.escape(current_nick)}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(current_rank))}\n\n"
         "Если хотите изменить ник, напишите новый (в формате <code>Имя_Фамилия</code>):",
-        reply_markup=kb,
-        parse_mode="HTML"
+        reply_markup=kb
     )
     await state.set_state(RegistrationStates.waiting_for_nick)
 
@@ -1129,7 +1130,7 @@ async def cmd_my_status(message: types.Message):
     praise_status_esc = html.escape(str(praise_status))
 
     text = (
-        f"📊 <b>FBI · Карточка агента</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <code>{nick_esc}</code> · ранг <b>{rank_esc}</b>\n\n"
+        f"📊 <b>FBI · Карточка агента</b>\n\n" f"👤 <code>{nick_esc}</code> · ранг <b>{rank_esc}</b>\n\n"
         f"🎖️ <b>/fractionrp (Отметки):</b>\n"
         f"• Количество: <b>{frp_qty}</b> шт.\n"
         f"• Статус: <b>{frp_status_esc}</b>\n\n"
@@ -1143,11 +1144,11 @@ async def cmd_my_status(message: types.Message):
             "\n\nℹ️ «Нет записи» означает отсутствие строки с этим ником в соответствующей "
             "таблице. Регистрация в боте хранится отдельно; удаление на сайте её не отменяет."
         )
-    text += "\n\n<i>↗ <a href=\"https://lea-script.space/\">ЛЕА · помощник ФБР</a></i>"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(style="primary", text="🌐 Открыть сайт таблицы", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await send_fbi_card(message, text, reply_markup=kb, lea=True)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  ПОДАЧА ОТЧЕТА НА ВЫДАЧУ                                         ║
@@ -1165,11 +1166,11 @@ async def start_report(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(style="primary", text="🌟 /praise (Похвала)", callback_data="type_praise")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
-    await message.answer(
-        f"📝 <b>FBI · Новый отчёт</b>\n━━━━━━━━━━━━━━\n\n" f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
+    await send_fbi_card(
+        message,
+        f"📝 <b>FBI · Новый отчёт</b>\n\n" f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
         "Выберите категорию начисления:",
-        reply_markup=kb,
-        parse_mode="HTML"
+        reply_markup=kb
     )
     await state.set_state(ReportStates.waiting_for_type)
 
@@ -1181,9 +1182,9 @@ async def show_report_reason_menu(message: types.Message, state: FSMContext, edi
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     if edit:
-        await message.edit_text("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
+        await message.edit_text("📑 <b>Новый отчёт · Причина</b>\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
     else:
-        await message.answer("📑 <b>Новый отчёт · Причина</b>\n━━━━━━━━━━━━━━\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
+        await message.answer("📑 <b>Новый отчёт · Причина</b>\n\nВыберите категорию, за которую начисляются баллы:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(ReportStates.waiting_for_reason)
 
 
@@ -1200,7 +1201,7 @@ async def process_report_type(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
     ])
     await callback.message.edit_text(
-        f"{icon} <b>Новый отчёт · Количество</b>\n━━━━━━━━━━━━━━\n\n" f"Сколько {label} указать в заявке?\n<i>Допустимо от 1 до 20.</i>",
+        f"{icon} <b>Новый отчёт · Количество</b>\n\n" f"Сколько {label} указать в заявке?\n<i>Допустимо от 1 до 20.</i>",
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -1242,7 +1243,7 @@ async def process_report_reason(callback: types.CallbackQuery, state: FSMContext
     await state.update_data(reason=reason)
 
     await callback.message.edit_text(
-        "📎 <b>Новый отчёт · Доказательства</b>\n━━━━━━━━━━━━━━\n\n" "Отправьте <b>ссылку на форум, фото или видео</b> прямо сюда.\n\n"
+        "📎 <b>Новый отчёт · Доказательства</b>\n\n" "Отправьте <b>ссылку на форум, фото или видео</b> прямо сюда.\n\n"
         "<i>Можно добавить подпись к фото/видео. Один отчёт = одно вложение.</i>",
         parse_mode="HTML"
     )
@@ -1281,7 +1282,7 @@ async def process_report_proof(message: types.Message, state: FSMContext):
 
     evidence_label = ("📸 Фото" if media_type == "photo" else "🎥 Видео") if media_type else "🔗 Ссылка"
     text = (
-        "📋 <b>FBI · Проверка отчёта</b>\n━━━━━━━━━━━━━━\n\n"
+        "📋 <b>FBI · Проверка отчёта</b>\n\n"
         f"• <b>Агент:</b> <code>{html.escape(user_data.get('nick', ''))}</code> [{html.escape(str(user_data.get('rank', '?')))}]\n"
         f"• <b>Тип:</b> {rep_type_label} (+{data.get('quantity', 1)})\n"
         f"• <b>Причина:</b> {html.escape(data['reason'].capitalize())}\n"
@@ -1319,7 +1320,7 @@ def pending_report_keyboard(req_id: str, req: Dict[str, Any]) -> InlineKeyboardM
 def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
     qty = int(req.get("quantity", 1))
     return (
-        f"📨 <b>FBI · Заявка #{html.escape(req_id)}</b>\n━━━━━━━━━━━━━━\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
+        f"📨 <b>FBI · Заявка #{html.escape(req_id)}</b>\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
         f"👤 <b>Агент:</b> <code>{html.escape(str(req.get('nick') or ''))}</code> "
         f"[{html.escape(str(req.get('rank') or '?'))}]\n"
         f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
@@ -1434,7 +1435,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     notify_state_changed()
 
     await callback.message.edit_text(
-        f"✅ <b>FBI · Отчёт #{req_id} отправлен</b>\n━━━━━━━━━━━━━━\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
+        f"✅ <b>FBI · Отчёт #{req_id} отправлен</b>\n\n" "🕒 <b>Статус:</b> Ожидает проверки\n\n"
         "Как только лидер или заместитель проверит его, вам придет уведомление.",
         parse_mode="HTML"
     )
@@ -1498,7 +1499,7 @@ async def approve_report(callback: types.CallbackQuery):
     )
     try:
         await bot.send_message(int(req["user_id"]),
-                               f"✅ <b>FBI · Отчёт одобрен</b>\n━━━━━━━━━━━━━━\n\n" f"Заявка: <code>#{html.escape(req_id)}</code>\n" f"Начислено: <b>+{quantity}</b>\n\n<i>Баланс обновлён руководством.</i>",
+                               f"✅ <b>FBI · Отчёт одобрен</b>\n\n" f"Заявка: <code>#{html.escape(req_id)}</code>\n" f"Начислено: <b>+{quantity}</b>\n\n<i>Баланс обновлён руководством.</i>",
                                parse_mode="HTML")
     except Exception as exc:
         logger.warning(f"Could not notify reporter: {exc}")
@@ -1528,7 +1529,7 @@ async def reject_report(callback: types.CallbackQuery):
     try:
         await bot.send_message(
             int(req["user_id"]),
-            f"❌ <b>FBI · Отчёт #{html.escape(req_id)} отклонён</b>\n━━━━━━━━━━━━━━\n\n" f"Категория: /{html.escape(str(req['rep_type']))}\n"
+            f"❌ <b>FBI · Отчёт #{html.escape(req_id)} отклонён</b>\n\n" f"Категория: /{html.escape(str(req['rep_type']))}\n"
             "Проверьте правильность ссылок или обратитесь к лидеру.",
             parse_mode="HTML"
         )
@@ -1561,7 +1562,7 @@ async def cmd_security_overview(message: types.Message):
         members.append("• Никого, кроме владельца")
     state_label = "✅ Firebase загружена" if _cloud_state_hydrated else "⚠️ Firebase НЕ подтверждена"
     await message.answer(
-        f"🔐 <b>FBI · Безопасность</b>\n━━━━━━━━━━━━━━\n"
+        f"🔐 <b>FBI · Безопасность</b>\n"
         f"Версия: <code>{html.escape(RELEASE_TAG)}</code>\n"
         f"{state_label}\n"
         f"Владелец: <code>{next(iter(OWNER_TELEGRAM_IDS))}</code>\n"
@@ -1592,7 +1593,7 @@ async def cmd_recover_admins(message: types.Message):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="aclrestorecancel")]
     ])
     await message.answer(
-        "🔐 <b>FBI · Восстановление прав</b>\n━━━━━━━━━━━━━━\n\n" "<b>Найден архивный неподписанный список:</b>\n\n"
+        "🔐 <b>FBI · Восстановление прав</b>\n\n" "<b>Найден архивный неподписанный список:</b>\n\n"
         + "\n".join(lines) + "\n\nПроверьте каждого человека перед подтверждением.",
         reply_markup=kb, parse_mode="HTML"
     )
@@ -1953,7 +1954,7 @@ async def cmd_list_admins(message: types.Message):
     tech_nick = html.escape(LEADER_INFO.get("tech_nick", "Gopon"))
 
     text = (
-        f"👥 <b>FBI · Состав руководства</b>\n━━━━━━━━━━━━━━\n\n"
+        f"👥 <b>FBI · Состав руководства</b>\n\n"
         f"🛠️ <b>Главный Тех. Администратор:</b>\n"
         f"• <b>{tech_nick}</b> 👑 <i>(Создатель системы)</i>\n\n"
         f"👑 <b>Действующий Лидер фракции:</b>\n"
@@ -2124,7 +2125,7 @@ async def perform_manual_grant(message: types.Message, raw: str):
             results.append(f"⚠️ {html.escape(nick)}: проверьте баланс перед повтором")
 
     await message.answer(
-        f"📊 <b>FBI · Результаты начисления</b>\n━━━━━━━━━━━━━━\n\n" f"Категория: <code>/{sheet}</code> · агентов: <b>{len(nicks)}</b>\n\n"
+        f"📊 <b>FBI · Результаты начисления</b>\n\n" f"Категория: <code>/{sheet}</code> · агентов: <b>{len(nicks)}</b>\n\n"
         + "\n".join(results)
         + "\n\n<i>Если запись не подтверждена, сначала проверьте таблицу, "
           "чтобы избежать двойного начисления.</i>",
@@ -2144,7 +2145,7 @@ async def cmd_grant_menu(message: types.Message, state: FSMContext):
         return
     await state.set_state(GrantStates.waiting_for_details)
     await message.answer(
-        "➕ <b>FBI · Начисление баллов</b>\n━━━━━━━━━━━━━━\n\n" "Введите тип, ник и количество (1–20):\n"
+        "➕ <b>FBI · Начисление баллов</b>\n\n" "Введите тип, ник и количество (1–20):\n"
         "<code>frp Gomez_Addams 2</code>\n"
         "<code>praise Gomez_Addams 3</code>\n\n"
         "Или используйте /grant praise Gomez_Addams 3. Для отмены: /cancel.",
@@ -2265,7 +2266,7 @@ def agent_list_markup(agents: List[Dict[str, Any]], page: int):
     page_size = 8
     pages = max(1, (len(agents) + page_size - 1) // page_size)
     page = max(0, min(page, pages - 1))
-    text = f"🧑‍💼 <b>FBI · Реестр агентов</b>\n━━━━━━━━━━━━━━\n\n" f"Всего: <b>{len(agents)}</b> · страница <b>{page + 1}/{pages}</b>\n\n"
+    text = f"🧑‍💼 <b>FBI · Реестр агентов</b>\n\n" f"Всего: <b>{len(agents)}</b> · страница <b>{page + 1}/{pages}</b>\n\n"
     if agents:
         for agent in agents[page * page_size:(page + 1) * page_size]:
             text += (f"• <b>{html.escape(agent['nick'])}</b> [{html.escape(agent['rank'])}] "
@@ -2295,7 +2296,7 @@ def agent_list_markup(agents: List[Dict[str, Any]], page: int):
 def agent_detail_markup(agent: Dict[str, Any], page: int):
     key = agent_hash(agent["nick"])
     text = (
-        f"👤 <b>FBI · Карточка агента</b>\n━━━━━━━━━━━━━━\n\n" f"<b>{html.escape(agent['nick'])}</b> · ранг {html.escape(agent['rank'])}\n\n"
+        f"👤 <b>FBI · Карточка агента</b>\n\n" f"<b>{html.escape(agent['nick'])}</b> · ранг {html.escape(agent['rank'])}\n\n"
         f"🎖️ FRP: <b>{agent['frp']}</b> — {html.escape(agent['frp_status'])}\n"
         f"🌟 Похвалы: <b>{agent['praise']}</b> — {html.escape(agent['praise_status'])}\n\n"
         "<i>Выберите действие. Изменение баланса требует подтверждения.</i>"
@@ -2457,7 +2458,7 @@ async def agent_ask_action(callback: types.CallbackQuery):
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{key}:{page}")]
         ])
         await callback.message.edit_text(
-            f"⚠️ <b>FBI · Подтверждение операции</b>\n━━━━━━━━━━━━━━\n\n"
+            f"⚠️ <b>FBI · Подтверждение операции</b>\n\n"
             f"👤 {html.escape(agent['nick'])}\n"
             f"{type_name}: <b>{operation}</b>\n"
             "После подтверждения баланс изменится в Firebase.",
@@ -2534,7 +2535,7 @@ async def agent_delete_prompt(callback: types.CallbackQuery):
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{key}:{page}")]
         ])
         await callback.message.edit_text(
-            f"🗑️ <b>FBI · Удаление агента</b>\n━━━━━━━━━━━━━━\n\n" f"Удалить <b>{html.escape(agent['nick'])}</b> из бота и таблиц?\n"
+            f"🗑️ <b>FBI · Удаление агента</b>\n\n" f"Удалить <b>{html.escape(agent['nick'])}</b> из бота и таблиц?\n"
             "Доступно только для нулевых балансов.",
             reply_markup=kb, parse_mode="HTML"
         )
@@ -2629,7 +2630,7 @@ def render_queue(rows: List[Dict[str, Any]]):
     if not pending:
         return "🎉 Очередь пуста! Все FRP выданы.", None
 
-    text = f"📋 <b>FBI · Очередь на выдачу</b>\n━━━━━━━━━━━━━━\n\n" f"Категория: <code>/fractionrp</code> · ожидают: <b>{len(pending)}</b>\n\n"
+    text = f"📋 <b>FBI · Очередь на выдачу</b>\n\n" f"Категория: <code>/fractionrp</code> · ожидают: <b>{len(pending)}</b>\n\n"
     buttons = []
     for i, r in enumerate(pending[:15], 1):
         nick = str(r.get("nick", "Noname"))
@@ -2694,7 +2695,7 @@ async def cmd_support(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_support")]
     ])
     await message.answer(
-        "💬 <b>FBI · Центр поддержки</b>\n━━━━━━━━━━━━━━\n\n"
+        "💬 <b>FBI · Центр поддержки</b>\n\n"
         "Опишите найденный баг, ошибку или предложение следующим сообщением.\n"
         "<i>Можно отправить текст, фотографию или видео с подписью — руководство получит вложение в Telegram.</i>",
         reply_markup=kb,
@@ -2719,7 +2720,7 @@ async def process_support_msg(message: types.Message, state: FSMContext):
     content_text = (message.text or message.caption or "[Вложение без текста]")[:600]
 
     admin_msg = (
-        "🚨 <b>FBI · Новое обращение</b>\n━━━━━━━━━━━━━━\n\n"
+        "🚨 <b>FBI · Новое обращение</b>\n\n"
         f"👤 <b>От:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
         f"🆔 <b>Telegram ID:</b> <code>{uid}</code> {html.escape(username_str)}\n"
         f"📝 <b>Сообщение:</b>\n{html.escape(content_text)}"
@@ -2743,7 +2744,7 @@ async def process_support_msg(message: types.Message, state: FSMContext):
         logger.warning("Support ticket was forwarded to leadership but not stored in Firestore")
 
     admin_msg_with_id = (
-        f"🚨 <b>FBI · Обращение {ticket_label}</b>\n━━━━━━━━━━━━━━\n\n"
+        f"🚨 <b>FBI · Обращение {ticket_label}</b>\n\n"
         f"👤 <b>От:</b> <code>{html.escape(nick)}</code> [{html.escape(str(rank))}]\n"
         f"🆔 <b>Telegram ID:</b> <code>{uid}</code> {html.escape(username_str)}\n"
         f"📝 <b>Сообщение:</b>\n{html.escape(content_text)}\n\n"
