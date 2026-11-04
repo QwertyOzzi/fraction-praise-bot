@@ -1331,7 +1331,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("report", "status", "nick", "support"))
+@dp.message(Command("report", "status", "nick", "rank", "support"))
 async def cmd_quick_navigation(message: types.Message, state: FSMContext):
     """Run public commands even when a registration/report state is active."""
     if getattr(message.chat, "type", "") != "private":
@@ -1345,6 +1345,8 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await cmd_my_status(message)
     elif command == "nick":
         await cmd_change_nick(message, state)
+    elif command == "rank":
+        await cmd_change_rank(message, state)
     elif command == "support":
         await cmd_support(message, state)
 
@@ -1544,6 +1546,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         "report": (start_report, True),
         "status": (cmd_my_status, False),
         "nick": (cmd_change_nick, True),
+        "rank": (cmd_change_rank, True),
         "support": (cmd_support, True),
         "agents": (cmd_agent_panel, True),
         "queue": (cmd_queue, False),
@@ -1567,6 +1570,18 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     else:
         await handler(source)
 
+
+
+def rank_selection_keyboard() -> InlineKeyboardMarkup:
+    """Exact 1-10 rank choices, shared by registration and rank requests."""
+    ranks = [("10 (Лидер)", "X"), ("9 (Зам)", "9"), ("8", "8"), ("7", "7"),
+             ("6", "6"), ("5", "5"), ("4", "4"), ("3", "3"),
+             ("2", "2"), ("1", "1")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"rank_{value}")
+         for name, value in ranks[i:i + 2]]
+        for i in range(0, len(ranks), 2)
+    ])
 
 
 # Регистрация ника
@@ -1633,12 +1648,7 @@ async def process_nick(message: types.Message, state: FSMContext):
     nick = clean_nick
     await state.update_data(nick=nick)
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="10 (Лидер)", callback_data="rank_X"), InlineKeyboardButton(text="9 (Зам)", callback_data="rank_9")],
-        [InlineKeyboardButton(text="8 ранг", callback_data="rank_8"), InlineKeyboardButton(text="7 ранг", callback_data="rank_7")],
-        [InlineKeyboardButton(text="6 ранг", callback_data="rank_6"), InlineKeyboardButton(text="5 ранг", callback_data="rank_5")],
-        [InlineKeyboardButton(text="4 ранг", callback_data="rank_4"), InlineKeyboardButton(text="1-3 ранг", callback_data="rank_1")]
-    ])
+    kb = rank_selection_keyboard()
     await message.answer(f"👤 <b>Регистрация · Шаг 2 из 2</b>\n\n" f"Ник: <code>{html.escape(nick)}</code>\n\n" "🎖️ Выберите ваш текущий ранг:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_rank)
 
@@ -1672,11 +1682,12 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
         save_json(USERS_FILE, users_db)
         await state.clear()
         await callback.message.edit_text(
-            "✅ <b>Вход в бот разрешён</b>\n\n"
+            "✅ <b>Запрос на изменение профиля сохранён</b>\n\n"
             f"👤 Ник: <code>{html.escape(nick)}</code>\n"
+            f"🎖️ Запрошенный ранг: <b>{html.escape(rank)}</b>\n"
             "🕒 Статус: <b>проверка руководства</b>\n\n"
-            "Никакие чужие балансы и привязки не изменены. "
-            "Подать отчёт можно будет после подтверждения.",
+            "До подтверждения текущие ники, ранги и балансы не изменяются. "
+            "Отчёты доступны после решения руководства.",
             parse_mode="HTML"
         )
         await send_fbi_card(
@@ -1736,6 +1747,32 @@ async def cmd_change_nick(message: types.Message, state: FSMContext):
         reply_markup=kb
     )
     await state.set_state(RegistrationStates.waiting_for_nick)
+
+@dp.message(Command("rank"))
+async def cmd_change_rank(message: types.Message, state: FSMContext):
+    """User requests rank change; the rank is never applied before moderation."""
+    await state.clear()
+    profile = users_db.get(str(message.from_user.id), {})
+    if not isinstance(profile, dict) or not profile.get("nick"):
+        await message.answer("Сначала зарегистрируйте ник через /start.")
+        return
+    if profile.get("verification_status") in (
+            "pending", "needs_proof", "proof_submitted", "disconnected",
+            "retry_ready", "cooldown", "disabled"):
+        await message.answer("⏳ Сначала завершите проверку текущего профиля.")
+        return
+    await state.update_data(nick=str(profile["nick"]))
+    await state.set_state(RegistrationStates.waiting_for_rank)
+    await send_fbi_card(
+        message,
+        "🎖️ <b>FBI · Изменение ранга</b>\n\n"
+        f"👤 Ник: <code>{html.escape(str(profile['nick']))}</code>\n"
+        f"📌 Сейчас: <b>{html.escape(str(profile.get('rank') or '?'))}</b>\n\n"
+        "<b>Выберите новый ранг:</b>\n"
+        "<i>Изменение будет применено только после проверки руководством.</i>",
+        reply_markup=rank_selection_keyboard()
+    )
+
 
 @dp.callback_query(F.data == "cancel_nick_change")
 async def cancel_nick_change(callback: types.CallbackQuery, state: FSMContext):
