@@ -59,6 +59,11 @@ def simple_parse(text: str) -> dict[str, Any] | None:
     names = [n.strip() for n in re.split(r"[,;]", match["names"]) if n.strip()]
     if not names:
         return None
+    # A conversational sentence like "сними у Нортона -3 фрп"
+    # is not a list of nicknames: route it through Gemini instead.
+    if re.match(r"^(?:сним\w*|спиш\w*|вычт\w*|начисл\w*|добав\w*|дай|выдай)\b",
+                match["names"].strip(), re.I):
+        return None
     kind = match["kind"].casefold()
     return validate_plan({
         "action": "credit" if match["sign"] == "+" else "debit",
