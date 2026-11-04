@@ -416,7 +416,8 @@ class FirebaseClient:
                 "rank": mv.get("rank", {}).get("stringValue", ""),
                 "status": mv.get("status", {}).get("stringValue", "Выдано"),
                 "qty": qty_val,
-                "proof": proof_data
+                "proof": proof_data,
+                "profileId": mv.get("profileId", {}).get("stringValue", "")
             })
         return rows
 
@@ -440,6 +441,8 @@ class FirebaseClient:
         return {
             "mapValue": {
                 "fields": {
+                    **({"profileId": {"stringValue": str(r["profileId"])}}
+                       if r.get("profileId") else {}),
                     "id": {"stringValue": str(r.get("id", ""))},
                     "fullName": {"stringValue": str(r.get("fullName", ""))},
                     "nick": {"stringValue": str(r.get("nick", ""))},
