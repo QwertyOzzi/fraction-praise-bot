@@ -160,6 +160,112 @@ class TestNicknameClaimTransaction(unittest.IsolatedAsyncioTestCase):
             "", self.signer, self.lock
         )
 
+    def add_existing_claimant(self):
+        """Simulate the exact user case: Test2_Gomeza -> occupied Samuel_Norton."""
+        old_binding = "b" * 32
+        self.store.users["222"] = {
+            "nick": "Test2_Gomeza", "rank": "6",
+            "telegram_username": "candidate", "profileId": old_binding
+        }
+        for sheet, balance in (("fractionrp", 5), ("praise", 2)):
+            self.store.rows[sheet].append({
+                "nick": "Test2_Gomeza", "rank": "6",
+                "profileId": old_binding, "qty": balance,
+                "status": "На выдаче", "proof": {"text": "previous", "links": []}
+            })
+        return old_binding
+
+    async def test_existing_agent_claiming_taken_nick_is_accepted_for_review(self):
+        self.add_existing_claimant()
+        original_rows = copy.deepcopy(self.store.rows)
+        ok, message, old_nick, pending = await register_profile(
+            self.client, "test", 222, "Samuel_Norton", "8",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(ok, message)
+        self.assertEqual(old_nick, "Test2_Gomeza")
+        self.assertEqual(pending["nick"], "Test2_Gomeza")
+        self.assertEqual(pending["rank"], "6")
+        self.assertEqual(pending["claimed_nick"], "Samuel_Norton")
+        self.assertEqual(pending["claimed_rank"], "8")
+        self.assertEqual(pending["verification_status"], "pending")
+        self.assertEqual(self.store.sheet_writes, 0)
+        self.assertEqual(self.store.rows, original_rows)
+        self.assertEqual(self.store.users["111"]["nick"], "Samuel_Norton")
+
+    async def test_approval_of_existing_account_keeps_both_balances_separate(self):
+        previous_binding = self.add_existing_claimant()
+        ok, message, _, pending = await register_profile(
+            self.client, "test", 222, "Samuel_Norton", "8",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(ok, message)
+        local = copy.deepcopy(self.store.users)
+        ok, message, approved, displaced = await resolve_nickname_claim(
+            self.client, "test", 222, pending["claim_id"],
+            self.signer, self.lock, {1}, local_users=local
+        )
+        self.assertTrue(ok, message)
+        self.assertEqual(approved["nick"], "Samuel_Norton")
+        self.assertEqual(approved["rank"], "8")
+        self.assertNotEqual(approved["profileId"], previous_binding)
+        self.assertEqual(displaced["111"]["nick"], "")
+        for sheet, expected_target, expected_old in (("fractionrp", 8, 5), ("praise", 3, 2)):
+            rows = self.store.rows[sheet]
+            target = next(row for row in rows if row["nick"] == "Samuel_Norton")
+            history = next(row for row in rows if row["nick"] == "Test2_Gomeza")
+            self.assertEqual(target["qty"], expected_target)
+            self.assertEqual(history["qty"], expected_old)
+            self.assertEqual(target["profileId"], approved["profileId"])
+            self.assertNotIn("profileId", history)
+            self.assertEqual(len(set(row.get("profileId") for row in rows if row.get("profileId"))),
+                             sum(bool(row.get("profileId")) for row in rows))
+
+    async def test_existing_agent_can_cancel_pending_claim_with_free_nick(self):
+        original_binding = self.add_existing_claimant()
+        ok, reason, _, pending = await register_profile(
+            self.client, "test", 222, "Samuel_Norton", "8",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(ok, reason)
+        ok, reason, _, updated = await register_profile(
+            self.client, "test", 222, "New_Gomeza", "6",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(ok, reason)
+        self.assertEqual(updated["nick"], "New_Gomeza")
+        self.assertEqual(updated["profileId"], original_binding)
+        self.assertNotIn("claimed_nick", updated)
+        self.assertNotIn("claimed_rank", updated)
+        self.assertNotIn("claim_id", updated)
+        self.assertEqual(self.store.rows["fractionrp"][1]["qty"], 5)
+        self.assertEqual(self.store.rows["fractionrp"][1]["nick"], "New_Gomeza")
+
+    async def test_existing_agent_reconfirming_own_nick_needs_no_review(self):
+        self.add_existing_claimant()
+        ok, reason, _, updated = await register_profile(
+            self.client, "test", 222, "Test2_Gomeza", "6",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(ok, reason)
+        self.assertNotIn("claimed_nick", updated)
+        self.assertEqual(updated["nick"], "Test2_Gomeza")
+
+    async def test_existing_agent_can_claim_nick_only_in_sheet(self):
+        self.add_existing_claimant()
+        self.store.rows["fractionrp"].append({
+            "nick": "Sheet_Only", "rank": "6", "qty": 4,
+            "status": "На выдаче", "proof": {"text": "", "links": []}
+        })
+        original_rows = copy.deepcopy(self.store.rows)
+        ok, reason, _, pending = await register_profile(
+            self.client, "test", 222, "Sheet_Only", "8",
+            "candidate", "Test2_Gomeza", self.signer, self.lock
+        )
+        self.assertTrue(ok, reason)
+        self.assertEqual(pending["verification_status"], "pending")
+        self.assertEqual(self.store.rows, original_rows)
+
     async def test_taken_nick_is_provisionally_accepted_without_sheet_write(self):
         ok, message, old_nick, pending = await self.claim()
         self.assertTrue(ok, message)
