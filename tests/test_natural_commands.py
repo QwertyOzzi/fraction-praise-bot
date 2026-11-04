@@ -109,7 +109,7 @@ class TestGeminiFallback(unittest.IsolatedAsyncioTestCase):
                 })}
             ]}}]}
         command, origin = await interpret(
-            "сними у нортона и гоммеза три фрп", "mock-key", api
+            "пожалуйста, сними у нортона и гоммеза три фрп", "mock-key", api
         )
         self.assertEqual(origin, "gemini")
         self.assertEqual(command["amount"], 3)
@@ -144,7 +144,7 @@ class TestGeminiFallback(unittest.IsolatedAsyncioTestCase):
         async def no_request(*args):
             raise AssertionError
         with self.assertRaises(ParseError):
-            await interpret("сними у Нортона три фрп", "", no_request)
+            await interpret("пожалуйста, сними у Нортона три фрп", "", no_request)
 
 
 class TestNickResolver(unittest.TestCase):
