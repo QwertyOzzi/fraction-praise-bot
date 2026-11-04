@@ -81,6 +81,50 @@ class TestFastParser(unittest.IsolatedAsyncioTestCase):
     def test_spoken_command_does_not_change_rank(self):
         self.assertFalse(looks_like_operation("повысь нортона на ранг 8"))
 
+    async def test_one_praise_accusative_phrase_without_gemini(self):
+        calls = []
+        async def mock_api(*args):
+            calls.append(args)
+            raise AssertionError("Похвалу нужно разбирать локально")
+        result, origin = await interpret(
+            "дай такадо одну похвалу", "", mock_api
+        )
+        self.assertEqual(origin, "local")
+        self.assertEqual(calls, [])
+        self.assertEqual(result, {
+            "action": "credit", "sheet": "praise", "amount": 1,
+            "names": ["такадо"]
+        })
+
+    async def test_praise_debit_with_accusative_without_gemini(self):
+        async def mock_api(*args):
+            raise AssertionError("Похвалы должны разбираться локально")
+        result, origin = await interpret(
+            "сними у такадо одну похвалу", "", mock_api
+        )
+        self.assertEqual(origin, "local")
+        self.assertEqual(result["action"], "debit")
+        self.assertEqual(result["sheet"], "praise")
+        self.assertEqual(result["amount"], 1)
+
+    async def test_direct_praise_command_in_both_orders_without_gemini(self):
+        async def mock_api(*args):
+            raise AssertionError("Похвала не требует API")
+        for command in ("такадо +1 похвалу", "такадо похвалу +1",
+                        "такадо -1 похвалы", "такадо похвал -1"):
+            plan, source = await interpret(command, "", mock_api)
+            self.assertEqual(source, "local", command)
+            self.assertEqual(plan["sheet"], "praise", command)
+            self.assertEqual(plan["amount"], 1, command)
+
+    def test_praise_message_detection(self):
+        for command in ("дай такадо одну похвалу", "такадо +1 похвалу",
+                        "такадо похвалу -1"):
+            self.assertTrue(looks_like_operation(command), command)
+
+    def test_unknown_praise_word_does_not_match_local_grammar(self):
+        self.assertIsNone(simple_parse("такадо +1 похвальбу"))
+
     def test_praise_and_plus(self):
         output = simple_parse("Gomez_Addams +5 похвалы")
         self.assertEqual(output["action"], "credit")
