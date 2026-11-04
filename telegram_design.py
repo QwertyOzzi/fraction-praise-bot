@@ -1,87 +1,83 @@
-"""Telegram 10.3 Rich Message presentation, isolated from business logic.
+"""Stable, native Telegram HTML layout for the FBI assistant.
 
-All profile, report, administrator and Firebase operations stay in bot.py.
+No experimental Rich Message API. The only promotional placement is an
+optional, small inline URL button on the home and status cards.
 """
 import re
-import logging
 
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InputRichMessage
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
-log = logging.getLogger(__name__)
 LEA_URL = "https://lea-script.space/"
 LEA_LABEL = "🧩 ЛЕА ↗"
-TITLE_RE = re.compile(r"^([^\n<]*)<b>([^<\n]+)</b>\n(?:━+\n)?\n*")
+TITLE_RE = re.compile(r"^([^\n<]*)<b>([^<\n]+)</b>\n+")
 
 
-def rich_card_html(text: str, *, lea: bool = False) -> str:
-    """Build real Telegram headings and a small inline LEA button.
-
-    Input text is already Telegram-escaped HTML, not raw untrusted user data.
-    Keep the approved inline markup intact and only replace layout boundaries.
-    """
+def card_html(text: str) -> str:
+    """Present escaped HTML in a compact Telegram-friendly card."""
+    text = text.replace("\n━━━━━━━━━━━━━━\n\n", "\n\n")
+    text = text.replace("\n━━━━━━━━━━━━━━\n", "\n").strip()
     match = TITLE_RE.match(text)
-    if match:
-        heading = match.group(1) + match.group(2)
-        body = text[match.end():].strip()
-        result = [f"<h2>{heading}</h2>"]
-    else:
-        body = text.strip()
-        result = []
-    for paragraph in body.split("\n\n"):
-        if paragraph.strip():
-            result.append("<p>" + paragraph.strip().replace("\n", "<br/>") + "</p>")
-    if lea:
-        # Inline Rich Message button, not a large InlineKeyboard row or text ad.
-        result.append(
-            f'<p><tg-button type="url" url="{LEA_URL}">{LEA_LABEL}</tg-button></p>'
-        )
-    return "\n".join(result)
+    if not match:
+        return text
+    heading = match.group(1) + "<b>" + match.group(2) + "</b>"
+    body = text[match.end():].strip()
+    # Profile details are visually separated using Telegram's supported quote.
+    if body.startswith("👤"):
+        profile, split, remainder = body.partition("\n\n")
+        if profile:
+            body = "<blockquote>" + profile + "</blockquote>"
+            if split and remainder:
+                body += "\n\n" + remainder
+    return heading + ("\n\n" + body if body else "")
 
 
-def plain_card_html(text: str, *, lea: bool = False) -> str:
-    """Readable fallback if Telegram rejects Rich Messages."""
-    clean = text.replace("\n━━━━━━━━━━━━━━\n\n", "\n\n")
-    clean = clean.replace("\n━━━━━━━━━━━━━━\n", "\n")
-    if lea:
-        clean += f'\n\n<i>↗ <a href="{LEA_URL}">ЛЕА · помощник ФБР</a></i>'
-    return clean
+def add_lea_button(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
+    """Append an optional LEA footer without touching existing action buttons."""
+    rows = [list(row) for row in markup.inline_keyboard] if markup else []
+    rows.append([InlineKeyboardButton(text=LEA_LABEL, url=LEA_URL)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def send_fbi_card(message, text: str, *, reply_markup=None, lea: bool = False):
-    """Send a card with actual typography; fall back only on API validation errors.
+    """One ordinary HTML message: reliably formatted, with inline controls."""
+    if lea:
+        if reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):
+            raise ValueError("LEA chip requires an inline keyboard")
+        reply_markup = add_lea_button(reply_markup)
+    return await message.answer(
+        card_html(text),
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
-    Never retry on network timeouts (the first send may have succeeded).
-    """
+
+async def edit_fbi_card(message, text: str, *, reply_markup=None, lea: bool = False):
+    if lea:
+        if reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):
+            raise ValueError("LEA chip requires an inline keyboard")
+        reply_markup = add_lea_button(reply_markup)
+    return await message.edit_text(
+        card_html(text),
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def hide_old_reply_keyboard(message) -> None:
+    """Remove the old full-screen keyboard, without leaving a chat message."""
+    if getattr(message.chat, "type", None) != "private":
+        return
     try:
-        return await message.answer_rich(
-            InputRichMessage(html=rich_card_html(text, lea=lea)),
-            reply_markup=reply_markup,
+        notification = await message.answer(
+            "⌨️ Открыто новое компактное меню.",
+            reply_markup=ReplyKeyboardRemove(),
         )
-    except TelegramBadRequest as exc:
-        log.warning("Telegram rejected rich card; using HTML fallback: %s", type(exc).__name__)
-        return await message.answer(
-            plain_card_html(text, lea=lea),
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-
-
-async def edit_fbi_card(message, text: str, *, reply_markup=None):
-    """Edit a Rich Message and preserve its existing callback keyboard."""
-    try:
-        return await message.edit_text(
-            rich_message=InputRichMessage(html=rich_card_html(text)),
-            reply_markup=reply_markup,
-        )
-    except TelegramBadRequest as exc:
-        if "message is not modified" in str(exc).lower():
-            raise
-        log.warning("Telegram rejected rich edit; using HTML fallback: %s", type(exc).__name__)
-        return await message.edit_text(
-            plain_card_html(text),
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        try:
+            await notification.delete()
+        except Exception:
+            pass
+    except Exception:
+        # An unsupported keyboard removal must not block authentication.
+        pass

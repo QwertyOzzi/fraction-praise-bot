@@ -14,7 +14,7 @@ from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile
-from telegram_design import send_fbi_card, edit_fbi_card
+from telegram_design import send_fbi_card, edit_fbi_card, hide_old_reply_keyboard
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -723,25 +723,43 @@ MENU_BUTTONS = [
     "🧑‍💼 Управление агентами"
 ]
 
-def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    admin_mode = is_admin(user_id)
-    buttons = [
-        [KeyboardButton(text="📝 Подать отчет на FRP / Похвалу", style="primary")],
-        [
-            KeyboardButton(text="📊 Мой статус", style="primary"),
-            KeyboardButton(text="🌐 Открыть таблицу", web_app=WebAppInfo(url=WEBAPP_URL)),
-        ],
-        [
-            KeyboardButton(text="⚙️ Мой никнейм"),
-            KeyboardButton(text="💬 Поддержка / Баг-репорт")
+def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardMarkup:
+    """Compact inline navigation. Sensitive actions still check access server-side."""
+    if admin_panel and is_admin(user_id):
+        buttons = [
+            [InlineKeyboardButton(text="🧑‍💼 Агенты", callback_data="main:agents", style="primary"),
+             InlineKeyboardButton(text="📋 Очередь", callback_data="main:queue")],
+            [InlineKeyboardButton(text="📌 Заявки", callback_data="main:pending"),
+             InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
+            [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
+            [InlineKeyboardButton(text="◀️ Личный кабинет", callback_data="main:home")],
         ]
-    ]
-    if admin_mode:
-        buttons.append([KeyboardButton(text="📋 Очередь на выдачу (Админ)"), KeyboardButton(text="👥 Список админов")])
-        buttons.append([KeyboardButton(text="📌 Ожидающие заявки"), KeyboardButton(text="➕ Начислить FRP / Похвалу", style="success")])
-        buttons.append([KeyboardButton(text="🧑‍💼 Управление агентами", style="primary")])
+    else:
+        buttons = [
+            [InlineKeyboardButton(text="📝 Подать отчёт", callback_data="main:report", style="primary"),
+             InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
+            [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
+             InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
+            [InlineKeyboardButton(text="🌐 Таблица", web_app=WebAppInfo(url=WEBAPP_URL))],
+        ]
+        if is_admin(user_id):
+            buttons.append([InlineKeyboardButton(text="👑 Панель руководства", callback_data="main:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def home_card_text(profile: Dict[str, Any], user_id: int) -> str:
+    """Render user-provided values with HTML escaping."""
+    nick = html.escape(str(profile.get("nick", "Не указан")))
+    rank = html.escape(str(profile.get("rank", "?")))
+    role = html.escape(role_name(user_id))
+    return (
+        "🛡️ <b>FBI · Личный кабинет</b>\n\n"
+        f"👤 <b>Агент:</b> <code>{nick}</code>\n"
+        f"🎖️ <b>Ранг:</b> {rank}\n"
+        f"🔐 <b>Доступ:</b> {role}\n\n"
+        "<i>Выберите нужный раздел ниже.</i>"
+    )
+
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  AIOGRAM DISPATCHER                                              ║
@@ -883,6 +901,7 @@ async def cmd_version(message: types.Message):
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
+    await hide_old_reply_keyboard(message)
     if isinstance(user_data, dict) and user_data.get("nick"):
         new_username = message.from_user.username or ""
         if user_data.get("telegram_username", "") != new_username:
@@ -902,12 +921,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(RegistrationStates.waiting_for_nick)
     else:
-        nick_esc = html.escape(user_data['nick'])
-        rank_esc = html.escape(str(user_data.get('rank', '?')))
         await send_fbi_card(
             message,
-            f"🛡️ <b>FBI · Личный кабинет</b>\n\n" f"👤 <b>Агент:</b> <code>{nick_esc}</code>\n" f"🎖️ <b>Ранг:</b> {rank_esc}\n" f"🔐 <b>Доступ:</b> {html.escape(role_name(message.from_user.id))}\n\n"
-            "Выберите действие на клавиатуре ниже.",
+            home_card_text(user_data, message.from_user.id),
             reply_markup=get_main_menu(message.from_user.id),
             lea=True
         )
@@ -938,6 +954,79 @@ async def cmd_start(message: types.Message, state: FSMContext):
         except Exception as exc:
             logger.warning("Could not compare profile with Firestore sheets: %s",
                            type(exc).__name__)
+
+
+# Every inline control is mapped to the existing validated handler; no new
+# permissions, billing logic, or Firebase routes are introduced.
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins"}
+
+
+@dp.callback_query(F.data.startswith("main:"))
+async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Route compact inline navigation using the verified Telegram sender."""
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Откройте бота в личном чате.", show_alert=True)
+        return
+
+    action = (callback.data or "").removeprefix("main:")
+    uid = callback.from_user.id
+    if action in MAIN_MENU_ADMIN_ACTIONS and not is_admin(uid):
+        await callback.answer("Доступно только руководству.", show_alert=True)
+        return
+
+    if action == "home":
+        profile = users_db.get(str(uid), {})
+        if not isinstance(profile, dict) or not profile.get("nick"):
+            await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
+            return
+        await edit_fbi_card(
+            callback.message, home_card_text(profile, uid),
+            reply_markup=get_main_menu(uid), lea=True
+        )
+        await callback.answer()
+        return
+
+    if action == "admin":
+        await edit_fbi_card(
+            callback.message,
+            "👑 <b>FBI · Панель руководства</b>\n\n"
+            "Управляйте агентами, начислениями и заявками.\n"
+            "<i>Все действия проверяют ваши права.</i>",
+            reply_markup=get_main_menu(uid, admin_panel=True),
+        )
+        await callback.answer()
+        return
+
+    routes = {
+        "report": (start_report, True),
+        "status": (cmd_my_status, False),
+        "nick": (cmd_change_nick, True),
+        "support": (cmd_support, True),
+        "agents": (cmd_agent_panel, True),
+        "queue": (cmd_queue, False),
+        "pending": (cmd_pending, False),
+        "grant": (cmd_grant_menu, True),
+        "admins": (cmd_list_admins, False),
+    }
+    route = routes.get(action)
+    if route is None:
+        await callback.answer("Неизвестный пункт меню.", show_alert=True)
+        return
+
+    # This is a copy of the bot's message with the actor replaced by the
+    # Telegram-verified callback sender. Never take IDs from callback_data.
+    source = callback.message.model_copy(update={"from_user": callback.from_user})
+    await state.clear()
+    await callback.answer()
+    handler, needs_state = route
+    if needs_state:
+        await handler(source, state)
+    else:
+        await handler(source)
+
+
 
 # Регистрация ника
 @dp.message(RegistrationStates.waiting_for_nick)
@@ -1098,7 +1187,7 @@ async def cmd_my_status(message: types.Message):
         return
 
     nick = user_data["nick"].lower()
-    await message.answer("🔄 Запрашиваю актуальные данные из таблицы...")
+    # Keep the status card as one message, not a loading-message chain.
 
     try:
         frp_rows, praise_rows = await asyncio.wait_for(
@@ -1130,14 +1219,14 @@ async def cmd_my_status(message: types.Message):
     praise_status_esc = html.escape(str(praise_status))
 
     text = (
-        f"📊 <b>FBI · Карточка агента</b>\n\n" f"👤 <code>{nick_esc}</code> · ранг <b>{rank_esc}</b>\n\n"
-        f"🎖️ <b>/fractionrp (Отметки):</b>\n"
-        f"• Количество: <b>{frp_qty}</b> шт.\n"
-        f"• Статус: <b>{frp_status_esc}</b>\n\n"
-        f"🌟 <b>/praise (Похвала):</b>\n"
-        f"• Количество: <b>{praise_qty}</b> шт.\n"
-        f"• Статус: <b>{praise_status_esc}</b>\n\n"
-        f"🌐 Таблица обновляется в реальном времени. Откройте её кнопкой ниже."
+        f"📊 <b>FBI · Статус агента</b>\n\n"
+        f"👤 <b>Ник:</b> <code>{nick_esc}</code>\n"
+        f"🎖️ <b>Ранг:</b> {rank_esc}\n\n"
+        f"🎖️ <b>FRP:</b> <b>{frp_qty}</b>\n"
+        f"     <i>{frp_status_esc}</i>\n\n"
+        f"🌟 <b>Похвала:</b> <b>{praise_qty}</b>\n"
+        f"     <i>{praise_status_esc}</i>\n\n"
+        "<i>Актуальные данные из таблицы.</i>"
     )
     if not frp_item or not praise_item:
         text += (
@@ -1162,14 +1251,16 @@ async def start_report(message: types.Message, state: FSMContext):
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(style="primary", text="🎖️ /fractionrp (Отметка FRP)", callback_data="type_fractionrp")],
-        [InlineKeyboardButton(style="primary", text="🌟 /praise (Похвала)", callback_data="type_praise")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_report")]
+        [InlineKeyboardButton(style="primary", text="🎖️ FRP", callback_data="type_fractionrp"),
+         InlineKeyboardButton(style="primary", text="🌟 Похвала", callback_data="type_praise")],
+        [InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel_report")]
     ])
     await send_fbi_card(
         message,
-        f"📝 <b>FBI · Новый отчёт</b>\n\n" f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n" f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
-        "Выберите категорию начисления:",
+        f"📝 <b>FBI · Новый отчёт</b>\n\n"
+        f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n"
+        f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
+        "<b>Выберите категорию:</b>",
         reply_markup=kb
     )
     await state.set_state(ReportStates.waiting_for_type)
