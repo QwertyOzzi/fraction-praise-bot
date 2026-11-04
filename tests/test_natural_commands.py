@@ -25,6 +25,34 @@ class TestFastParser(unittest.IsolatedAsyncioTestCase):
             "amount": 3, "names": ["норто", "гоммез", "кударов"]
         })
 
+    async def test_screenshot_order_works_without_gemini_or_api_key(self):
+        calls = []
+        async def no_api(*args):
+            calls.append(args)
+            raise AssertionError("This syntax must not call Gemini")
+        result, source = await interpret(
+            "нортон,гоммез,кударов фрп +1", "", no_api
+        )
+        self.assertEqual(source, "local")
+        self.assertEqual(calls, [])
+        self.assertEqual(result, {
+            "action": "credit", "sheet": "fractionrp", "amount": 1,
+            "names": ["нортон", "гоммез", "кударов"]
+        })
+
+    def test_reverse_order_with_minus_and_praise(self):
+        result = simple_parse("Samuel_Norton; Gomez_Addams похвалы −2")
+        self.assertEqual(result["action"], "debit")
+        self.assertEqual(result["sheet"], "praise")
+        self.assertEqual(result["amount"], 2)
+        self.assertEqual(result["names"], ["Samuel_Norton", "Gomez_Addams"])
+
+    def test_plain_message_detection_both_orders(self):
+        self.assertTrue(looks_like_operation("норто,гоммез фрп +1"))
+        self.assertTrue(looks_like_operation("норто,гоммез +1 фрп"))
+        self.assertTrue(looks_like_operation("норто,гоммез фрп −3"))
+        self.assertFalse(looks_like_operation("Добрый день!"))
+
     def test_praise_and_plus(self):
         output = simple_parse("Gomez_Addams +5 похвалы")
         self.assertEqual(output["action"], "credit")
@@ -59,6 +87,11 @@ class TestGeminiFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command["amount"], 3)
         self.assertEqual(len(called), 1)
         self.assertIn(MODEL, called[0][0])
+        self.assertEqual(
+            called[0][2]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        )
+        self.assertGreaterEqual(called[0][2]["generationConfig"]["maxOutputTokens"], 1000)
         self.assertEqual(called[0][1]["x-goog-api-key"], "mock-key")
         self.assertNotIn("Telegram ID", called[0][2]["contents"][0]["parts"][0]["text"])
 
