@@ -10,7 +10,7 @@ from aiogram.types import InputRichMessage
 
 log = logging.getLogger(__name__)
 LEA_URL = "https://lea-script.space/"
-LEA_LABEL = "↗ ЛЕА · помощник ФБР"
+LEA_LABEL = "🧩 ЛЕА ↗"
 TITLE_RE = re.compile(r"^([^\n<]*)<b>([^<\n]+)</b>\n(?:━+\n)?\n*")
 
 
