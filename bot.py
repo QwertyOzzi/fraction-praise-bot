@@ -14,7 +14,8 @@ from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile
-from telegram_design import send_fbi_card, edit_fbi_card, hide_old_reply_keyboard
+from telegram_design import (send_fbi_card, edit_fbi_card,
+                             hide_old_reply_keyboard, with_home_button)
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -29,6 +30,10 @@ from aiogram.types import (
     WebAppInfo,
     InputMediaPhoto,
     InputMediaVideo,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
+    MenuButtonCommands,
 )
 
 # Load environment variables
@@ -765,8 +770,75 @@ def home_card_text(profile: Dict[str, Any], user_id: int) -> str:
         f"👤 <b>Агент:</b> <code>{nick}</code>\n"
         f"🎖️ <b>Ранг:</b> {rank}\n"
         f"🔐 <b>Доступ:</b> {role}\n\n"
-        "<i>Выберите нужный раздел ниже.</i>"
+        "<i>Команды всегда доступны через «Меню» у поля ввода.</i>"
     )
+
+
+# These labels appear in the native Telegram "Меню" button beside chat input.
+# Universal commands are shown to everyone. Leadership commands are scoped to
+# users with current owner-approved Telegram ACL; display does not grant access.
+PUBLIC_BOT_COMMANDS = [
+    BotCommand(command="start", description="Открыть личный кабинет"),
+    BotCommand(command="menu", description="Показать главное меню внизу чата"),
+    BotCommand(command="report", description="Подать отчёт FRP / похвала"),
+    BotCommand(command="status", description="Мои FRP и похвалы"),
+    BotCommand(command="nick", description="Изменить игровой ник"),
+    BotCommand(command="support", description="Поддержка и баг-репорт"),
+    BotCommand(command="help", description="Помощь и разделы бота"),
+    BotCommand(command="cancel", description="Отменить текущее действие"),
+]
+ADMIN_BOT_COMMANDS = [
+    BotCommand(command="agents", description="Управление агентами"),
+    BotCommand(command="pending", description="Ожидающие заявки"),
+    BotCommand(command="queue", description="Очередь на выдачу"),
+    BotCommand(command="grant", description="Начислить FRP / похвалы"),
+    BotCommand(command="admins", description="Список руководства"),
+]
+OWNER_BOT_COMMANDS = [
+    BotCommand(command="security", description="Проверить права доступа"),
+    BotCommand(command="notifications", description="Уведомления руководства"),
+]
+
+
+def commands_for_user(user_id: int) -> List[BotCommand]:
+    commands = list(PUBLIC_BOT_COMMANDS)
+    if is_admin(user_id):
+        commands.extend(ADMIN_BOT_COMMANDS)
+    if is_owner(user_id):
+        commands.extend(OWNER_BOT_COMMANDS)
+    return commands
+
+
+async def sync_user_command_scope(user_id: int) -> None:
+    """Reflect confirmed role changes in Telegram's native slash menu.
+
+    ACL checks remain in handlers. Removing a user drops their custom menu.
+    """
+    if type(user_id) is not int or user_id <= 0:
+        return
+    try:
+        scope = BotCommandScopeChat(chat_id=user_id)
+        if is_admin(user_id):
+            await bot.set_my_commands(commands_for_user(user_id), scope=scope)
+        else:
+            await bot.delete_my_commands(scope=scope)
+    except Exception as exc:
+        logger.warning("Telegram command scope update failed: %s", type(exc).__name__)
+
+
+async def register_native_command_menu() -> None:
+    """Set the persistent Telegram Menu control for the bot."""
+    try:
+        await bot.set_my_commands(PUBLIC_BOT_COMMANDS,
+                                  scope=BotCommandScopeDefault())
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as exc:
+        logger.warning("Could not register the Telegram native menu: %s",
+                       type(exc).__name__)
+    # Admin permissions have already been hydrated from Firebase at this point.
+    known = OWNER_TELEGRAM_IDS | (set(admins_db) if _cloud_state_hydrated else set())
+    for uid in sorted(uid for uid in known if type(uid) is int and uid > 0):
+        await sync_user_command_scope(uid)
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -867,6 +939,43 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
                          reply_markup=get_main_menu(message.from_user.id))
 
 
+@dp.message(Command("menu", "help"))
+async def cmd_menu(message: types.Message, state: FSMContext):
+    """Always send a fresh menu at the bottom, irrespective of current FSM state."""
+    if getattr(message.chat, "type", "") != "private":
+        await message.answer("Откройте бота в личном чате.")
+        return
+    await state.clear()
+    user_id = message.from_user.id
+    profile = users_db.get(str(user_id))
+    if not isinstance(profile, dict) or not profile.get("nick"):
+        await cmd_start(message, state)
+        return
+    await sync_user_command_scope(user_id)
+    await send_fbi_card(
+        message, home_card_text(profile, user_id),
+        reply_markup=get_main_menu(user_id), lea=True
+    )
+
+
+@dp.message(Command("report", "status", "nick", "support"))
+async def cmd_quick_navigation(message: types.Message, state: FSMContext):
+    """Run public commands even when a registration/report state is active."""
+    if getattr(message.chat, "type", "") != "private":
+        await message.answer("Используйте команды в личном чате с ботом.")
+        return
+    command = (message.text or "").split(maxsplit=1)[0].split("@", 1)[0].lstrip("/")
+    await state.clear()
+    if command == "report":
+        await start_report(message, state)
+    elif command == "status":
+        await cmd_my_status(message)
+    elif command == "nick":
+        await cmd_change_nick(message, state)
+    elif command == "support":
+        await cmd_support(message, state)
+
+
 @dp.message(Command("notifications"))
 async def cmd_owner_notifications(message: types.Message):
     """Owner-only private /notifications on|off; mirrored by the site toggle."""
@@ -910,6 +1019,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = str(message.from_user.id)
     user_data = users_db.get(user_id)
     await hide_old_reply_keyboard(message)
+    await sync_user_command_scope(message.from_user.id)
     if isinstance(user_data, dict) and user_data.get("nick"):
         new_username = message.from_user.username or ""
         if user_data.get("telegram_username", "") != new_username:
@@ -984,12 +1094,25 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Доступно только руководству.", show_alert=True)
         return
 
+    if action == "open":
+        profile = users_db.get(str(uid), {})
+        if not isinstance(profile, dict) or not profile.get("nick"):
+            await callback.answer("Для начала регистрации используйте /start.", show_alert=True)
+            return
+        await state.clear()
+        await send_fbi_card(
+            callback.message, home_card_text(profile, uid),
+            reply_markup=get_main_menu(uid), lea=True
+        )
+        await callback.answer()
+        return
+
     if action == "home":
         profile = users_db.get(str(uid), {})
         if not isinstance(profile, dict) or not profile.get("nick"):
             await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
             return
-        await edit_fbi_card(
+        await send_fbi_card(
             callback.message, home_card_text(profile, uid),
             reply_markup=get_main_menu(uid), lea=True
         )
@@ -997,7 +1120,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         return
 
     if action == "admin":
-        await edit_fbi_card(
+        await send_fbi_card(
             callback.message,
             "👑 <b>FBI · Панель руководства</b>\n\n"
             "Управляйте агентами, начислениями и заявками.\n"
@@ -1245,7 +1368,7 @@ async def cmd_my_status(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(style="primary", text="🌐 Открыть сайт таблицы", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await send_fbi_card(message, text, reply_markup=kb, lea=True)
+    await send_fbi_card(message, text, reply_markup=with_home_button(kb), lea=True)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  ПОДАЧА ОТЧЕТА НА ВЫДАЧУ                                         ║
@@ -1269,7 +1392,7 @@ async def start_report(message: types.Message, state: FSMContext):
         f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n"
         f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
         "<b>Выберите категорию:</b>",
-        reply_markup=kb
+        reply_markup=with_home_button(kb)
     )
     await state.set_state(ReportStates.waiting_for_type)
 
@@ -1868,6 +1991,8 @@ async def callback_recover_admins(callback: types.CallbackQuery):
         return
     save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
+    for restored_uid in admins_db:
+        await sync_user_command_scope(restored_uid)
     _pending_legacy_admins.clear()
     _pending_legacy_nonce = ""
     await callback.message.edit_text("✅ Список администраторов подтверждён и сохранён.")
@@ -2138,6 +2263,7 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     pending_admin_requests.pop(target_id, None)
     save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
+    await sync_user_command_scope(target_id)
     asyncio.create_task(record_admin_activity("admin_role_assigned", callback.from_user.id,
         f"Назначена роль {role} для Telegram ID {target_id}"))
     target_user = users_db.get(str(target_id), {})
@@ -2232,7 +2358,7 @@ async def cmd_list_admins(message: types.Message):
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
-    await send_fbi_card(message, text, reply_markup=kb)
+    await send_fbi_card(message, text, reply_markup=with_home_button(kb))
 
 @dp.callback_query(F.data.startswith("remove_admin_"))
 async def process_remove_admin(callback: types.CallbackQuery):
@@ -2264,6 +2390,7 @@ async def process_remove_admin(callback: types.CallbackQuery):
             return
         save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
+        await sync_user_command_scope(target_id)
         asyncio.create_task(record_admin_activity("admin_revoked", callback.from_user.id,
             f"Доступ отозван у Telegram ID {target_id}"))
         await callback.answer("Заместитель успешно снят!", show_alert=True)
@@ -2566,9 +2693,9 @@ async def agent_panel_list(message: types.Message, admin_id: int, page: int = 0,
         agents = [agent for agent in agents if term in agent["nick"].casefold()]
     text, kb = agent_list_markup(agents, page)
     if edit:
-        await edit_fbi_card(message, text, reply_markup=kb)
+        await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
     else:
-        await send_fbi_card(message, text, reply_markup=kb)
+        await send_fbi_card(message, text, reply_markup=with_home_button(kb))
 
 
 async def agent_panel_detail(message: types.Message, key: str, page: int):
@@ -2578,7 +2705,7 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
         await message.edit_text("⚠️ Агент больше не найден. Откройте список снова.")
         return
     text, kb = agent_detail_markup(agent, page)
-    await edit_fbi_card(message, text, reply_markup=kb)
+    await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
 
 
 @dp.message(Command("agents"))
@@ -2897,7 +3024,7 @@ async def cmd_queue(message: types.Message):
     try:
         rows = await firebase_client.get_sheet("fractionrp")
         text, keyboard = render_queue(rows)
-        await send_fbi_card(message, text, reply_markup=keyboard)
+        await send_fbi_card(message, text, reply_markup=with_home_button(keyboard))
     except Exception as e:
         logger.error(f"Could not load issue queue: {e}")
         await message.answer("⚠️ Не удалось загрузить очередь из Firebase.")
@@ -2920,7 +3047,9 @@ async def process_issue_one(callback: types.CallbackQuery):
         # Refresh original message; zero-quantity rows disappear completely.
         rows = await firebase_client.get_sheet("fractionrp")
         new_text, new_keyboard = render_queue(rows)
-        await callback.message.edit_text(new_text, reply_markup=new_keyboard, parse_mode="HTML")
+        await callback.message.edit_text(
+            new_text, reply_markup=with_home_button(new_keyboard), parse_mode="HTML"
+        )
     except Exception as e:
         logger.error(f"Error issuing point: {e}")
         await callback.answer("⚠️ Списание не подтверждено. Обновите /queue.", show_alert=True)
@@ -2941,7 +3070,7 @@ async def cmd_support(message: types.Message, state: FSMContext):
         "💬 <b>FBI · Центр поддержки</b>\n\n"
         "Опишите найденный баг, ошибку или предложение следующим сообщением.\n"
         "<i>Можно отправить текст, фотографию или видео с подписью — руководство получит вложение в Telegram.</i>",
-        reply_markup=kb
+        reply_markup=with_home_button(kb)
     )
     await state.set_state(SupportStates.waiting_for_message)
 
@@ -3175,6 +3304,7 @@ async def main():
         except Exception as exc:
             logger.warning(f"Could not clean up accidental duplicate: {exc}")
 
+    await register_native_command_menu()
     logger.info("Bot polling starting...")
     await dp.start_polling(bot)
 

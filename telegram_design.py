@@ -38,6 +38,16 @@ def add_lea_button(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def with_home_button(markup: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
+    """Attach an unobtrusive way to send a fresh menu near the latest message."""
+    rows = [list(row) for row in markup.inline_keyboard] if markup else []
+    if not any(getattr(button, "callback_data", None) in ("main:open", "main:home")
+               for row in rows for button in row):
+        rows.append([InlineKeyboardButton(text="🏠 Главное меню",
+                                          callback_data="main:open")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def send_fbi_card(message, text: str, *, reply_markup=None, lea: bool = False):
     """One ordinary HTML message: reliably formatted, with inline controls."""
     if lea:
