@@ -322,10 +322,31 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                         bool(old_verified_nick)
                         and old_verified_nick.casefold() != nick.casefold()
                     )
-                    # Do not let the new nick share a binding with the user's
-                    # previous nickname: that would make the tables ambiguous.
-                    target_binding = (uuid.uuid4().hex
-                                      if changing_existing_nick else current_binding)
+                    # When a rank change accompanies a FREE nickname change,
+                    # rename the owned rows in place. This preserves all FRP,
+                    # praise and evidence rather than creating empty rows.
+                    # If another agent already has the target nick, retain
+                    # each old balance on its original row and transfer only
+                    # the explicitly approved occupied nickname.
+                    sheet_rows = {
+                        sheet: client._parse_firestore_rows(
+                            docs["sheets/" + sheet].get("fields", {}).get(
+                                "rows", {}).get("arrayValue", {}).get("values", [])
+                        )
+                        for sheet in SHEETS
+                    }
+                    target_row_exists = any(
+                        str(row.get("nick") or "").casefold() == nick.casefold()
+                        for rows in sheet_rows.values() for row in rows
+                    )
+                    free_nickname_rename = (
+                        changing_existing_nick and not holders
+                        and not target_row_exists
+                    )
+                    target_binding = (
+                        uuid.uuid4().hex if changing_existing_nick
+                        and not free_nickname_rename else current_binding
+                    )
                     if holders:
                         previous_uid, previous = holders[0]
                         displaced_profile = dict(previous)
@@ -353,8 +374,7 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                     writes = []
                     for sheet in SHEETS:
                         doc = docs["sheets/" + sheet]
-                        rows = client._parse_firestore_rows(doc.get("fields", {}).get(
-                            "rows", {}).get("arrayValue", {}).get("values", []))
+                        rows = sheet_rows[sheet]
                         matches = [row for row in rows
                                    if str(row.get("nick") or "").casefold() == nick.casefold()]
                         if len(matches) > 1:
@@ -368,12 +388,16 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                             ]
                             if len(old_bound) > 1:
                                 return False, "Дубли прежней привязки. Нужна проверка.", None, {}
-                            # Retain previous FRP/praise, evidence and history
-                            # on the OLD row. Only detach its obsolete profileId.
-                            for old_row in old_bound:
-                                old_row.pop("profileId", None)
+                            # Only detach the old profile ID when taking over
+                            # an occupied nickname. For a free rename the
+                            # original row is the one being renamed.
+                            if not free_nickname_rename:
+                                for old_row in old_bound:
+                                    old_row.pop("profileId", None)
                         if matches:
                             row = matches[0]
+                        elif free_nickname_rename and old_bound:
+                            row = old_bound[0]
                         else:
                             row = {
                                 "id": uuid.uuid4().hex, "nick": nick, "rank": rank,
