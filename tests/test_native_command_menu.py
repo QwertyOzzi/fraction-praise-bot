@@ -76,6 +76,7 @@ class TestNativeCommandCatalog(unittest.IsolatedAsyncioTestCase):
         self.assertIn("menu", user)
         self.assertIn("help", user)
         self.assertIn("report", user)
+        self.assertIn("rank", user)
         self.assertIn("status", user)
         self.assertNotIn("agents", user)
         self.assertIn("agents", admin)
@@ -160,7 +161,7 @@ class TestNavigationStatic(unittest.TestCase):
     def test_menu_handlers_precede_fsm_consumers(self):
         self.assertLess(BOT.index('@dp.message(Command("menu", "help"))'),
                         BOT.index('@dp.message(RegistrationStates.waiting_for_nick)'))
-        self.assertLess(BOT.index('@dp.message(Command("report", "status", "nick", "support"))'),
+        self.assertLess(BOT.index('@dp.message(Command("report", "status", "nick", "rank", "support"))'),
                         BOT.index('@dp.message(ReportStates.waiting_for_proof)'))
         self.assertIn('await register_native_command_menu()', BOT)
 

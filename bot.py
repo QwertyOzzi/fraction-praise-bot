@@ -8,7 +8,7 @@ import hashlib
 import hmac
 import re
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
@@ -740,7 +740,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
     """Compact inline navigation. Sensitive actions still check access server-side."""
     profile = users_db.get(str(user_id), {})
     claim_status = profile.get("verification_status") if isinstance(profile, dict) else ""
-    if claim_status in ("pending", "needs_proof", "proof_submitted", "disconnected"):
+    if claim_status in ("pending", "needs_proof", "proof_submitted", "disconnected", "retry_ready", "cooldown"):
         buttons = [
             [InlineKeyboardButton(text="🕒 Проверка профиля", callback_data="main:claim_status")],
             [InlineKeyboardButton(text="⚙️ Указать другой ник", callback_data="main:nick")],
@@ -760,7 +760,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📝 Подать отчёт", callback_data="main:report", style="primary"),
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
-             InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
+             InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
+            [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
             [InlineKeyboardButton(text="🌐 Таблица", web_app=WebAppInfo(url=WEBAPP_URL))],
         ]
         if is_admin(user_id):
@@ -779,6 +780,10 @@ def pending_claim_card_text(profile: Dict[str, Any]) -> str:
         note = "Доказательства получены. Ожидайте решения руководства."
     elif status == "disconnected":
         note = "Этот ник переназначен по решению руководства. Вы можете указать другой."
+    elif status == "retry_ready":
+        note = "Ограничение закончилось. Можно повторно указать ник и ранг."
+    elif status == "cooldown":
+        note = "Временное ограничение после отказа руководства."
     else:
         note = "Вы вошли в бот. Ник ожидает проверки руководством."
     previous_nick = html.escape(str(profile.get("nick") or ""))
@@ -815,6 +820,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="report", description="Подать отчёт FRP / похвала"),
     BotCommand(command="status", description="Мои FRP и похвалы"),
     BotCommand(command="nick", description="Изменить игровой ник"),
+    BotCommand(command="rank", description="Запросить смену ранга"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
@@ -881,19 +887,73 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+CLAIM_COOLDOWN_SECONDS = 5 * 60
+
+
+def claim_cooldown_remaining(profile: Dict[str, Any]) -> int:
+    """Remaining cooldown seconds; historical permanent blocks are retryable."""
+    timestamp = profile.get("cooldown_until")
+    if not isinstance(timestamp, str) or not timestamp:
+        return 0
+    try:
+        until = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if until.tzinfo is None:
+            return 0
+        return max(0, int((until - datetime.now(timezone.utc)).total_seconds() + 0.999))
+    except ValueError:
+        return 0
+
+
+async def finish_expired_claim_cooldown(user_id: str) -> bool:
+    """Release only the rejected claim, not any verified admin permissions."""
+    async with _claim_action_locks.setdefault(user_id, asyncio.Lock()):
+        profile = users_db.get(user_id)
+        if not isinstance(profile, dict):
+            return True
+        if profile.get("verification_status") not in ("disabled", "cooldown"):
+            return True
+        if claim_cooldown_remaining(profile):
+            return False
+        previous = dict(profile)
+        updated = dict(profile)
+        updated["verification_status"] = "retry_ready"
+        updated.pop("cooldown_until", None)
+        updated.pop("claim_id", None)
+        for key in ("proof_submitted", "proof_kind", "proof_file_id",
+                    "proof_link", "proof_caption"):
+            updated.pop(key, None)
+        users_db[user_id] = updated
+        if not await sync_state_to_cloud():
+            users_db[user_id] = previous
+            return False
+        save_json(USERS_FILE, users_db)
+        return True
+
+
 class DisabledClaimMiddleware(BaseMiddleware):
-    """Telegram cannot ban someone from writing, but we can reject every action."""
+    """Allow a new attempt after five minutes; old disabled users recover too."""
     async def __call__(self, handler, event, data):
         sender = getattr(event, "from_user", None)
         profile = users_db.get(str(sender.id)) if sender else None
-        if isinstance(profile, dict) and profile.get("verification_status") == "disabled":
+        if isinstance(profile, dict) and (
+                profile.get("verification_status") == "disabled"
+                or profile.get("verification_status") == "cooldown"):
+            remaining = claim_cooldown_remaining(profile)
+            if remaining > 0:
+                minutes, seconds = divmod(remaining, 60)
+                text = (f"⏳ Заявка отклонена. Повторно попробовать можно через "
+                        f"{minutes}:{seconds:02d}.")
+            elif await finish_expired_claim_cooldown(str(sender.id)):
+                return await handler(event, data)
+            else:
+                text = "⚠️ Не удалось сохранить окончание блокировки. Повторите позже."
             try:
                 if isinstance(event, types.CallbackQuery):
-                    await event.answer("⛔ Доступ отключён руководством.", show_alert=True)
+                    await event.answer(text, show_alert=True)
                 else:
-                    await event.answer("⛔ Доступ к боту отключён руководством.")
+                    await event.answer(text)
             except Exception as exc:
-                logger.info("Could not inform disconnected user: %s", type(exc).__name__)
+                logger.info("Could not notify cooldown status: %s", type(exc).__name__)
             return None
         return await handler(event, data)
 
@@ -993,7 +1053,7 @@ def claim_review_keyboard(uid: str, claim_id: str) -> InlineKeyboardMarkup:
     controls = [
         [InlineKeyboardButton(style="success", text="✅ Оставить",
                               callback_data=f"claim:keep:{uid}:{claim_id}")],
-        [InlineKeyboardButton(style="danger", text="⛔ Отключить",
+        [InlineKeyboardButton(style="danger", text="⏳ Отклонить (5 мин.)",
                               callback_data=f"claim:disable:{uid}:{claim_id}")],
         [InlineKeyboardButton(style="primary", text="📎 Запросить доказательства",
                               callback_data=f"claim:proof:{uid}:{claim_id}")]
@@ -1014,16 +1074,28 @@ def claim_review_text(uid: str, profile: Dict[str, Any]) -> str:
     holder_note = ("\n⚠️ <b>Уже привязан к Telegram ID:</b> "
                    + ", ".join(f"<code>{html.escape(key)}</code>" for key, _ in holders)
                    if holders else "\n⚠️ Такой ник уже встречается в таблице.")
+    rank_only = (
+        bool(profile.get("nick"))
+        and str(profile.get("nick") or "").casefold()
+            == str(profile.get("claimed_nick") or "").casefold()
+        and str(profile.get("claimed_rank") or profile.get("rank") or "")
+            != str(profile.get("rank") or "")
+    )
     return (
-        "🔎 <b>FBI · Возможное совпадение ника</b>\n\n"
-        f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
+        ("🎖️ <b>FBI · Запрос смены ранга</b>\n\n" if rank_only
+         else "🔎 <b>FBI · Проверка регистрации</b>\n\n")
+        + f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
         f"🎮 <b>Ник:</b> <code>{name}</code>\n"
         f"🎖️ <b>Заявленный ранг:</b> {rank}\n"
         + (f"📌 <b>Старый ник пользователя:</b> <code>{old_nick}</code>\n" if old_nick else "")
         + (f"💬 <b>Telegram:</b> @{username}\n" if username else "")
-        + holder_note + "\n\n"
-        "Проверьте, действительно ли агент владеет игровым аккаунтом. "
-        "Кнопка «Оставить» переносит привязку ника, сохраняя балансы."
+        + (f"🎖️ <b>Текущий ранг:</b> {html.escape(str(profile.get('rank') or '?'))}\n"
+           if rank_only else holder_note)
+        + "\n\n"
+        + ("Подтвердите повышение или понижение ранга. Балансы не меняются."
+           if rank_only else
+           "Проверьте, действительно ли агент владеет игровым аккаунтом. "
+           "Кнопка «Оставить» переносит привязку ника, сохраняя балансы.")
     )
 
 
@@ -1170,8 +1242,14 @@ async def review_claim(callback: types.CallbackQuery):
         previous = dict(profile)
         updated = dict(profile)
         updated["verification_status"] = (
-            "disabled" if action == "disable" else "needs_proof"
+            "cooldown" if action == "disable" else "needs_proof"
         )
+        if action == "disable":
+            updated["cooldown_until"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=CLAIM_COOLDOWN_SECONDS)
+            ).isoformat()
+            # Previous moderation buttons cannot approve an already rejected claim.
+            updated.pop("claim_id", None)
         if action == "proof":
             for key in ("proof_submitted", "proof_kind", "proof_file_id",
                         "proof_link", "proof_caption"):
@@ -1183,7 +1261,7 @@ async def review_claim(callback: types.CallbackQuery):
                                   show_alert=True)
             return
         save_json(USERS_FILE, users_db)
-        action_label = "Отключён" if action == "disable" else "Запрошены доказательства"
+        action_label = "Отклонено (повтор через 5 минут)" if action == "disable" else "Запрошены доказательства"
         asyncio.create_task(record_admin_activity(
             "nickname_claim_disabled" if action == "disable"
             else "nickname_claim_proof_requested",
@@ -1202,7 +1280,9 @@ async def review_claim(callback: types.CallbackQuery):
         try:
             if action == "disable":
                 await bot.send_message(int(uid),
-                    "⛔ Руководство отключило доступ к боту из-за спорной регистрации.")
+                    "⏳ Руководство отклонило заявку. "
+                    "Повторная попытка доступна через 5 минут. "
+                    "Затем откройте /start или /menu.")
             else:
                 await bot.send_message(
                     int(uid),
@@ -1235,7 +1315,8 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     profile = users_db.get(str(user_id))
     if isinstance(profile, dict) and profile.get("verification_status") in (
-            "pending", "needs_proof", "proof_submitted", "disconnected"):
+            "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
         await send_fbi_card(
             message, pending_claim_card_text(profile),
             reply_markup=get_main_menu(user_id)
@@ -1251,7 +1332,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("report", "status", "nick", "support"))
+@dp.message(Command("report", "status", "nick", "rank", "support"))
 async def cmd_quick_navigation(message: types.Message, state: FSMContext):
     """Run public commands even when a registration/report state is active."""
     if getattr(message.chat, "type", "") != "private":
@@ -1265,6 +1346,8 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await cmd_my_status(message)
     elif command == "nick":
         await cmd_change_nick(message, state)
+    elif command == "rank":
+        await cmd_change_rank(message, state)
     elif command == "support":
         await cmd_support(message, state)
 
@@ -1326,7 +1409,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if (isinstance(user_data, dict)
             and user_data.get("verification_status") in
-            ("pending", "needs_proof", "proof_submitted", "disconnected")):
+            ("pending", "needs_proof", "proof_submitted", "disconnected", "retry_ready", "cooldown")):
         await send_fbi_card(
             message, pending_claim_card_text(user_data),
             reply_markup=get_main_menu(message.from_user.id)
@@ -1398,7 +1481,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     if action == "claim_status":
         profile = users_db.get(str(uid), {})
         if not isinstance(profile, dict) or profile.get("verification_status") not in (
-                "pending", "needs_proof", "proof_submitted", "disconnected"):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
             await callback.answer("Нет активной проверки ника.", show_alert=True)
             return
         await send_fbi_card(
@@ -1411,7 +1495,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     if action == "open":
         profile = users_db.get(str(uid), {})
         if isinstance(profile, dict) and profile.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected"):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
             await send_fbi_card(
                 callback.message, pending_claim_card_text(profile),
                 reply_markup=get_main_menu(uid)
@@ -1432,7 +1517,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     if action == "home":
         profile = users_db.get(str(uid), {})
         if isinstance(profile, dict) and profile.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected"):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
             await send_fbi_card(
                 callback.message, pending_claim_card_text(profile),
                 reply_markup=get_main_menu(uid)
@@ -1464,6 +1550,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         "report": (start_report, True),
         "status": (cmd_my_status, False),
         "nick": (cmd_change_nick, True),
+        "rank": (cmd_change_rank, True),
         "support": (cmd_support, True),
         "agents": (cmd_agent_panel, True),
         "queue": (cmd_queue, False),
@@ -1487,6 +1574,18 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     else:
         await handler(source)
 
+
+
+def rank_selection_keyboard() -> InlineKeyboardMarkup:
+    """Exact 1-10 rank choices, shared by registration and rank requests."""
+    ranks = [("10 (Лидер)", "X"), ("9 (Зам)", "9"), ("8", "8"), ("7", "7"),
+             ("6", "6"), ("5", "5"), ("4", "4"), ("3", "3"),
+             ("2", "2"), ("1", "1")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"rank_{value}")
+         for name, value in ranks[i:i + 2]]
+        for i in range(0, len(ranks), 2)
+    ])
 
 
 # Регистрация ника
@@ -1553,12 +1652,7 @@ async def process_nick(message: types.Message, state: FSMContext):
     nick = clean_nick
     await state.update_data(nick=nick)
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="10 (Лидер)", callback_data="rank_X"), InlineKeyboardButton(text="9 (Зам)", callback_data="rank_9")],
-        [InlineKeyboardButton(text="8 ранг", callback_data="rank_8"), InlineKeyboardButton(text="7 ранг", callback_data="rank_7")],
-        [InlineKeyboardButton(text="6 ранг", callback_data="rank_6"), InlineKeyboardButton(text="5 ранг", callback_data="rank_5")],
-        [InlineKeyboardButton(text="4 ранг", callback_data="rank_4"), InlineKeyboardButton(text="1-3 ранг", callback_data="rank_1")]
-    ])
+    kb = rank_selection_keyboard()
     await message.answer(f"👤 <b>Регистрация · Шаг 2 из 2</b>\n\n" f"Ник: <code>{html.escape(nick)}</code>\n\n" "🎖️ Выберите ваш текущий ранг:", reply_markup=kb, parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_rank)
 
@@ -1592,11 +1686,12 @@ async def process_rank(callback: types.CallbackQuery, state: FSMContext):
         save_json(USERS_FILE, users_db)
         await state.clear()
         await callback.message.edit_text(
-            "✅ <b>Вход в бот разрешён</b>\n\n"
+            "✅ <b>Запрос на изменение профиля сохранён</b>\n\n"
             f"👤 Ник: <code>{html.escape(nick)}</code>\n"
+            f"🎖️ Запрошенный ранг: <b>{html.escape(rank)}</b>\n"
             "🕒 Статус: <b>проверка руководства</b>\n\n"
-            "Никакие чужие балансы и привязки не изменены. "
-            "Подать отчёт можно будет после подтверждения.",
+            "До подтверждения текущие ники, ранги и балансы не изменяются. "
+            "Отчёты доступны после решения руководства.",
             parse_mode="HTML"
         )
         await send_fbi_card(
@@ -1657,6 +1752,32 @@ async def cmd_change_nick(message: types.Message, state: FSMContext):
     )
     await state.set_state(RegistrationStates.waiting_for_nick)
 
+@dp.message(Command("rank"))
+async def cmd_change_rank(message: types.Message, state: FSMContext):
+    """User requests rank change; the rank is never applied before moderation."""
+    await state.clear()
+    profile = users_db.get(str(message.from_user.id), {})
+    if not isinstance(profile, dict) or not profile.get("nick"):
+        await message.answer("Сначала зарегистрируйте ник через /start.")
+        return
+    if profile.get("verification_status") in (
+            "pending", "needs_proof", "proof_submitted", "disconnected",
+            "retry_ready", "cooldown", "disabled"):
+        await message.answer("⏳ Сначала завершите проверку текущего профиля.")
+        return
+    await state.update_data(nick=str(profile["nick"]))
+    await state.set_state(RegistrationStates.waiting_for_rank)
+    await send_fbi_card(
+        message,
+        "🎖️ <b>FBI · Изменение ранга</b>\n\n"
+        f"👤 Ник: <code>{html.escape(str(profile['nick']))}</code>\n"
+        f"📌 Сейчас: <b>{html.escape(str(profile.get('rank') or '?'))}</b>\n\n"
+        "<b>Выберите новый ранг:</b>\n"
+        "<i>Изменение будет применено только после проверки руководством.</i>",
+        reply_markup=rank_selection_keyboard()
+    )
+
+
 @dp.callback_query(F.data == "cancel_nick_change")
 async def cancel_nick_change(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1669,7 +1790,8 @@ async def cmd_my_status(message: types.Message):
     user_data = users_db.get(user_id)
     if (not isinstance(user_data, dict) or not user_data.get("nick")
             or user_data.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected")):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown")):
         await message.answer(
             "🕒 Ник ожидает проверки. Просмотр баланса пока недоступен."
         )
@@ -1737,7 +1859,8 @@ async def start_report(message: types.Message, state: FSMContext):
     user_data = users_db.get(user_id)
     if (not isinstance(user_data, dict) or not user_data.get("nick")
             or user_data.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected")):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown")):
         await message.answer(
             "🕒 Ник ещё проверяется руководством. "
             "Вы можете открыть /menu, но отчёты пока недоступны."
@@ -2142,7 +2265,8 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     user_data = users_db.get(user_id, {})
     if (not isinstance(user_data, dict) or not user_data.get("nick")
             or user_data.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disabled", "disconnected")):
+                "pending", "needs_proof", "proof_submitted", "disabled", "disconnected",
+                "retry_ready", "cooldown")):
         await state.clear()
         await callback.answer("Ваш игровой ник ещё не подтверждён.", show_alert=True)
         return
@@ -2204,7 +2328,7 @@ async def approve_report(callback: types.CallbackQuery):
             or str(holder.get("nick") or "").casefold()
                != str(req.get("nick") or "").casefold()
             or holder.get("verification_status") in
-               ("pending", "needs_proof", "proof_submitted", "disabled", "disconnected")):
+               ("pending", "needs_proof", "proof_submitted", "disabled", "disconnected", "retry_ready", "cooldown")):
         await callback.answer(
             "Ник заявителя больше не подтверждён. Заявку нельзя начислять.",
             show_alert=True
