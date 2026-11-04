@@ -3,6 +3,7 @@ import copy
 import unittest
 
 from natural_balance import apply_batch, BalanceConflict
+from natural_aliases import MEMORY_FIELD, decode_alias_book
 
 
 class FakeResponse:
@@ -26,6 +27,7 @@ class FirestoreFake:
              "rank": "7", "qty": 7, "status": "На выдаче"},
         ]
         self.ids = []
+        self.aliases = ""
         self.rev = 1
         self.writes = 0
 
@@ -38,7 +40,8 @@ class FirestoreFake:
                 ]}},
                 "appliedNaturalIds": {"arrayValue": {"values": [
                     {"stringValue": value} for value in self.ids
-                ]}}
+                ]}},
+                MEMORY_FIELD: {"stringValue": self.aliases}
             }
         })
 
@@ -54,6 +57,9 @@ class FirestoreFake:
             item["stringValue"]
             for item in fields["appliedNaturalIds"]["arrayValue"]["values"]
         ]
+        if MEMORY_FIELD in fields:
+            self.aliases = fields[MEMORY_FIELD]["stringValue"]
+            assert ("updateMask.fieldPaths", MEMORY_FIELD) in params
         self.rev += 1
         self.writes += 1
         return FakeResponse(200)
@@ -141,6 +147,61 @@ class TestAtomicBalanceChanges(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repeat, "already_applied")
         self.assertEqual(self.store.writes, 1)
         self.assertEqual([row["qty"] for row in self.store.rows], [7, 5])
+
+    async def test_learning_occurs_only_in_successful_firestore_commit(self):
+        prepared = self.targets()
+        result = await apply_batch(
+            self.client, "fractionrp", prepared, "credit", 1,
+            "ai-memory-001", self.session_factory,
+            aliases=["норто", "гоммез"],
+            original_text="норто,гоммез фрп +1"
+        )
+        self.assertEqual(result, "applied")
+        learned = decode_alias_book(self.store.aliases, sheet="fractionrp")
+        self.assertEqual(learned["norto"]["nick"], "Samuel_Norton")
+        self.assertEqual(learned["gommez"]["nick"], "Gomez_Addams")
+        self.assertEqual(self.store.writes, 1)
+        self.assertEqual([row["qty"] for row in self.store.rows], [10, 8])
+
+    async def test_failed_transaction_does_not_learn_any_alias(self):
+        prepared = self.targets()
+        with self.assertRaises(BalanceConflict):
+            await apply_batch(
+                self.client, "fractionrp", prepared, "debit", 8,
+                "ai-memory-002", self.session_factory,
+                aliases=["норто", "гоммез"],
+                original_text="норто,гоммез фрп -8"
+            )
+        self.assertEqual(self.store.writes, 0)
+        self.assertFalse(self.store.aliases)
+
+    async def test_duplicate_callback_never_relearns_or_debits_again(self):
+        prepared = self.targets()
+        for _ in range(2):
+            result = await apply_batch(
+                self.client, "fractionrp", prepared, "debit", 1,
+                "ai-memory-003", self.session_factory,
+                aliases=["норто", "гоммез"],
+                original_text="норто,гоммез фрп -1"
+            )
+        self.assertEqual(result, "already_applied")
+        self.assertEqual(self.store.writes, 1)
+        self.assertEqual([row["qty"] for row in self.store.rows], [8, 6])
+        self.assertEqual(len(decode_alias_book(
+            self.store.aliases, sheet="fractionrp"
+        )), 2)
+
+    async def test_invented_alias_is_not_learned(self):
+        prepared = self.targets()
+        await apply_batch(
+            self.client, "fractionrp", prepared, "credit", 1,
+            "ai-memory-004", self.session_factory,
+            aliases=["придумано", "гоммез"],
+            original_text="Samuel_Norton,гоммез +1 фрп"
+        )
+        learned = decode_alias_book(self.store.aliases, sheet="fractionrp")
+        self.assertNotIn("pridumano", learned)
+        self.assertIn("gommez", learned)
 
     async def test_duplicate_targets_rejected(self):
         prepared = self.targets()
