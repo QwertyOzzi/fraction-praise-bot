@@ -34,35 +34,59 @@ def simplified(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", transliterate(value))
 
 
+_KIND_PATTERN = r"(?:фрп|frp|отметк[иауы]?|похвал[аы]?|praise)"
+# Two equally safe syntaxes: "ники -3 фрп" and "ники фрп -3".
+_SIMPLE_PATTERNS = (
+    re.compile(
+        rf"^\s*(?P<names>[\w\s,;.\-]{{3,230}}?)\s+"
+        rf"(?P<sign>[+-])\s*(?P<amount>\d{{1,2}})\s*"
+        rf"(?P<kind>{_KIND_PATTERN})\s*[.!]*\s*$", re.I
+    ),
+    re.compile(
+        rf"^\s*(?P<names>[\w\s,;.\-]{{3,230}}?)\s+"
+        rf"(?P<kind>{_KIND_PATTERN})\s*"
+        rf"(?P<sign>[+-])\s*(?P<amount>\d{{1,2}})\s*[.!]*\s*$", re.I
+    ),
+)
+_VERB = re.compile(
+    r"^(?:сним\w*|спиш\w*|вычт\w*|начисл\w*|добав\w*|дай|выдай)\b", re.I
+)
+
+
+def _plain_minus(text: str) -> str:
+    return text.replace("−", "-").replace("–", "-")
+
+
 def looks_like_operation(text: str) -> bool:
-    """Only capture plausible commands from admin chats, not regular messages."""
+    """Intercept plausible balance commands, not ordinary bot conversation."""
     if not text or text.lstrip().startswith("/") or len(text) > MAX_TEXT:
         return False
+    text = _plain_minus(text)
     return bool(
-        re.search(r"[+-]\s*\d{1,2}\s*(?:фрп|frp|отметк|похвал|praise)", text, re.I)
-        or re.search(r"(?:сним|спиш|вычт|добав|начисл|дай|выдай)\w*.*"
-                     r"(?:фрп|frp|отмет|похвал|praise)", text, re.I)
+        re.search(
+            rf"(?:[+-]\s*\d{{1,2}}\s*{_KIND_PATTERN}|"
+            rf"{_KIND_PATTERN}\s*[+-]\s*\d{{1,2}})", text, re.I
+        )
+        or re.search(
+            r"(?:сним|спиш|вычт|добав|начисл|дай|выдай)\w*.*"
+            r"(?:фрп|frp|отмет|похвал|praise)", text, re.I
+        )
     )
 
 
 def simple_parse(text: str) -> dict[str, Any] | None:
-    """Cheap deterministic fast path, no API tokens required."""
-    pattern = (
-        r"^\s*(?P<names>[\w\s,;.-]{3,230}?)\s+"
-        r"(?P<sign>[+-])\s*(?P<amount>\d{1,2})\s*"
-        r"(?P<kind>фрп|frp|отметк[иауы]?|похвал[аы]?|praise)"
-        r"\s*[.!]*\s*$"
-    )
-    match = re.fullmatch(pattern, text, re.I)
-    if not match:
+    """Parse safe name lists locally, regardless of amount/category ordering."""
+    text = _plain_minus(text)
+    match = next((p.fullmatch(text) for p in _SIMPLE_PATTERNS
+                  if p.fullmatch(text)), None)
+    if match is None:
         return None
-    names = [n.strip() for n in re.split(r"[,;]", match["names"]) if n.strip()]
+    name_segment = match["names"].strip()
+    if _VERB.match(name_segment):
+        # Conversational instructions are not nicknames; send to Gemini.
+        return None
+    names = [name.strip() for name in re.split(r"[,;]", name_segment) if name.strip()]
     if not names:
-        return None
-    # A conversational sentence like "сними у Нортона -3 фрп"
-    # is not a list of nicknames: route it through Gemini instead.
-    if re.match(r"^(?:сним\w*|спиш\w*|вычт\w*|начисл\w*|добав\w*|дай|выдай)\b",
-                match["names"].strip(), re.I):
         return None
     kind = match["kind"].casefold()
     return validate_plan({
@@ -71,6 +95,7 @@ def simple_parse(text: str) -> dict[str, Any] | None:
         "amount": int(match["amount"]),
         "names": names
     })
+
 
 
 def validate_plan(obj: Any, *, original: str | None = None) -> dict[str, Any]:
@@ -134,7 +159,8 @@ async def interpret(text: str, api_key: str, request):
         "contents": [{"role": "user", "parts": [{"text": text}]}],
         "generationConfig": {
             "temperature": 0,
-            "maxOutputTokens": 380,
+            "maxOutputTokens": 1024,
+            "thinkingConfig": {"thinkingLevel": "low"},
             "responseMimeType": "application/json",
             "responseSchema": {
                 "type": "OBJECT",
