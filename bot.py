@@ -955,6 +955,79 @@ async def cmd_start(message: types.Message, state: FSMContext):
             logger.warning("Could not compare profile with Firestore sheets: %s",
                            type(exc).__name__)
 
+
+# Every inline control is mapped to the existing validated handler; no new
+# permissions, billing logic, or Firebase routes are introduced.
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins"}
+
+
+@dp.callback_query(F.data.startswith("main:"))
+async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Route compact inline navigation using the verified Telegram sender."""
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Откройте бота в личном чате.", show_alert=True)
+        return
+
+    action = (callback.data or "").removeprefix("main:")
+    uid = callback.from_user.id
+    if action in MAIN_MENU_ADMIN_ACTIONS and not is_admin(uid):
+        await callback.answer("Доступно только руководству.", show_alert=True)
+        return
+
+    if action == "home":
+        profile = users_db.get(str(uid), {})
+        if not isinstance(profile, dict) or not profile.get("nick"):
+            await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
+            return
+        await edit_fbi_card(
+            callback.message, home_card_text(profile, uid),
+            reply_markup=get_main_menu(uid), lea=True
+        )
+        await callback.answer()
+        return
+
+    if action == "admin":
+        await edit_fbi_card(
+            callback.message,
+            "👑 <b>FBI · Панель руководства</b>\n\n"
+            "Управляйте агентами, начислениями и заявками.\n"
+            "<i>Все действия проверяют ваши права.</i>",
+            reply_markup=get_main_menu(uid, admin_panel=True),
+        )
+        await callback.answer()
+        return
+
+    routes = {
+        "report": (start_report, True),
+        "status": (cmd_my_status, False),
+        "nick": (cmd_change_nick, True),
+        "support": (cmd_support, True),
+        "agents": (cmd_agent_panel, True),
+        "queue": (cmd_queue, False),
+        "pending": (cmd_pending, False),
+        "grant": (cmd_grant_menu, True),
+        "admins": (cmd_list_admins, False),
+    }
+    route = routes.get(action)
+    if route is None:
+        await callback.answer("Неизвестный пункт меню.", show_alert=True)
+        return
+
+    # This is a copy of the bot's message with the actor replaced by the
+    # Telegram-verified callback sender. Never take IDs from callback_data.
+    source = callback.message.model_copy(update={"from_user": callback.from_user})
+    await state.clear()
+    await callback.answer()
+    handler, needs_state = route
+    if needs_state:
+        await handler(source, state)
+    else:
+        await handler(source)
+
+
+
 # Регистрация ника
 @dp.message(RegistrationStates.waiting_for_nick)
 async def process_nick(message: types.Message, state: FSMContext):
