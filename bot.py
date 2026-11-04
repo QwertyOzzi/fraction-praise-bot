@@ -1315,7 +1315,8 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     profile = users_db.get(str(user_id))
     if isinstance(profile, dict) and profile.get("verification_status") in (
-            "pending", "needs_proof", "proof_submitted", "disconnected"):
+            "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
         await send_fbi_card(
             message, pending_claim_card_text(profile),
             reply_markup=get_main_menu(user_id)
@@ -1480,7 +1481,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     if action == "claim_status":
         profile = users_db.get(str(uid), {})
         if not isinstance(profile, dict) or profile.get("verification_status") not in (
-                "pending", "needs_proof", "proof_submitted", "disconnected"):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
             await callback.answer("Нет активной проверки ника.", show_alert=True)
             return
         await send_fbi_card(
@@ -1493,7 +1495,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     if action == "open":
         profile = users_db.get(str(uid), {})
         if isinstance(profile, dict) and profile.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected"):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
             await send_fbi_card(
                 callback.message, pending_claim_card_text(profile),
                 reply_markup=get_main_menu(uid)
@@ -1514,7 +1517,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     if action == "home":
         profile = users_db.get(str(uid), {})
         if isinstance(profile, dict) and profile.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected"):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown"):
             await send_fbi_card(
                 callback.message, pending_claim_card_text(profile),
                 reply_markup=get_main_menu(uid)
@@ -1786,7 +1790,8 @@ async def cmd_my_status(message: types.Message):
     user_data = users_db.get(user_id)
     if (not isinstance(user_data, dict) or not user_data.get("nick")
             or user_data.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected")):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown")):
         await message.answer(
             "🕒 Ник ожидает проверки. Просмотр баланса пока недоступен."
         )
@@ -1854,7 +1859,8 @@ async def start_report(message: types.Message, state: FSMContext):
     user_data = users_db.get(user_id)
     if (not isinstance(user_data, dict) or not user_data.get("nick")
             or user_data.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disconnected")):
+                "pending", "needs_proof", "proof_submitted", "disconnected",
+                "retry_ready", "cooldown")):
         await message.answer(
             "🕒 Ник ещё проверяется руководством. "
             "Вы можете открыть /menu, но отчёты пока недоступны."
@@ -2259,7 +2265,8 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
     user_data = users_db.get(user_id, {})
     if (not isinstance(user_data, dict) or not user_data.get("nick")
             or user_data.get("verification_status") in (
-                "pending", "needs_proof", "proof_submitted", "disabled", "disconnected")):
+                "pending", "needs_proof", "proof_submitted", "disabled", "disconnected",
+                "retry_ready", "cooldown")):
         await state.clear()
         await callback.answer("Ваш игровой ник ещё не подтверждён.", show_alert=True)
         return
