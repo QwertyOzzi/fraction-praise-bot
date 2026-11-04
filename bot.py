@@ -27,6 +27,8 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     WebAppInfo,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 
 # Load environment variables
@@ -1540,8 +1542,10 @@ def pending_report_text(req_id: str, req: Dict[str, Any]) -> str:
         f"[{html.escape(str(req.get('rank') or '?'))}]\n"
         f"📌 <b>Тип:</b> /{html.escape(str(req.get('rep_type') or ''))} (+{qty})\n"
         f"📝 <b>Причина:</b> {html.escape(str(req.get('reason') or ''))}\n"
-        f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n\n"
-        + "<i>Измените количество кнопками ➖/➕ и выберите решение.</i>"
+        f"🔗 <b>Доказательства:</b> {html.escape(str(req.get('proof') or ''))}\n"
+        + (f"📎 <b>Вложений:</b> {len(req.get('proof_media') or [])}\n"
+           if req.get("proof_media") else "")
+        + "\n<i>Измените количество кнопками ➖/➕ и выберите решение.</i>"
     )
 
 
@@ -1551,18 +1555,40 @@ async def send_pending_report_to_admin(chat_id: int, req_id: str, req: Dict[str,
                                   disable_web_page_preview=True, parse_mode="HTML")
     refs = req.setdefault("admin_messages", [])
     refs.append({"chat_id": chat_id, "message_id": sent.message_id})
-    # Media is sent privately to the same authorized leadership recipients.
-    # Do not share a public URL or bot-token-backed download endpoint.
+    # Send every photo/video in the report to authorized leadership only.
+    # Albums are sent as a single Telegram media group when possible.
+    items = req.get("proof_media") or []
+    if not isinstance(items, list):
+        items = []
+    valid = [item for item in items[:REPORT_MEDIA_LIMIT]
+             if isinstance(item, dict)
+             and item.get("type") in ("photo", "video")
+             and isinstance(item.get("file_id"), str)
+             and item["file_id"]]
     media_kind, media_id = req.get("proof_media_type"), req.get("proof_file_id")
-    if media_id and media_kind in ("photo", "video"):
+    # Compatibility with reports submitted before the multi-photo update.
+    if not valid and media_id and media_kind in ("photo", "video"):
+        valid = [{"type": media_kind, "file_id": media_id}]
+    if valid:
+        caption = f"📎 Вложение к заявке #{req_id} от {str(req.get('nick', 'Агент'))[:70]}"
         try:
-            caption = f"📎 Вложение к заявке #{req_id} от {str(req.get('nick', 'Агент'))[:70]}"
-            if media_kind == "photo":
-                await bot.send_photo(chat_id, media_id, caption=caption, parse_mode=None)
+            if len(valid) > 1:
+                attachments = [
+                    InputMediaPhoto(media=item["file_id"])
+                    if item["type"] == "photo"
+                    else InputMediaVideo(media=item["file_id"])
+                    for item in valid
+                ]
+                await bot.send_media_group(chat_id=chat_id, media=attachments)
+            elif valid[0]["type"] == "photo":
+                await bot.send_photo(chat_id, valid[0]["file_id"],
+                                     caption=caption, parse_mode=None)
             else:
-                await bot.send_video(chat_id, media_id, caption=caption, parse_mode=None)
+                await bot.send_video(chat_id, valid[0]["file_id"],
+                                     caption=caption, parse_mode=None)
         except Exception as exc:
-            logger.warning("Could not forward report evidence to administrator: %s", type(exc).__name__)
+            logger.warning("Could not forward report evidence to administrator: %s",
+                           type(exc).__name__)
     try:
         await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id,
                                    disable_notification=True)
@@ -1641,6 +1667,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
         "proof": data["proof"],
         "proof_media_type": data.get("proof_media_type", ""),
         "proof_file_id": data.get("proof_file_id", ""),
+        "proof_media": data.get("proof_media", []),
         "quantity": int(data.get("quantity", 1)),
         "admin_messages": [],
         "status": "pending",
