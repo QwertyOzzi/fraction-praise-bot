@@ -1053,7 +1053,7 @@ def claim_review_keyboard(uid: str, claim_id: str) -> InlineKeyboardMarkup:
     controls = [
         [InlineKeyboardButton(style="success", text="✅ Оставить",
                               callback_data=f"claim:keep:{uid}:{claim_id}")],
-        [InlineKeyboardButton(style="danger", text="⛔ Отключить",
+        [InlineKeyboardButton(style="danger", text="⏳ Отклонить (5 мин.)",
                               callback_data=f"claim:disable:{uid}:{claim_id}")],
         [InlineKeyboardButton(style="primary", text="📎 Запросить доказательства",
                               callback_data=f"claim:proof:{uid}:{claim_id}")]
@@ -1074,16 +1074,28 @@ def claim_review_text(uid: str, profile: Dict[str, Any]) -> str:
     holder_note = ("\n⚠️ <b>Уже привязан к Telegram ID:</b> "
                    + ", ".join(f"<code>{html.escape(key)}</code>" for key, _ in holders)
                    if holders else "\n⚠️ Такой ник уже встречается в таблице.")
+    rank_only = (
+        bool(profile.get("nick"))
+        and str(profile.get("nick") or "").casefold()
+            == str(profile.get("claimed_nick") or "").casefold()
+        and str(profile.get("claimed_rank") or profile.get("rank") or "")
+            != str(profile.get("rank") or "")
+    )
     return (
-        "🔎 <b>FBI · Возможное совпадение ника</b>\n\n"
+        ("🎖️ <b>FBI · Запрос смены ранга</b>\n\n" if rank_only
+         else "🔎 <b>FBI · Проверка регистрации</b>\n\n")
         f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
         f"🎮 <b>Ник:</b> <code>{name}</code>\n"
         f"🎖️ <b>Заявленный ранг:</b> {rank}\n"
         + (f"📌 <b>Старый ник пользователя:</b> <code>{old_nick}</code>\n" if old_nick else "")
         + (f"💬 <b>Telegram:</b> @{username}\n" if username else "")
-        + holder_note + "\n\n"
-        "Проверьте, действительно ли агент владеет игровым аккаунтом. "
-        "Кнопка «Оставить» переносит привязку ника, сохраняя балансы."
+        + (f"🎖️ <b>Текущий ранг:</b> {html.escape(str(profile.get('rank') or '?'))}\n"
+           if rank_only else holder_note)
+        + "\n\n"
+        + ("Подтвердите повышение или понижение ранга. Балансы не меняются."
+           if rank_only else
+           "Проверьте, действительно ли агент владеет игровым аккаунтом. "
+           "Кнопка «Оставить» переносит привязку ника, сохраняя балансы.")
     )
 
 
@@ -1230,8 +1242,14 @@ async def review_claim(callback: types.CallbackQuery):
         previous = dict(profile)
         updated = dict(profile)
         updated["verification_status"] = (
-            "disabled" if action == "disable" else "needs_proof"
+            "cooldown" if action == "disable" else "needs_proof"
         )
+        if action == "disable":
+            updated["cooldown_until"] = (
+                datetime.now(timezone.utc) + timedelta(seconds=CLAIM_COOLDOWN_SECONDS)
+            ).isoformat()
+            # Previous moderation buttons cannot approve an already rejected claim.
+            updated.pop("claim_id", None)
         if action == "proof":
             for key in ("proof_submitted", "proof_kind", "proof_file_id",
                         "proof_link", "proof_caption"):
@@ -1243,7 +1261,7 @@ async def review_claim(callback: types.CallbackQuery):
                                   show_alert=True)
             return
         save_json(USERS_FILE, users_db)
-        action_label = "Отключён" if action == "disable" else "Запрошены доказательства"
+        action_label = "Отклонено (повтор через 5 минут)" if action == "disable" else "Запрошены доказательства"
         asyncio.create_task(record_admin_activity(
             "nickname_claim_disabled" if action == "disable"
             else "nickname_claim_proof_requested",
@@ -1262,7 +1280,9 @@ async def review_claim(callback: types.CallbackQuery):
         try:
             if action == "disable":
                 await bot.send_message(int(uid),
-                    "⛔ Руководство отключило доступ к боту из-за спорной регистрации.")
+                    "⏳ Руководство отклонило заявку. "
+                    "Повторная попытка доступна через 5 минут. "
+                    "Затем откройте /start или /menu.")
             else:
                 await bot.send_message(
                     int(uid),
