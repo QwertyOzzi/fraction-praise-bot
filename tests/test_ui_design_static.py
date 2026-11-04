@@ -4,17 +4,19 @@ import unittest
 from pathlib import Path
 
 CODE = Path(__file__).resolve().parents[1].joinpath("bot.py").read_text("utf-8")
+DESIGN = Path(__file__).resolve().parents[1].joinpath("telegram_design.py").read_text("utf-8")
 TREE = ast.parse(CODE)
 
 
 class TestTelegramUi(unittest.TestCase):
     def test_lea_only_on_noncritical_screens(self):
-        self.assertEqual(CODE.count("https://lea-script.space/"), 2)
+        self.assertEqual(DESIGN.count("https://lea-script.space/"), 1)
+        self.assertEqual(CODE.count("lea=True"), 2)
         for name in ("pending_report_text", "approve_report", "reject_report",
                      "cmd_admin_auth", "cmd_security_overview", "perform_manual_grant"):
             fn = next(n for n in TREE.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                       and n.name == name)
-            self.assertNotIn("lea-script.space", ast.get_source_segment(CODE, fn))
+            self.assertNotIn("lea=True", ast.get_source_segment(CODE, fn))
 
     def test_buttons_have_supported_colors(self):
         for style in ("primary", "success", "danger"):
