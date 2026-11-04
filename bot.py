@@ -13,11 +13,11 @@ from datetime import datetime, timezone
 from aiohttp import web, ClientSession, ClientTimeout
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
-from profile_sheets import register_profile
+from profile_sheets import register_profile, resolve_nickname_claim
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -738,7 +738,15 @@ MENU_BUTTONS = [
 
 def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardMarkup:
     """Compact inline navigation. Sensitive actions still check access server-side."""
-    if admin_panel and is_admin(user_id):
+    profile = users_db.get(str(user_id), {})
+    claim_status = profile.get("verification_status") if isinstance(profile, dict) else ""
+    if claim_status in ("pending", "needs_proof", "proof_submitted", "disconnected"):
+        buttons = [
+            [InlineKeyboardButton(text="🕒 Проверка профиля", callback_data="main:claim_status")],
+            [InlineKeyboardButton(text="⚙️ Указать другой ник", callback_data="main:nick")],
+            [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
+        ]
+    elif admin_panel and is_admin(user_id):
         buttons = [
             [InlineKeyboardButton(text="🧑‍💼 Агенты", callback_data="main:agents", style="primary"),
              InlineKeyboardButton(text="📋 Очередь", callback_data="main:queue")],
@@ -758,6 +766,28 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
         if is_admin(user_id):
             buttons.append([InlineKeyboardButton(text="👑 Панель руководства", callback_data="main:admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def pending_claim_card_text(profile: Dict[str, Any]) -> str:
+    """A non-binding nickname claim never represents another agent's account."""
+    nick = html.escape(str(profile.get("claimed_nick") or
+                           profile.get("disconnected_nick") or "Не указан"))
+    status = profile.get("verification_status")
+    if status == "needs_proof":
+        note = "Руководство запросило доказательства. Отправьте скриншот игрового профиля сюда."
+    elif status == "proof_submitted":
+        note = "Доказательства получены. Ожидайте решения руководства."
+    elif status == "disconnected":
+        note = "Этот ник переназначен по решению руководства. Вы можете указать другой."
+    else:
+        note = "Вы вошли в бот. Ник ожидает проверки руководством."
+    return (
+        "🛡️ <b>FBI · Проверка регистрации</b>\n\n"
+        f"👤 <b>Заявленный ник:</b> <code>{nick}</code>\n"
+        f"🎖️ <b>Ранг:</b> {html.escape(str(profile.get('rank') or '?'))}\n\n"
+        f"<i>{note}</i>\n\n"
+        "До подтверждения чужие балансы и отчёты недоступны."
+    )
 
 
 def home_card_text(profile: Dict[str, Any], user_id: int) -> str:
@@ -793,6 +823,7 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="queue", description="Очередь на выдачу"),
     BotCommand(command="grant", description="Начислить FRP / похвалы"),
     BotCommand(command="admins", description="Список руководства"),
+    BotCommand(command="claims", description="Проверка спорных регистраций"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
@@ -846,6 +877,27 @@ async def register_native_command_menu() -> None:
 # ╚══════════════════════════════════════════════════════════════════╝
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+class DisabledClaimMiddleware(BaseMiddleware):
+    """Telegram cannot ban someone from writing, but we can reject every action."""
+    async def __call__(self, handler, event, data):
+        sender = getattr(event, "from_user", None)
+        profile = users_db.get(str(sender.id)) if sender else None
+        if isinstance(profile, dict) and profile.get("verification_status") == "disabled":
+            try:
+                if isinstance(event, types.CallbackQuery):
+                    await event.answer("⛔ Доступ отключён руководством.", show_alert=True)
+                else:
+                    await event.answer("⛔ Доступ к боту отключён руководством.")
+            except Exception as exc:
+                logger.info("Could not inform disconnected user: %s", type(exc).__name__)
+            return None
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(DisabledClaimMiddleware())
+dp.callback_query.outer_middleware(DisabledClaimMiddleware())
 
 
 async def record_admin_activity(action: str, actor_id: int, details: str, sheet: str = "") -> None:
@@ -929,6 +981,251 @@ async def record_profile_activity(actor_id: int, action: str, old_nick: str,
                     logger.warning("Profile audit write failed (HTTP %s)", response.status)
     except Exception as exc:
         logger.warning("Profile audit delivery failed: %s", type(exc).__name__)
+
+
+CLAIM_ACTIVE_STATES = ("pending", "needs_proof", "proof_submitted")
+_claim_action_locks: Dict[str, asyncio.Lock] = {}
+
+
+def claim_review_keyboard(uid: str, claim_id: str) -> InlineKeyboardMarkup:
+    controls = [
+        [InlineKeyboardButton(style="success", text="✅ Оставить",
+                              callback_data=f"claim:keep:{uid}:{claim_id}")],
+        [InlineKeyboardButton(style="danger", text="⛔ Отключить",
+                              callback_data=f"claim:disable:{uid}:{claim_id}")],
+        [InlineKeyboardButton(style="primary", text="📎 Запросить доказательства",
+                              callback_data=f"claim:proof:{uid}:{claim_id}")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=controls)
+
+
+def claim_review_text(uid: str, profile: Dict[str, Any]) -> str:
+    name = html.escape(str(profile.get("claimed_nick") or "Не указан"))
+    rank = html.escape(str(profile.get("rank") or "?"))
+    username = html.escape(str(profile.get("telegram_username") or "").lstrip("@"))
+    holders = [
+        (key, entry) for key, entry in users_db.items()
+        if key != uid and isinstance(entry, dict) and
+        str(entry.get("nick") or "").casefold() == str(profile.get("claimed_nick") or "").casefold()
+    ]
+    holder_note = ("\n⚠️ <b>Уже привязан к Telegram ID:</b> "
+                   + ", ".join(f"<code>{html.escape(key)}</code>" for key, _ in holders)
+                   if holders else "\n⚠️ Такой ник уже встречается в таблице.")
+    return (
+        "🔎 <b>FBI · Возможное совпадение ника</b>\n\n"
+        f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
+        f"🎮 <b>Ник:</b> <code>{name}</code>\n"
+        f"🎖️ <b>Заявленный ранг:</b> {rank}\n"
+        + (f"💬 <b>Telegram:</b> @{username}\n" if username else "")
+        + holder_note + "\n\n"
+        "Проверьте, действительно ли агент владеет игровым аккаунтом. "
+        "Кнопка «Оставить» переносит привязку ника, сохраняя балансы."
+    )
+
+
+async def notify_claim_reviewers(uid: str, profile: Dict[str, Any],
+                                 *, evidence_message=None) -> None:
+    """Private notifications only to verified leadership and the owner."""
+    claim_id = str(profile.get("claim_id") or "")
+    if not claim_id:
+        return
+    recipients = set(OWNER_TELEGRAM_IDS)
+    if _cloud_state_hydrated:
+        recipients.update(item for item in admins_db if type(item) is int)
+    for reviewer_id in recipients:
+        if not is_admin(reviewer_id):
+            continue
+        try:
+            await bot.send_message(
+                reviewer_id, claim_review_text(uid, profile),
+                reply_markup=claim_review_keyboard(uid, claim_id),
+                parse_mode="HTML", disable_web_page_preview=True
+            )
+            if evidence_message is not None:
+                try:
+                    await bot.copy_message(
+                        chat_id=reviewer_id, from_chat_id=evidence_message.chat.id,
+                        message_id=evidence_message.message_id
+                    )
+                except Exception as exc:
+                    logger.warning("Claim evidence copy failed: %s", type(exc).__name__)
+        except Exception as exc:
+            logger.warning("Claim review notification failed: %s", type(exc).__name__)
+
+
+@dp.message(Command("claims"))
+async def cmd_claims(message: types.Message):
+    if not is_admin(message.from_user.id) or getattr(message.chat, "type", "") != "private":
+        await message.answer("⛔ Проверка регистраций доступна только руководству.")
+        return
+    items = [
+        (uid, entry) for uid, entry in users_db.items()
+        if isinstance(entry, dict) and entry.get("verification_status") in CLAIM_ACTIVE_STATES
+        and entry.get("claimed_nick") and entry.get("claim_id")
+    ]
+    if not items:
+        await message.answer("✅ Спорных регистраций нет.")
+        return
+    await message.answer(f"🔎 <b>FBI · На проверке: {len(items)}</b>", parse_mode="HTML")
+    for uid, profile in items[:15]:
+        await message.answer(
+            claim_review_text(uid, profile),
+            reply_markup=claim_review_keyboard(uid, profile["claim_id"]),
+            parse_mode="HTML", disable_web_page_preview=True
+        )
+
+
+@dp.callback_query(F.data.startswith("claim:"))
+async def review_claim(callback: types.CallbackQuery):
+    if (not is_admin(callback.from_user.id)
+            or getattr(callback.message.chat, "type", "") != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        _, action, uid, claim_id = (callback.data or "").split(":", 3)
+    except ValueError:
+        await callback.answer("Неверная заявка.", show_alert=True)
+        return
+    if not uid.isdecimal() or action not in ("keep", "disable", "proof"):
+        await callback.answer("Неизвестное решение.", show_alert=True)
+        return
+    async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
+        profile = users_db.get(uid)
+        if (not isinstance(profile, dict)
+                or profile.get("claim_id") != claim_id
+                or profile.get("verification_status") not in CLAIM_ACTIVE_STATES):
+            await callback.answer("Заявка уже обработана или устарела.", show_alert=True)
+            return
+        if action == "keep":
+            if profile.get("verification_status") == "needs_proof":
+                await callback.answer("Сначала дождитесь доказательств.", show_alert=True)
+                return
+            success, reason, updated, displaced = await resolve_nickname_claim(
+                firebase_client, FIREBASE_PROJECT_ID, uid, claim_id,
+                sign_admin_permissions, _state_sync_lock, OWNER_TELEGRAM_IDS,
+                local_users=users_db
+            )
+            if not success:
+                await callback.answer(reason[:190], show_alert=True)
+                return
+            save_json(USERS_FILE, users_db)
+            asyncio.create_task(record_admin_activity(
+                "nickname_claim_approved", callback.from_user.id,
+                f"Telegram ID {uid}: {updated.get('nick', '')}; replaced={list(displaced)}"
+            ))
+            await callback.answer("✅ Ник закреплён за пользователем.")
+            try:
+                await callback.message.edit_text(
+                    f"✅ <b>Ник подтверждён:</b> <code>{html.escape(updated['nick'])}</code>\n"
+                    f"Проверил: {html.escape(callback.from_user.full_name)}",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            try:
+                await bot.send_message(int(uid),
+                    "✅ <b>Руководство подтвердило ваш игровой ник.</b>\n"
+                    "Теперь можно пользоваться всеми функциями. Откройте /menu.",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+            for displaced_uid in displaced:
+                try:
+                    await bot.send_message(int(displaced_uid),
+                        "⚠️ Прежняя привязка игрового ника изменена руководством. "
+                        "Откройте /start и укажите актуальный ник.")
+                except Exception:
+                    pass
+            return
+
+        previous = dict(profile)
+        updated = dict(profile)
+        updated["verification_status"] = (
+            "disabled" if action == "disable" else "needs_proof"
+        )
+        if action == "proof":
+            updated.pop("proof_submitted", None)
+        users_db[uid] = updated
+        if not await sync_state_to_cloud():
+            users_db[uid] = previous
+            await callback.answer("Firebase не сохранил решение. Повторите позже.",
+                                  show_alert=True)
+            return
+        save_json(USERS_FILE, users_db)
+        action_label = "Отключён" if action == "disable" else "Запрошены доказательства"
+        asyncio.create_task(record_admin_activity(
+            "nickname_claim_disabled" if action == "disable"
+            else "nickname_claim_proof_requested",
+            callback.from_user.id, f"Telegram ID {uid}: {updated.get('claimed_nick')}"
+        ))
+        await callback.answer(f"✅ {action_label}")
+        try:
+            await callback.message.edit_text(
+                f"📋 <b>Заявка на ник:</b> "
+                f"<code>{html.escape(str(updated.get('claimed_nick') or ''))}</code>\n"
+                f"Решение: {action_label}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        try:
+            if action == "disable":
+                await bot.send_message(int(uid),
+                    "⛔ Руководство отключило доступ к боту из-за спорной регистрации.")
+            else:
+                await bot.send_message(
+                    int(uid),
+                    "📎 <b>FBI · Подтверждение ника</b>\n\n"
+                    "Руководство просит подтвердить игровой аккаунт. "
+                    "Пришлите <b>скриншот игрового профиля с ником</b> "
+                    "или ссылку на профиль. Не присылайте паспорт, пароли, "
+                    "личные документы и другие конфиденциальные сведения.",
+                    parse_mode="HTML"
+                )
+        except Exception as exc:
+            logger.warning("Claim decision notification failed: %s", type(exc).__name__)
+
+
+@dp.message(lambda message: isinstance(users_db.get(str(message.from_user.id)), dict)
+            and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof")
+async def receive_claim_proof(message: types.Message):
+    if getattr(message.chat, "type", "") != "private":
+        return
+    uid = str(message.from_user.id)
+    if message.text and message.text.startswith("/"):
+        await message.answer("Для подтверждения отправьте скриншот или ссылку.")
+        return
+    photo = bool(message.photo)
+    video = bool(message.video)
+    document = bool(message.document and
+                    (message.document.mime_type or "").startswith("image/"))
+    link = (message.text or "").strip()
+    if not (photo or video or document or
+            (link.startswith(("https://", "http://")) and len(link) <= 1000)):
+        await message.answer(
+            "Пришлите скриншот игрового профиля, фото, видео или ссылку http(s). "
+            "Не отправляйте персональные документы."
+        )
+        return
+    async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
+        profile = users_db.get(uid)
+        if not isinstance(profile, dict) or profile.get("verification_status") != "needs_proof":
+            return
+        previous = dict(profile)
+        updated = dict(profile)
+        updated["verification_status"] = "proof_submitted"
+        updated["proof_submitted"] = datetime.now(timezone.utc).isoformat()
+        users_db[uid] = updated
+        if not await sync_state_to_cloud():
+            users_db[uid] = previous
+            await message.answer("⚠️ Не получилось сохранить доказательства. Повторите позже.")
+            return
+        save_json(USERS_FILE, users_db)
+    await message.answer(
+        "✅ Доказательства отправлены руководству. Ожидайте решения."
+    )
+    await notify_claim_reviewers(uid, updated, evidence_message=message)
 
 
 @dp.message(Command("cancel"))
