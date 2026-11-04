@@ -1084,7 +1084,7 @@ def claim_review_text(uid: str, profile: Dict[str, Any]) -> str:
     return (
         ("🎖️ <b>FBI · Запрос смены ранга</b>\n\n" if rank_only
          else "🔎 <b>FBI · Проверка регистрации</b>\n\n")
-        f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
+        + f"👤 <b>Новый пользователь:</b> <code>{uid}</code>\n"
         f"🎮 <b>Ник:</b> <code>{name}</code>\n"
         f"🎖️ <b>Заявленный ранг:</b> {rank}\n"
         + (f"📌 <b>Старый ник пользователя:</b> <code>{old_nick}</code>\n" if old_nick else "")
