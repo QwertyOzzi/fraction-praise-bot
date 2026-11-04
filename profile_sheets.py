@@ -146,7 +146,8 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
 
                     updated = dict(old)
                     for stale in ("claimed_nick", "claim_id", "verification_status",
-                                  "disconnected_nick", "proof_submitted"):
+                                  "disconnected_nick", "proof_submitted", "proof_kind",
+                                  "proof_file_id", "proof_link", "proof_caption"):
                         updated.pop(stale, None)
                     updated.update({
                         "nick": nick, "rank": rank, "telegram_username": username[:32],
@@ -318,7 +319,9 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                     applicant.update({"nick": nick, "verification_status": "verified"})
                     applicant.pop("claimed_nick", None)
                     applicant.pop("claim_id", None)
-                    applicant.pop("proof_submitted", None)
+                    for key in ("proof_submitted", "proof_kind", "proof_file_id",
+                                "proof_link", "proof_caption"):
+                        applicant.pop(key, None)
                     users[claimant_uid] = applicant
                     state["users"] = users
 
