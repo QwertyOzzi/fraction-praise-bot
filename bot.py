@@ -1078,6 +1078,7 @@ async def cmd_claims(message: types.Message):
 @dp.callback_query(F.data.startswith("claim:"))
 async def review_claim(callback: types.CallbackQuery):
     if (not is_admin(callback.from_user.id)
+            or not isinstance(callback.message, types.Message)
             or getattr(callback.message.chat, "type", "") != "private"
             or callback.message.chat.id != callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
@@ -3419,6 +3420,48 @@ async def cancel_support(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Отправка обращения отменена.")
 
+@dp.message(lambda message: isinstance(users_db.get(str(message.from_user.id)), dict)
+            and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof")
+async def receive_claim_proof(message: types.Message):
+    if getattr(message.chat, "type", "") != "private":
+        return
+    uid = str(message.from_user.id)
+    if message.text and message.text.startswith("/"):
+        await message.answer("Для подтверждения отправьте скриншот или ссылку.")
+        return
+    photo = bool(message.photo)
+    video = bool(message.video)
+    document = bool(message.document and
+                    (message.document.mime_type or "").startswith("image/"))
+    link = (message.text or "").strip()
+    if not (photo or video or document or
+            (link.startswith(("https://", "http://")) and len(link) <= 1000)):
+        await message.answer(
+            "Пришлите скриншот игрового профиля, фото, видео или ссылку http(s). "
+            "Не отправляйте персональные документы."
+        )
+        return
+    async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
+        profile = users_db.get(uid)
+        if not isinstance(profile, dict) or profile.get("verification_status") != "needs_proof":
+            return
+        previous = dict(profile)
+        updated = dict(profile)
+        updated["verification_status"] = "proof_submitted"
+        updated["proof_submitted"] = datetime.now(timezone.utc).isoformat()
+        users_db[uid] = updated
+        if not await sync_state_to_cloud():
+            users_db[uid] = previous
+            await message.answer("⚠️ Не получилось сохранить доказательства. Повторите позже.")
+            return
+        save_json(USERS_FILE, users_db)
+    await message.answer(
+        "✅ Доказательства отправлены руководству. Ожидайте решения."
+    )
+    await notify_claim_reviewers(uid, updated, evidence_message=message)
+
+
+
 @dp.message(SupportStates.waiting_for_message)
 async def process_support_msg(message: types.Message, state: FSMContext):
     await state.clear()
@@ -3489,48 +3532,6 @@ async def process_support_msg(message: types.Message, state: FSMContext):
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  DUMMY WEB SERVER ДЛЯ RENDER (STAY-ALIVE)                        ║
 # ╚══════════════════════════════════════════════════════════════════╝
-@dp.message(lambda message: isinstance(users_db.get(str(message.from_user.id)), dict)
-            and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof")
-async def receive_claim_proof(message: types.Message):
-    if getattr(message.chat, "type", "") != "private":
-        return
-    uid = str(message.from_user.id)
-    if message.text and message.text.startswith("/"):
-        await message.answer("Для подтверждения отправьте скриншот или ссылку.")
-        return
-    photo = bool(message.photo)
-    video = bool(message.video)
-    document = bool(message.document and
-                    (message.document.mime_type or "").startswith("image/"))
-    link = (message.text or "").strip()
-    if not (photo or video or document or
-            (link.startswith(("https://", "http://")) and len(link) <= 1000)):
-        await message.answer(
-            "Пришлите скриншот игрового профиля, фото, видео или ссылку http(s). "
-            "Не отправляйте персональные документы."
-        )
-        return
-    async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
-        profile = users_db.get(uid)
-        if not isinstance(profile, dict) or profile.get("verification_status") != "needs_proof":
-            return
-        previous = dict(profile)
-        updated = dict(profile)
-        updated["verification_status"] = "proof_submitted"
-        updated["proof_submitted"] = datetime.now(timezone.utc).isoformat()
-        users_db[uid] = updated
-        if not await sync_state_to_cloud():
-            users_db[uid] = previous
-            await message.answer("⚠️ Не получилось сохранить доказательства. Повторите позже.")
-            return
-        save_json(USERS_FILE, users_db)
-    await message.answer(
-        "✅ Доказательства отправлены руководству. Ожидайте решения."
-    )
-    await notify_claim_reviewers(uid, updated, evidence_message=message)
-
-
-
 async def handle_ping(request):
     headers = {
         "Access-Control-Allow-Origin": "*",
