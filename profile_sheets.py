@@ -225,7 +225,8 @@ async def register_profile(client, project_id, user_id, nick, rank, username,
     return False, "Конфликт изменений, повторите действие.", "", None
 
 async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
-                                 signing_function, state_lock, protected_ids):
+                                 signing_function, state_lock, protected_ids,
+                                 local_users=None):
     """Atomically approve a pending nickname claim without changing balances.
 
     Returns (success, message, claimant_profile, displaced_profiles).
@@ -372,6 +373,13 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                     async with session.post(base + ":commit", headers=headers,
                                             json={"writes": writes}) as response:
                         if response.status == 200:
+                            # Update the in-process profiles before releasing the
+                            # state lock, so a concurrent state sync cannot resurrect
+                            # the previous nickname ownership.
+                            if local_users is not None:
+                                local_users[claimant_uid] = applicant
+                                for displaced_uid, displaced_profile in displaced.items():
+                                    local_users[displaced_uid] = displaced_profile
                             return True, "Ник закреплён. Балансы сохранены.", applicant, displaced
                         if response.status not in (409, 412):
                             return False, "Firebase не подтвердил решение.", None, {}
