@@ -770,7 +770,7 @@ def home_card_text(profile: Dict[str, Any], user_id: int) -> str:
         f"👤 <b>Агент:</b> <code>{nick}</code>\n"
         f"🎖️ <b>Ранг:</b> {rank}\n"
         f"🔐 <b>Доступ:</b> {role}\n\n"
-        "<i>Выберите нужный раздел ниже.</i>"
+        "<i>Команды всегда доступны через «Меню» у поля ввода.</i>"
     )
 
 
@@ -1368,7 +1368,7 @@ async def cmd_my_status(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(style="primary", text="🌐 Открыть сайт таблицы", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await send_fbi_card(message, text, reply_markup=kb, lea=True)
+    await send_fbi_card(message, text, reply_markup=with_home_button(kb), lea=True)
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  ПОДАЧА ОТЧЕТА НА ВЫДАЧУ                                         ║
@@ -1392,7 +1392,7 @@ async def start_report(message: types.Message, state: FSMContext):
         f"👤 <b>Агент:</b> <code>{html.escape(user_data['nick'])}</code>\n"
         f"🎖️ <b>Ранг:</b> {html.escape(str(user_data.get('rank', '?')))}\n\n"
         "<b>Выберите категорию:</b>",
-        reply_markup=kb
+        reply_markup=with_home_button(kb)
     )
     await state.set_state(ReportStates.waiting_for_type)
 
@@ -1991,6 +1991,8 @@ async def callback_recover_admins(callback: types.CallbackQuery):
         return
     save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
+    for restored_uid in admins_db:
+        await sync_user_command_scope(restored_uid)
     _pending_legacy_admins.clear()
     _pending_legacy_nonce = ""
     await callback.message.edit_text("✅ Список администраторов подтверждён и сохранён.")
@@ -2261,6 +2263,7 @@ async def callback_admin_grant(callback: types.CallbackQuery):
     pending_admin_requests.pop(target_id, None)
     save_json(ADMINS_FILE, admins_db)
     save_json("admin_roles.json", admin_roles)
+    await sync_user_command_scope(target_id)
     asyncio.create_task(record_admin_activity("admin_role_assigned", callback.from_user.id,
         f"Назначена роль {role} для Telegram ID {target_id}"))
     target_user = users_db.get(str(target_id), {})
@@ -2355,7 +2358,7 @@ async def cmd_list_admins(message: types.Message):
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
-    await send_fbi_card(message, text, reply_markup=kb)
+    await send_fbi_card(message, text, reply_markup=with_home_button(kb))
 
 @dp.callback_query(F.data.startswith("remove_admin_"))
 async def process_remove_admin(callback: types.CallbackQuery):
@@ -2387,6 +2390,7 @@ async def process_remove_admin(callback: types.CallbackQuery):
             return
         save_json("admin_roles.json", admin_roles)
         save_json(ADMINS_FILE, admins_db)
+        await sync_user_command_scope(target_id)
         asyncio.create_task(record_admin_activity("admin_revoked", callback.from_user.id,
             f"Доступ отозван у Telegram ID {target_id}"))
         await callback.answer("Заместитель успешно снят!", show_alert=True)
@@ -2689,9 +2693,9 @@ async def agent_panel_list(message: types.Message, admin_id: int, page: int = 0,
         agents = [agent for agent in agents if term in agent["nick"].casefold()]
     text, kb = agent_list_markup(agents, page)
     if edit:
-        await edit_fbi_card(message, text, reply_markup=kb)
+        await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
     else:
-        await send_fbi_card(message, text, reply_markup=kb)
+        await send_fbi_card(message, text, reply_markup=with_home_button(kb))
 
 
 async def agent_panel_detail(message: types.Message, key: str, page: int):
@@ -2701,7 +2705,7 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
         await message.edit_text("⚠️ Агент больше не найден. Откройте список снова.")
         return
     text, kb = agent_detail_markup(agent, page)
-    await edit_fbi_card(message, text, reply_markup=kb)
+    await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
 
 
 @dp.message(Command("agents"))
@@ -3020,7 +3024,7 @@ async def cmd_queue(message: types.Message):
     try:
         rows = await firebase_client.get_sheet("fractionrp")
         text, keyboard = render_queue(rows)
-        await send_fbi_card(message, text, reply_markup=keyboard)
+        await send_fbi_card(message, text, reply_markup=with_home_button(keyboard))
     except Exception as e:
         logger.error(f"Could not load issue queue: {e}")
         await message.answer("⚠️ Не удалось загрузить очередь из Firebase.")
@@ -3043,7 +3047,9 @@ async def process_issue_one(callback: types.CallbackQuery):
         # Refresh original message; zero-quantity rows disappear completely.
         rows = await firebase_client.get_sheet("fractionrp")
         new_text, new_keyboard = render_queue(rows)
-        await callback.message.edit_text(new_text, reply_markup=new_keyboard, parse_mode="HTML")
+        await callback.message.edit_text(
+            new_text, reply_markup=with_home_button(new_keyboard), parse_mode="HTML"
+        )
     except Exception as e:
         logger.error(f"Error issuing point: {e}")
         await callback.answer("⚠️ Списание не подтверждено. Обновите /queue.", show_alert=True)
@@ -3064,7 +3070,7 @@ async def cmd_support(message: types.Message, state: FSMContext):
         "💬 <b>FBI · Центр поддержки</b>\n\n"
         "Опишите найденный баг, ошибку или предложение следующим сообщением.\n"
         "<i>Можно отправить текст, фотографию или видео с подписью — руководство получит вложение в Telegram.</i>",
-        reply_markup=kb
+        reply_markup=with_home_button(kb)
     )
     await state.set_state(SupportStates.waiting_for_message)
 
