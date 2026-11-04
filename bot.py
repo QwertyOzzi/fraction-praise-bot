@@ -1053,6 +1053,28 @@ async def notify_claim_reviewers(uid: str, profile: Dict[str, Any],
             logger.warning("Claim review notification failed: %s", type(exc).__name__)
 
 
+async def send_saved_claim_evidence(reviewer_id: int, profile: Dict[str, Any]) -> None:
+    """Allow reviewers to re-open a submitted screenshot after a restart."""
+    if profile.get("verification_status") != "proof_submitted":
+        return
+    kind, file_id = profile.get("proof_kind"), profile.get("proof_file_id")
+    try:
+        if kind == "photo" and file_id:
+            await bot.send_photo(reviewer_id, file_id)
+        elif kind == "video" and file_id:
+            await bot.send_video(reviewer_id, file_id)
+        elif kind == "document" and file_id:
+            await bot.send_document(reviewer_id, file_id)
+        elif kind == "link" and profile.get("proof_link"):
+            await bot.send_message(
+                reviewer_id,
+                "🔗 Доказательство: " + html.escape(str(profile["proof_link"])),
+                parse_mode="HTML", disable_web_page_preview=True
+            )
+    except Exception as exc:
+        logger.warning("Could not retrieve saved claim evidence: %s", type(exc).__name__)
+
+
 @dp.message(Command("claims"))
 async def cmd_claims(message: types.Message):
     if not is_admin(message.from_user.id) or getattr(message.chat, "type", "") != "private":
@@ -1073,6 +1095,7 @@ async def cmd_claims(message: types.Message):
             reply_markup=claim_review_keyboard(uid, profile["claim_id"]),
             parse_mode="HTML", disable_web_page_preview=True
         )
+        await send_saved_claim_evidence(message.from_user.id, profile)
 
 
 @dp.callback_query(F.data.startswith("claim:"))
@@ -1146,7 +1169,9 @@ async def review_claim(callback: types.CallbackQuery):
             "disabled" if action == "disable" else "needs_proof"
         )
         if action == "proof":
-            updated.pop("proof_submitted", None)
+            for key in ("proof_submitted", "proof_kind", "proof_file_id",
+                        "proof_link", "proof_caption"):
+                updated.pop(key, None)
         users_db[uid] = updated
         if not await sync_state_to_cloud():
             users_db[uid] = previous
@@ -3420,8 +3445,11 @@ async def cancel_support(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Отправка обращения отменена.")
 
-@dp.message(lambda message: isinstance(users_db.get(str(message.from_user.id)), dict)
-            and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof")
+@dp.message(lambda message: (
+    getattr(message, "from_user", None) is not None
+    and isinstance(users_db.get(str(message.from_user.id)), dict)
+    and users_db[str(message.from_user.id)].get("verification_status") == "needs_proof"
+))
 async def receive_claim_proof(message: types.Message):
     if getattr(message.chat, "type", "") != "private":
         return
@@ -3441,6 +3469,14 @@ async def receive_claim_proof(message: types.Message):
             "Не отправляйте персональные документы."
         )
         return
+    if photo:
+        proof_kind, proof_file_id = "photo", message.photo[-1].file_id
+    elif video:
+        proof_kind, proof_file_id = "video", message.video.file_id
+    elif document:
+        proof_kind, proof_file_id = "document", message.document.file_id
+    else:
+        proof_kind, proof_file_id = "link", ""
     async with _claim_action_locks.setdefault(uid, asyncio.Lock()):
         profile = users_db.get(uid)
         if not isinstance(profile, dict) or profile.get("verification_status") != "needs_proof":
@@ -3449,6 +3485,10 @@ async def receive_claim_proof(message: types.Message):
         updated = dict(profile)
         updated["verification_status"] = "proof_submitted"
         updated["proof_submitted"] = datetime.now(timezone.utc).isoformat()
+        updated["proof_kind"] = proof_kind
+        updated["proof_file_id"] = proof_file_id
+        updated["proof_link"] = link if proof_kind == "link" else ""
+        updated["proof_caption"] = (message.caption or "").strip()[:500]
         users_db[uid] = updated
         if not await sync_state_to_cloud():
             users_db[uid] = previous
