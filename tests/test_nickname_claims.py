@@ -241,7 +241,7 @@ class TestClaimSecurity(unittest.TestCase):
         self.assertIn('"currentDocument": {"updateTime": docs["config/bot_state"]["updateTime"]}', source)
         self.assertIn('"writes": [write]', source)
         self.assertIn("if any(uid in protected for uid, _ in holders):", source)
-        self.assertIn("updated[\"verification_status\"]", source)
+        self.assertIn('"verification_status": "pending"', source)
 
 
 if __name__ == "__main__":
