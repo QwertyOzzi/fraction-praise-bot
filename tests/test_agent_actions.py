@@ -289,6 +289,7 @@ class TestSeparateAgentTransactions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["id"], fixed_id)
         self.assertEqual(second["id"], fixed_id)
         self.assertEqual(second["status"], "sending")
+        self.assertTrue(second["_already_persisted"])
         self.assertEqual(len(self.cloud.commits), 1)
 
     async def test_existing_id_with_different_payload_is_rejected(self):
