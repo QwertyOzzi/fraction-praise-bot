@@ -20,7 +20,8 @@ class BalanceConflict(ValueError):
 async def apply_batch(client, sheet: str, targets: list[dict], action: str,
                       amount: int, transaction_id: str, session_factory,
                       *, aliases: list[str] | None = None,
-                      original_text: str = "") -> str:
+                      original_text: str = "",
+                      agent_audit: dict | None = None) -> str:
     """Return 'applied' or 'already_applied', otherwise raise.
 
     No partial updates are possible: all players share one Firestore document
@@ -37,6 +38,15 @@ async def apply_batch(client, sheet: str, targets: list[dict], action: str,
         raise ValueError("Invalid operation id")
     if len({str(t["nick"]).casefold() for t in targets}) != len(targets):
         raise ValueError("Duplicate agents")
+    if agent_audit is not None:
+        if (not isinstance(agent_audit, dict)
+                or agent_audit.get("actor_id", 0) <= 0
+                or type(agent_audit.get("actor_id")) is not int
+                or not isinstance(agent_audit.get("actor_nick"), str)
+                or not agent_audit["actor_nick"]
+                or not isinstance(agent_audit.get("reason", ""), str)
+                or len(agent_audit.get("reason", "")) > 1000):
+            raise ValueError("Invalid agent audit metadata")
     if aliases is not None and (
             not isinstance(aliases, list)
             or len(aliases) != len(targets)
@@ -136,6 +146,33 @@ async def apply_batch(client, sheet: str, targets: list[dict], action: str,
                 payload["fields"][MEMORY_FIELD] = {
                     "stringValue": encode_alias_book(updated_aliases)
                 }
+            if agent_audit:
+                # An independent, append-only agent audit trail is written
+                # together with the changed balance. It never uses admin logs.
+                old_audit = data.get("fields", {}).get(
+                    "appliedAgentActions", {}).get("arrayValue", {}).get("values", [])
+                clean = [
+                    item for item in old_audit
+                    if isinstance(item, dict) and isinstance(
+                        item.get("stringValue"), str)
+                ][-299:]
+                actor_log = {
+                    "operation": transaction_id,
+                    "actor_id": agent_audit["actor_id"],
+                    "actor_nick": agent_audit["actor_nick"][:70],
+                    "targets": [t["nick"] for t in targets],
+                    "action": action, "sheet": sheet, "amount": amount,
+                    "reason": agent_audit.get("reason", "")[:500],
+                    "reviewer_id": agent_audit.get("reviewer_id", 0),
+                    "at": datetime.now(timezone.utc).isoformat()
+                }
+                import json
+                clean.append({"stringValue": json.dumps(
+                    actor_log, ensure_ascii=False, separators=(",", ":")
+                )})
+                payload["fields"]["appliedAgentActions"] = {
+                    "arrayValue": {"values": clean}
+                }
             params = [
                 ("currentDocument.updateTime", revision),
                 ("updateMask.fieldPaths", "rows"),
@@ -144,6 +181,8 @@ async def apply_batch(client, sheet: str, targets: list[dict], action: str,
             ]
             if updated_aliases != old_aliases:
                 params.append(("updateMask.fieldPaths", MEMORY_FIELD))
+            if agent_audit:
+                params.append(("updateMask.fieldPaths", "appliedAgentActions"))
             async with session.patch(url, headers=headers, params=params, json=payload) as response:
                 if response.status == 200:
                     return "applied"
