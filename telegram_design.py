@@ -4,13 +4,8 @@ No experimental Rich Message API. The only promotional placement is an
 optional, small inline URL button on the home and status cards.
 """
 import re
-from pathlib import Path
 
-from aiogram.types import (
-    FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
-)
-
-MENU_BANNER_PATH = Path(__file__).resolve().parent / "assets" / "addams_custom_menu.jpg"
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 LEA_URL = "https://lea-script.space/"
 LEA_LABEL = "🧩 ЛЕА ↗"
@@ -68,30 +63,25 @@ async def send_fbi_card(message, text: str, *, reply_markup=None, lea: bool = Fa
 
 
 async def send_home_banner_card(message, text: str, *, reply_markup=None,
-                                lea: bool = False):
-    """Show the supplied Addams Custom banner with the normal inline menu.
+                                lea: bool = False, banner_file_id: str = ""):
+    """Show the owner-selected Telegram banner with the normal home keyboard.
 
-    If the file is unavailable or Telegram rejects the media, preserve the
-    original text-based menu and every button. This never edits old messages.
+    Telegram file_id is stored in verified Firebase cloud state; it is not an
+    external URL, and no image needs to be checked into the public repository.
+    If media becomes unavailable, retain the original text menu and buttons.
     """
-    if not MENU_BANNER_PATH.is_file():
+    if not banner_file_id:
         return await send_fbi_card(message, text, reply_markup=reply_markup, lea=lea)
-
     if lea and reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):
         raise ValueError("LEA chip requires an inline keyboard")
     markup = add_lea_button(reply_markup) if lea else reply_markup
     try:
         return await message.answer_photo(
-            photo=FSInputFile(str(MENU_BANNER_PATH)),
-            caption=card_html(text),
-            parse_mode="HTML",
-            reply_markup=markup
+            photo=banner_file_id, caption=card_html(text),
+            parse_mode="HTML", reply_markup=markup
         )
     except Exception:
-        # The home menu must still work when the image is temporarily rejected.
-        return await send_fbi_card(
-            message, text, reply_markup=reply_markup, lea=lea
-        )
+        return await send_fbi_card(message, text, reply_markup=reply_markup, lea=lea)
 
 
 async def edit_fbi_card(message, text: str, *, reply_markup=None, lea: bool = False):
