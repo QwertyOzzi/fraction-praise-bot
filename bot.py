@@ -18,6 +18,10 @@ from natural_commands import (interpret as interpret_natural, resolve_names,
                               looks_like_operation, simple_parse, ParseError, MODEL)
 from natural_balance import apply_batch, BalanceConflict
 from natural_aliases import load_alias_memory, resolve_with_memory, AliasMemoryError
+from agent_tools import (
+    parse_min_args, active_profile, suggest_nicks,
+    describe_command, audit_fields, audit_preview
+)
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
@@ -103,6 +107,12 @@ admins_db: List[int] = load_json(ADMINS_FILE, [])
 pending_admin_requests: Dict[int, Dict[str, Any]] = {}
 admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
+# Kept separately from ordinary report requests and leadership audit events.
+agent_requests_db: Dict[str, Any] = {}
+AGENT_TASKS: Dict[str, Dict[str, Any]] = {}
+NEWS_DRAFTS: Dict[str, Dict[str, Any]] = {}
+_AGENT_TASK_LOCKS: Dict[str, asyncio.Lock] = {}
+_AGENT_TASK_TTL = 600
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 completed_cleanup_ids = set()
 _cloud_state_hydrated = False
@@ -598,6 +608,18 @@ async def sync_state_from_cloud():
                     cloud_requests = cloud_data.get("requests", {})
                     for rid, rdata in cloud_requests.items():
                         requests_db[str(rid)] = rdata
+                    # Pending points requests survive Render restarts.  Never
+                    # mix these entries with existing FRP-report requests.
+                    saved_agent_requests = cloud_data.get("agent_point_requests", {})
+                    if not isinstance(saved_agent_requests, dict):
+                        raise RuntimeError("Invalid agent requests in cloud")
+                    agent_requests_db.clear()
+                    agent_requests_db.update({
+                        str(rid): row for rid, row in saved_agent_requests.items()
+                        if isinstance(row, dict) and
+                        row.get("status") in ("pending", "processing", "uncertain",
+                                              "approved", "rejected")
+                    })
 
                     save_json(USERS_FILE, users_db)
                     save_json(ADMINS_FILE, admins_db)
@@ -672,7 +694,8 @@ async def sync_state_to_cloud():
                 "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
-                "requests": requests_db
+                "requests": requests_db,
+                "agent_point_requests": agent_requests_db
             }
 
             body = {
@@ -725,6 +748,14 @@ class GrantStates(StatesGroup):
 class AiStates(StatesGroup):
     waiting_for_text = State()
 
+
+class AgentPointStates(StatesGroup):
+    waiting_for_reason = State()
+
+
+class NewsStates(StatesGroup):
+    waiting_for_post = State()
+
 class SupportStates(StatesGroup):
     waiting_for_message = State()
 
@@ -762,6 +793,11 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
             [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
+            [InlineKeyboardButton(text="📒 Заявки агентов", callback_data="main:agentrequests"),
+             InlineKeyboardButton(text="📜 Лог агентов", callback_data="main:agentlog")],
+            *([[InlineKeyboardButton(text="📢 Рассылка новостей",
+                                    callback_data="main:news")]]
+              if is_leader(user_id) else []),
             [InlineKeyboardButton(text="◀️ Личный кабинет", callback_data="main:home")],
         ]
     else:
@@ -770,7 +806,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
-            [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
+            [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support"),
+             InlineKeyboardButton(text="➖ Баллы", callback_data="main:agent_points")],
             [InlineKeyboardButton(text="🌐 Таблица", web_app=WebAppInfo(url=WEBAPP_URL))],
         ]
         if is_admin(user_id):
@@ -833,6 +870,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="support", description="Поддержка и баг-репорт"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
+    BotCommand(command="min", description="FRP/похвалы: − сразу, + через заявку"),
 ]
 ADMIN_BOT_COMMANDS = [
     BotCommand(command="agents", description="Управление агентами"),
@@ -841,11 +879,15 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="grant", description="Начислить FRP / похвалы"),
     BotCommand(command="admins", description="Список руководства"),
     BotCommand(command="claims", description="Проверка спорных регистраций"),
+    BotCommand(command="agentrequests", description="Заявки агентов на начисление"),
+    BotCommand(command="agentlog", description="Журнал действий агентов"),
     BotCommand(command="ai", description="ИИ-команды: начисление и списание FRP"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
     BotCommand(command="notifications", description="Уведомления руководства"),
+    BotCommand(command="news", description="Новость всем агентам"),
+    BotCommand(command="update", description="Рассылка об обновлении"),
 ]
 
 
@@ -854,7 +896,10 @@ def commands_for_user(user_id: int) -> List[BotCommand]:
     if is_admin(user_id):
         commands.extend(ADMIN_BOT_COMMANDS)
     if is_owner(user_id):
-        commands.extend(OWNER_BOT_COMMANDS)
+        commands.append(OWNER_BOT_COMMANDS[0])
+        commands.append(OWNER_BOT_COMMANDS[1])
+    if is_leader(user_id):
+        commands.extend(OWNER_BOT_COMMANDS[2:])
     return commands
 
 
@@ -1478,7 +1523,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai"}
+MAIN_MENU_ADMIN_ACTIONS = {
+    "admin", "agents", "queue", "pending", "grant", "admins", "ai",
+    "agentrequests", "agentlog"
+}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1529,6 +1577,43 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             callback.message, home_card_text(profile, uid),
             reply_markup=get_main_menu(uid), lea=True
         )
+        await callback.answer()
+        return
+
+    if action == "agent_points":
+        if await state.get_state():
+            await callback.answer("Сначала закончите текущее действие или /cancel.",
+                                  show_alert=True)
+            return
+        if not active_profile(users_db.get(str(uid))):
+            await callback.answer("Сначала подтвердите игровой ник.", show_alert=True)
+            return
+        await callback.message.answer(
+            "➖ <b>FBI · Баллы агентов</b>\n\n"
+            "Для списания: <code>/min frp Gomez_Addams -2</code>\n"
+            "Для заявки на начисление: "
+            "<code>/min praise Gomez_Addams +1</code>\n\n"
+            "Можно написать прямо в чат: <code>Гомер -2 фрп</code>.",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    if action in ("agentrequests", "agentlog", "news"):
+        if action == "news":
+            if not is_leader(uid):
+                await callback.answer("Рассылки доступны только лидеру и владельцу.",
+                                      show_alert=True)
+                return
+            if await state.get_state():
+                await callback.answer("Завершите текущее действие или /cancel.",
+                                      show_alert=True)
+                return
+            await begin_news(callback.message, state)
+        elif action == "agentrequests":
+            await show_agent_requests(callback.message, uid)
+        else:
+            await show_agent_log(callback.message, uid)
         await callback.answer()
         return
 
