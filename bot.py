@@ -25,6 +25,9 @@ from agent_actions import (
     decide_add_request, list_collection, create_announcement, finish_announcement
 )
 from personnel import personnel_details, ranked_reporters
+from access_control import (PERMISSIONS, AGENT_DELEGATABLE,
+    normalize_overrides, sign_overrides, has_permission as resolve_permission,
+    max_debit_for)
 from telegram_design import (send_fbi_card, send_home_banner_card,
                              edit_fbi_card, hide_old_reply_keyboard,
                              with_home_button)
@@ -113,6 +116,7 @@ users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
 pending_admin_requests: Dict[int, Dict[str, Any]] = {}
 admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
+permission_overrides: Dict[str, Dict[str, bool]] = {}
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 completed_cleanup_ids = set()
@@ -137,6 +141,22 @@ def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
     msg = json.dumps(signed_payload, ensure_ascii=True, sort_keys=True,
                      separators=(",", ":")).encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def permission_secret() -> str:
+    return os.getenv("ADMIN_ACL_SIGNING_KEY", "").strip() or BOT_TOKEN
+
+
+def has_permission(user_id: int, permission: str) -> bool:
+    return resolve_permission(user_id, permission, owners=OWNER_TELEGRAM_IDS,
+        admins=admins_db, roles=admin_roles, overrides=permission_overrides,
+        hydrated=_cloud_state_hydrated)
+
+
+def debit_limit(user_id: int) -> int:
+    return max_debit_for(user_id, owners=OWNER_TELEGRAM_IDS,
+        admins=admins_db, roles=admin_roles, overrides=permission_overrides,
+        hydrated=_cloud_state_hydrated)
 
 
 def is_admin(user_id: int) -> bool:
@@ -578,6 +598,17 @@ async def sync_state_from_cloud():
                         if cloud_roles.get(str(item)) in ("leader", "deputy")
                         else "deputy" for item in filtered
                     }
+                    # Additional, separately signed capabilities do not alter the
+                    # existing admins/admin_roles signature or revoke old grants.
+                    cloud_permissions = normalize_overrides(
+                        cloud_data.get("permission_overrides", {}))
+                    permission_signature = str(cloud_data.get("permission_overrides_signature") or "")
+                    expected_permissions = sign_overrides(cloud_permissions, permission_secret())
+                    if ((cloud_permissions and not permission_signature) or
+                            (permission_signature and not hmac.compare_digest(
+                                permission_signature, expected_permissions))):
+                        logger.error("Permission override signature invalid; refusing state hydration")
+                        return
                     signature = cloud_data.get("admin_acl_signature", "")
                     expected = sign_admin_permissions(filtered, filtered_roles)
                     if filtered and not signature:
@@ -608,6 +639,8 @@ async def sync_state_from_cloud():
                     admins_db[:] = filtered
                     admin_roles.clear()
                     admin_roles.update(filtered_roles)
+                    permission_overrides.clear()
+                    permission_overrides.update(cloud_permissions)
                     save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
@@ -627,6 +660,7 @@ async def sync_state_from_cloud():
                     # Owners retain their hardcoded Telegram identity to bootstrap the system.
                     admins_db.clear()
                     admin_roles.clear()
+                    permission_overrides.clear()
                     MENU_BANNER_FILE_ID = ""
                     save_json(ADMINS_FILE, admins_db)
                     save_json("admin_roles.json", admin_roles)
@@ -688,6 +722,8 @@ async def sync_state_to_cloud():
                 "admins": admins_db,
                 "admin_roles": admin_roles,
                 "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
+                "permission_overrides": permission_overrides,
+                "permission_overrides_signature": sign_overrides(permission_overrides, permission_secret()),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db,
@@ -897,6 +933,7 @@ OWNER_BOT_COMMANDS = [
     BotCommand(command="notifications", description="Уведомления руководства"),
     BotCommand(command="setbanner", description="Установить баннер главного меню"),
     BotCommand(command="removebanner", description="Убрать баннер из меню"),
+    BotCommand(command="permissions", description="Управление правами сотрудников"),
 ]
 
 
@@ -3452,6 +3489,57 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
         text = text.replace("<i>Выберите действие.", details + "\n\n<i>Выберите действие.")
     await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
 
+
+
+
+@dp.message(Command("permissions"))
+async def cmd_permissions(message: types.Message):
+    """Owner-only capabilities; never replace existing Telegram role assignments."""
+    if not is_owner(message.from_user.id):
+        await message.answer("⛔ Настраивать права может только владелец.")
+        return
+    if not _cloud_state_hydrated:
+        await message.answer("Firebase ещё не подтвердил состояние прав.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) == 1:
+        await message.answer(
+            "🔐 Права фракции:\n" + "\n".join("• " + p for p in PERMISSIONS) +
+            "\n\nИзменить: /permissions TelegramID permission allow|deny|clear\n"
+            "Пример: /permissions 123456789 points.debit allow\n"
+            "Без явного разрешения обычные агенты не могут списывать баллы."
+        )
+        return
+    if len(parts) != 4 or not parts[1].isdigit() or parts[2] not in PERMISSIONS or parts[3] not in ("allow", "deny", "clear"):
+        await message.answer("Неверные параметры. Используйте /permissions для справки.")
+        return
+    uid, capability, mode = parts[1], parts[2], parts[3]
+    if (uid not in users_db and int(uid) not in admins_db
+            and int(uid) not in OWNER_TELEGRAM_IDS):
+        await message.answer("Telegram ID не принадлежит зарегистрированному сотруднику.")
+        return
+    if int(uid) in OWNER_TELEGRAM_IDS:
+        await message.answer("Права владельца не изменяются.")
+        return
+    if int(uid) not in admins_db and capability not in AGENT_DELEGATABLE:
+        await message.answer("Обычным агентам можно отдельно разрешать только points.debit.")
+        return
+    previous = {key: dict(value) for key, value in permission_overrides.items()}
+    if mode == "clear":
+        if uid in permission_overrides:
+            permission_overrides[uid].pop(capability, None)
+            if not permission_overrides[uid]:
+                permission_overrides.pop(uid)
+    else:
+        permission_overrides.setdefault(uid, {})[capability] = (mode == "allow")
+    if not await sync_state_to_cloud():
+        permission_overrides.clear()
+        permission_overrides.update(previous)
+        await message.answer("Firebase не подтвердила изменение прав.")
+        return
+    await record_admin_activity("permission_changed", message.from_user.id,
+                                f"Telegram ID {uid}: {capability} -> {mode}")
+    await message.answer(f"✅ Право {capability}: {mode}. Прежние роли сохранены.")
 
 
 @dp.message(Command("profile"))
