@@ -92,6 +92,9 @@ class TestAgentCallbacks(unittest.IsolatedAsyncioTestCase):
             "_AGENT_TASK_LOCKS": {}, "_AGENT_TASK_TTL": 600,
             "users_db": {"42": {"nick": "Test_Agent"}},
             "active_profile": lambda profile: True,
+            "AgentPointStates": types.SimpleNamespace(
+                waiting_for_reason="agent-reason"
+            ),
             "firebase_client": object(), "ClientSession": object(),
             "apply_batch": apply, "agent_audit_event": audit,
             "asyncio": asyncio, "datetime": datetime, "timezone": timezone,
