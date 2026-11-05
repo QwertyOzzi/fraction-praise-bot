@@ -16,6 +16,7 @@ ROLE_DEFAULTS = {
     "leader": frozenset((
         "agents.view", "agents.rank", "department.manage", "reports.review",
         "points.grant", "points.debit", "stats.view", "news.publish",
+        "events.manage", "messages.schedule",
     )),
     "deputy": frozenset((
         "agents.view", "reports.review", "points.grant", "points.debit",
