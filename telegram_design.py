@@ -4,8 +4,13 @@ No experimental Rich Message API. The only promotional placement is an
 optional, small inline URL button on the home and status cards.
 """
 import re
+from pathlib import Path
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+)
+
+MENU_BANNER_PATH = Path(__file__).resolve().parent / "assets" / "addams_custom_menu.jpg"
 
 LEA_URL = "https://lea-script.space/"
 LEA_LABEL = "🧩 ЛЕА ↗"
@@ -60,6 +65,33 @@ async def send_fbi_card(message, text: str, *, reply_markup=None, lea: bool = Fa
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+
+
+async def send_home_banner_card(message, text: str, *, reply_markup=None,
+                                lea: bool = False):
+    """Show the supplied Addams Custom banner with the normal inline menu.
+
+    If the file is unavailable or Telegram rejects the media, preserve the
+    original text-based menu and every button. This never edits old messages.
+    """
+    if not MENU_BANNER_PATH.is_file():
+        return await send_fbi_card(message, text, reply_markup=reply_markup, lea=lea)
+
+    if lea and reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):
+        raise ValueError("LEA chip requires an inline keyboard")
+    markup = add_lea_button(reply_markup) if lea else reply_markup
+    try:
+        return await message.answer_photo(
+            photo=FSInputFile(str(MENU_BANNER_PATH)),
+            caption=card_html(text),
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+    except Exception:
+        # The home menu must still work when the image is temporarily rejected.
+        return await send_fbi_card(
+            message, text, reply_markup=reply_markup, lea=lea
+        )
 
 
 async def edit_fbi_card(message, text: str, *, reply_markup=None, lea: bool = False):
