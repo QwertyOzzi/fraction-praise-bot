@@ -74,6 +74,7 @@ class TestNaturalOnlyWhenIdle(unittest.IsolatedAsyncioTestCase):
             "is_admin": lambda uid: uid == 101,
             "looks_like_operation": lambda text: "фрп" in text,
             "handle_natural_command": handle,
+            "get_verified_agent": lambda uid: None,
         })
 
     async def test_only_idle_admin_message_triggers_ai(self):

@@ -7,6 +7,7 @@ import uuid
 import hashlib
 import hmac
 import re
+import difflib
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -18,6 +19,11 @@ from natural_commands import (interpret as interpret_natural, resolve_names,
                               looks_like_operation, simple_parse, ParseError, MODEL)
 from natural_balance import apply_batch, BalanceConflict
 from natural_aliases import load_alias_memory, resolve_with_memory, AliasMemoryError
+from natural_commands import simplified
+from agent_actions import (
+    AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
+    decide_add_request, list_collection, create_announcement, finish_announcement
+)
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
@@ -725,6 +731,17 @@ class GrantStates(StatesGroup):
 class AiStates(StatesGroup):
     waiting_for_text = State()
 
+
+class AgentActionStates(StatesGroup):
+    waiting_add_evidence = State()
+    confirm_add = State()
+
+
+class NewsStates(StatesGroup):
+    waiting_for_text = State()
+    confirm = State()
+
+
 class SupportStates(StatesGroup):
     waiting_for_message = State()
 
@@ -761,7 +778,11 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📌 Заявки", callback_data="main:pending"),
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
+            [InlineKeyboardButton(text="📥 Запросы агентов", callback_data="main:agentpending")],
+            [InlineKeyboardButton(text="📜 Журнал агентов", callback_data="main:agentlogs")],
             [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
+            *([[InlineKeyboardButton(text="📣 Новости для всех", callback_data="main:news")]]
+              if is_leader(user_id) else []),
             [InlineKeyboardButton(text="◀️ Личный кабинет", callback_data="main:home")],
         ]
     else:
@@ -770,6 +791,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
+            [InlineKeyboardButton(text="➖ Списать FRP / похвалу", callback_data="main:min")],
+            [InlineKeyboardButton(text="➕ Запросить начисление", callback_data="main:plus")],
             [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
             [InlineKeyboardButton(text="🌐 Таблица", web_app=WebAppInfo(url=WEBAPP_URL))],
         ]
@@ -830,6 +853,8 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="status", description="Мои FRP и похвалы"),
     BotCommand(command="nick", description="Изменить игровой ник"),
     BotCommand(command="rank", description="Запросить смену ранга"),
+    BotCommand(command="min", description="Списать FRP/похвалу агенту"),
+    BotCommand(command="plus", description="Запросить начисление с причиной"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
@@ -842,6 +867,8 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="admins", description="Список руководства"),
     BotCommand(command="claims", description="Проверка спорных регистраций"),
     BotCommand(command="ai", description="ИИ-команды: начисление и списание FRP"),
+    BotCommand(command="agentpending", description="Заявки агентов на начисление"),
+    BotCommand(command="agentlogs", description="Отдельный журнал действий агентов"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
@@ -853,6 +880,9 @@ def commands_for_user(user_id: int) -> List[BotCommand]:
     commands = list(PUBLIC_BOT_COMMANDS)
     if is_admin(user_id):
         commands.extend(ADMIN_BOT_COMMANDS)
+    if is_leader(user_id):
+        commands.append(BotCommand(command="news", description="Новости и обновления для всех"))
+        commands.append(BotCommand(command="newslog", description="История рассылок"))
     if is_owner(user_id):
         commands.extend(OWNER_BOT_COMMANDS)
     return commands
@@ -1478,7 +1508,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai"}
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs"}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1530,6 +1560,42 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=get_main_menu(uid), lea=True
         )
         await callback.answer()
+        return
+
+    if action == "news":
+        if not is_leader(uid):
+            await callback.answer("Рассылка доступна только владельцу или лидеру.", show_alert=True)
+            return
+        if await state.get_state():
+            await callback.answer("Завершите текущее действие или используйте /cancel.", show_alert=True)
+            return
+        source = callback.message.model_copy(update={
+            "from_user": callback.from_user,
+            # Menu callback points at the BOT's previous message, not /news.
+            "text": "/news"
+        })
+        await callback.answer()
+        await cmd_news(source, state)
+        return
+
+    if action in ("min", "plus"):
+        if await state.get_state():
+            await callback.answer("Сначала завершите текущее действие или /cancel.", show_alert=True)
+            return
+        profile = get_verified_agent(uid)
+        if not profile:
+            await callback.answer("Сначала подтвердите регистрацию.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            "➖ <b>Списание</b>: <code>/min frp Gomez_Addams -2</code>\n"
+            "➕ <b>Начисление</b>: <code>/plus praise Gomez_Addams +1</code>\n\n"
+            "Можно также написать обычную фразу, например "
+            "<code>Гомер -2 фрп</code>.\n"
+            "<i>Списание требует вашего подтверждения; начисление — причины "
+            "или доказательства и одобрения руководства.</i>",
+            parse_mode="HTML"
+        )
         return
 
     if action == "ai":
@@ -1594,6 +1660,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         "pending": (cmd_pending, False),
         "grant": (cmd_grant_menu, True),
         "admins": (cmd_list_admins, False),
+        "agentpending": (cmd_agent_pending, False),
+        "agentlogs": (cmd_agent_logs, False),
     }
     route = routes.get(action)
     if route is None:
@@ -4125,6 +4193,829 @@ async def confirm_natural_command(callback: types.CallbackQuery):
         logger.warning("Cannot refresh AI confirmation: %s", type(exc).__name__)
 
 
+
+# --- Independent agent operations: never mixed with leadership audit ---------
+AGENT_CONFIRM_TTL = 300
+AGENT_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+_AGENT_LIMIT: Dict[int, List[float]] = {}
+_AGENT_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def get_verified_agent(uid: int) -> Optional[Dict[str, Any]]:
+    """Only a cloud-verified profile can change game balances."""
+    if type(uid) is not int or not _cloud_state_hydrated:
+        return None
+    profile = users_db.get(str(uid))
+    if (not isinstance(profile, dict)
+            or not re.fullmatch(r"[A-Za-z0-9_]{3,30}",
+                                str(profile.get("nick") or ""))
+            or profile.get("verification_status") in (
+                "pending", "needs_proof", "proof_submitted", "disabled",
+                "disconnected", "retry_ready", "cooldown")):
+        return None
+    return profile
+
+
+def _agent_private(message) -> bool:
+    return (getattr(message.chat, "type", "") == "private"
+            and message.chat.id == message.from_user.id)
+
+
+def _agent_key_row(row):
+    return {key: str(row.get(key) or "") for key in ("nick", "id", "profileId", "rank")} | {
+        "qty": int(row.get("qty") or 0)
+    }
+
+
+def _agent_fuzzy_suggestion(alias: str, rows: List[Dict[str, Any]]):
+    """Conservative unique suggestion, NEVER a silent authoritative match."""
+    key = simplified(alias)
+    if len(key) < 4:
+        return None
+    candidates = []
+    for row in rows:
+        nick = str(row.get("nick") or "")
+        if not nick:
+            continue
+        tokens = [simplified(part) for part in nick.split("_")]
+        score = max((difflib.SequenceMatcher(None, key, token).ratio()
+                     for token in tokens if token), default=0.0)
+        if score >= 0.75:
+            candidates.append((score, row))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if (not candidates or candidates[0][0] < 0.75
+            or (len(candidates) > 1 and
+                candidates[0][0] - candidates[1][0] < 0.12)):
+        return None
+    return _agent_key_row(candidates[0][1])
+
+
+async def _agent_parse_and_resolve(raw: str, *, forced_action: str = ""):
+    """Parse one target only; never auto-select an ambiguous or stale alias."""
+    plan, origin = await interpret_natural(raw, GEMINI_API_KEY, gemini_json_request)
+    if forced_action and plan["action"] != forced_action:
+        raise AgentOperationError("Знак операции не совпадает с командой.")
+    if len(plan["names"]) != 1:
+        raise AgentOperationError(
+            "Агенту разрешена одна цель за операцию. Укажите один ник."
+        )
+    alias = plan["names"][0]
+    rows = await firebase_client.get_sheet(plan["sheet"])
+    memory = await load_alias_memory(firebase_client, ClientSession)
+    results, errors = resolve_with_memory([alias], rows, memory, plan["sheet"])
+    guessed = False
+    if errors:
+        # Never override a blocked/stale learned alias or an ambiguous match.
+        if simplified(alias) not in memory and len(errors) == 1 and "не найден" in errors[0]:
+            proposal = _agent_fuzzy_suggestion(alias, rows)
+            if proposal:
+                results, errors, guessed = [proposal], [], True
+    if errors:
+        raise AgentOperationError(
+            "Нужно уточнить ник: " + "; ".join(errors) +
+            ". Используйте полный игровой ник."
+        )
+    if len(results) != 1:
+        raise AgentOperationError("Ник не удалось однозначно определить.")
+    return plan, _agent_key_row(results[0]), alias, guessed, origin
+
+
+def _format_agent_operation(plan, target, alias, guessed):
+    label = "FRP" if plan["sheet"] == "fractionrp" else "похвал"
+    signed = ("−" if plan["action"] == "debit" else "+") + str(plan["amount"])
+    return (
+        "👤 <b>FBI · Проверка действия агента</b>\n\n"
+        f"🔎 Ввод: <code>{html.escape(alias)}</code>\n"
+        f"🎮 <b>Найденный ник:</b> <code>{html.escape(target['nick'])}</code>\n"
+        f"📌 Баланс: <b>{target['qty']}</b>\n"
+        f"🧮 Действие: <b>{signed} {label}</b>\n"
+        + ("⚠️ <b>Совпадение приблизительное!</b> "
+           "Проверьте полный ник перед подтверждением.\n" if guessed else "")
+    )
+
+
+async def agent_operation_from_text(message: types.Message, raw: str,
+                                    *, forced_action=""):
+    uid = message.from_user.id
+    if not _agent_private(message):
+        await message.answer("Действия агентов доступны только в личном чате.")
+        return
+    profile = get_verified_agent(uid)
+    if not profile:
+        await message.answer(
+            "⛔ Для управления баллами нужна подтверждённая регистрация. /start"
+        )
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    recent = [t for t in _AGENT_LIMIT.get(uid, []) if now - t < 60]
+    if len(recent) >= 5:
+        await message.answer("⏳ Не более 5 новых операций в минуту.")
+        return
+    _AGENT_LIMIT[uid] = [*recent, now]
+    try:
+        plan, target, alias, guessed, origin = await _agent_parse_and_resolve(
+            raw, forced_action=forced_action
+        )
+    except (ParseError, AgentOperationError) as exc:
+        await message.answer("⚠️ " + html.escape(str(exc)))
+        return
+    except Exception as exc:
+        logger.warning("Agent command resolution failed: %s", type(exc).__name__)
+        await message.answer(
+            "⚠️ Не удалось проверить запрос в Firebase или Gemini. "
+            "Балансы не изменились."
+        )
+        return
+    if plan["action"] == "debit" and target["qty"] < plan["amount"]:
+        await message.answer(
+            "⚠️ Недостаточно баллов: сейчас " + str(target["qty"])
+        )
+        return
+    token = uuid.uuid4().hex[:20]
+    AGENT_CONFIRMATIONS[token] = {
+        "uid": uid, "chat_id": message.chat.id, "created": now, "status": "new",
+        "plan": plan, "target": target, "alias": alias,
+        "guessed": guessed, "raw": raw,
+        "op_id": "agent-" + uuid.uuid4().hex
+    }
+    for old_token, value in list(AGENT_CONFIRMATIONS.items()):
+        if now - value["created"] > AGENT_CONFIRM_TTL:
+            AGENT_CONFIRMATIONS.pop(old_token, None)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=("✅ Подтвердить списание" if plan["action"] == "debit"
+                  else "📎 Продолжить заявку"),
+            callback_data=f"agentop:confirm:{token}", style="success")],
+        [InlineKeyboardButton(text="❌ Отмена",
+                              callback_data=f"agentop:cancel:{token}")]
+    ])
+    text = _format_agent_operation(plan, target, alias, guessed)
+    text += (
+        "\n<i>После подтверждения баллы спишутся без решения руководства.</i>"
+        if plan["action"] == "debit"
+        else "\n<i>Для начисления нужны причина или доказательства; "
+             "баланс изменится только после одобрения руководством.</i>"
+    )
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+def parse_agent_slash(raw: str, action: str) -> str:
+    """Accept /min frp Nick -2 and /plus praise Nick +2, one target at a time."""
+    match = re.fullmatch(
+        r"\s*(frp|fractionrp|praise|фрп|похвал[аы]?)\s+"
+        r"([A-Za-zА-Яа-яЁё0-9_]{2,40})\s+([+-])\s*(\d{1,2})\s*",
+        raw, re.I
+    )
+    if not match:
+        raise AgentOperationError(
+            "Формат: /min frp Nick_Name -2 или /plus praise Nick_Name +2."
+        )
+    category, nickname, sign, amount = match.groups()
+    if sign != ("-" if action == "debit" else "+"):
+        raise AgentOperationError("Неверный знак: для /min нужен −, для /plus +.")
+    category = "praise" if category.casefold().startswith(("praise", "похвал")) else "frp"
+    return f"{nickname} {sign}{amount} {category}"
+
+
+@dp.message(Command("min", "plus"))
+async def cmd_agent_min_plus(message: types.Message, state: FSMContext):
+    if await state.get_state() is not None:
+        await message.answer(
+            "⏳ Бот ожидает данные текущего действия. "
+            "Сначала завершите его или используйте /cancel."
+        )
+        return
+    command, *remainder = (message.text or "").split(maxsplit=1)
+    kind = command.split("@", 1)[0].lstrip("/").casefold()
+    if not remainder:
+        await message.answer(
+            f"📝 <b>FBI · {'Списание' if kind == 'min' else 'Запрос начисления'}</b>\n\n"
+            f"<code>/{kind} frp Gomez_Addams {'-2' if kind == 'min' else '+2'}</code>\n"
+            f"<code>/{kind} praise Gomez_Addams {'-1' if kind == 'min' else '+1'}</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        raw = parse_agent_slash(remainder[0], "debit" if kind == "min" else "credit")
+    except AgentOperationError as exc:
+        await message.answer("⚠️ " + html.escape(str(exc)))
+        return
+    await agent_operation_from_text(
+        message, raw, forced_action="debit" if kind == "min" else "credit"
+    )
+
+
+@dp.callback_query(F.data.startswith("agentop:"))
+async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMContext):
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Доступно только в личном чате.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in ("confirm", "cancel"):
+        await callback.answer("Неверная операция.", show_alert=True)
+        return
+    mode, token = parts[1], parts[2]
+    uid = callback.from_user.id
+    async with _AGENT_LOCKS.setdefault(uid, asyncio.Lock()):
+        item = AGENT_CONFIRMATIONS.get(token)
+        if (not item or item["uid"] != uid
+                or item["chat_id"] != callback.message.chat.id
+                or item["status"] != "new"
+                or datetime.now(timezone.utc).timestamp() - item["created"]
+                    > AGENT_CONFIRM_TTL):
+            await callback.answer("Операция устарела или уже обработана.", show_alert=True)
+            return
+        if mode == "cancel":
+            item["status"] = "cancelled"
+            await callback.answer("Отменено.")
+            await callback.message.edit_text("❌ Действие агента отменено.")
+            return
+        if await state.get_state() is not None:
+            await callback.answer("Сначала завершите текущее действие.", show_alert=True)
+            return
+        profile = get_verified_agent(uid)
+        if not profile:
+            await callback.answer("Профиль ожидает подтверждения.", show_alert=True)
+            return
+        item["status"] = "processing"
+        await callback.answer("Проверяю данные Firebase...")
+        plan = item["plan"]
+        if plan["action"] == "credit":
+            await state.update_data(agent_add={
+                "plan": plan, "target": item["target"], "alias": item["alias"],
+                "raw": item["raw"], "nonce": uuid.uuid4().hex[:16]
+            })
+            await state.set_state(AgentActionStates.waiting_add_evidence)
+            item["status"] = "sent_to_form"
+            await callback.message.answer(
+                "📎 <b>FBI · Заявка на начисление</b>\n\n"
+                + _format_agent_operation(plan, item["target"],
+                                          item["alias"], item["guessed"])
+                + "\n<b>Отправьте причину или доказательство:</b>\n"
+                  "• Текст с причиной\n"
+                  "• Фото или видео игрового доказательства\n"
+                  "• Ссылку на игровой отчёт\n\n"
+                  "<i>Пароли и личные документы не отправляйте. "
+                  "Для отмены: /cancel.</i>",
+                parse_mode="HTML"
+            )
+            return
+        try:
+            status, audit = await commit_agent_debit(
+                firebase_client, ClientSession,
+                op_id=item["op_id"], actor_id=uid,
+                actor_nick=profile["nick"],
+                sheet=plan["sheet"], target=item["target"],
+                amount=plan["amount"], alias=item["alias"], raw=item["raw"]
+            )
+            item["status"] = "done"
+        except AgentOperationError as exc:
+            item["status"] = "failed"
+            await callback.message.edit_text(
+                "⚠️ <b>Списание не выполнено:</b> " + html.escape(str(exc)),
+                parse_mode="HTML"
+            )
+            return
+        except Exception as exc:
+            item["status"] = "uncertain"
+            logger.warning("Agent debit status uncertain: %s", type(exc).__name__)
+            await callback.message.edit_text(
+                "⚠️ Firebase не подтвердила списание. "
+                "Проверьте баланс и отдельный журнал перед повтором."
+            )
+            return
+        await callback.message.edit_text(
+            "✅ <b>FBI · Агентское списание</b>\n\n"
+            f"🎮 <code>{html.escape(item['target']['nick'])}</code>\n"
+            f"🧮 −{plan['amount']} {'FRP' if plan['sheet'] == 'fractionrp' else 'похвал'}\n"
+            f"📊 Было: {audit['before']} · Стало: {audit['after']}\n\n"
+            "📜 Действие сохранено в отдельном журнале агентов.",
+            parse_mode="HTML"
+        )
+
+
+@dp.message(AgentActionStates.waiting_add_evidence)
+async def collect_agent_add_evidence(message: types.Message, state: FSMContext):
+    if not _agent_private(message) or not get_verified_agent(message.from_user.id):
+        await message.answer("⛔ Подтвердите свою регистрацию.")
+        return
+    data = (await state.get_data()).get("agent_add")
+    if not isinstance(data, dict):
+        await state.clear()
+        await message.answer("Форма устарела. Начните заново.")
+        return
+    reason = (message.text or message.caption or "").strip()
+    kind = ""
+    evidence_id = ""
+    if message.photo:
+        kind, evidence_id = "photo", message.photo[-1].file_id
+    elif message.video:
+        kind, evidence_id = "video", message.video.file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        kind, evidence_id = "document", message.document.file_id
+    elif reason.startswith(("https://", "http://")) and len(reason) <= 700:
+        kind, evidence_id = "link", reason
+    if not reason and not kind:
+        await message.answer("Отправьте причину текстом, фото, видео или ссылку.")
+        return
+    if len(reason) > 700:
+        await message.answer("Слишком длинная причина, максимум 700 символов.")
+        return
+    data.update({
+        "reason": reason if kind != "link" else "",
+        "evidence_kind": kind,
+        "evidence_id": evidence_id,
+        "evidence_caption": reason if kind in ("photo", "video", "document") else ""
+    })
+    await state.update_data(agent_add=data)
+    await state.set_state(AgentActionStates.confirm_add)
+    plan = data["plan"]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Отправить руководству",
+                              callback_data=f"agentaddsend:{data['nonce']}", style="success")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="agentaddcancel")]
+    ])
+    await message.answer(
+        "📋 <b>FBI · Проверка заявки</b>\n\n"
+        f"🎮 <code>{html.escape(data['target']['nick'])}</code>\n"
+        f"➕ {plan['amount']} {'FRP' if plan['sheet'] == 'fractionrp' else 'похвал'}\n"
+        f"📝 Причина: {html.escape(reason[:200] or '[вложение]')}\n\n"
+        "<i>Баланс не изменится до одобрения руководством.</i>",
+        parse_mode="HTML", reply_markup=kb
+    )
+
+
+@dp.callback_query(F.data.startswith("agentaddsend:") | (F.data == "agentaddcancel"))
+async def submit_agent_add_request(callback: types.CallbackQuery, state: FSMContext):
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    uid = callback.from_user.id
+    async with _AGENT_LOCKS.setdefault(uid, asyncio.Lock()):
+        if await state.get_state() != AgentActionStates.confirm_add.state:
+            await callback.answer("Заявка уже отправлена или устарела.", show_alert=True)
+            return
+        data = (await state.get_data()).get("agent_add")
+        if not isinstance(data, dict):
+            await callback.answer("Данные заявки отсутствуют.", show_alert=True)
+            return
+        if callback.data == "agentaddcancel":
+            await state.clear()
+            await callback.answer("Отменено.")
+            await callback.message.edit_text("❌ Заявка отменена.")
+            return
+        if callback.data != f"agentaddsend:{data['nonce']}":
+            await callback.answer("Кнопка устарела.", show_alert=True)
+            return
+        profile = get_verified_agent(uid)
+        if not profile:
+            await callback.answer("Профиль не подтверждён.", show_alert=True)
+            return
+        await state.clear()  # Single-use form; no second write on double-click.
+        await callback.answer("Сохраняю заявку...")
+        plan = data["plan"]
+        try:
+            req = await create_add_request(
+                firebase_client, ClientSession,
+                actor_id=uid, actor_nick=profile["nick"],
+                sheet=plan["sheet"], target=data["target"],
+                amount=plan["amount"], reason=data.get("reason", ""),
+                evidence_kind=data.get("evidence_kind", ""),
+                evidence_id=data.get("evidence_id", ""),
+                evidence_caption=data.get("evidence_caption", ""),
+                raw=data.get("raw", ""), target_alias=data.get("alias", "")
+            )
+        except Exception as exc:
+            logger.warning("Agent add request not confirmed: %s", type(exc).__name__)
+            await callback.message.edit_text(
+                "⚠️ Сохранение заявки не подтверждено. "
+                "Проверьте её наличие у руководства перед повтором."
+            )
+            return
+        await callback.message.edit_text(
+            "✅ <b>Заявка отправлена руководству</b>\n\n"
+            f"ID: <code>{html.escape(req['id'])}</code>\n"
+            f"Ник: <code>{html.escape(req['target']['nick'])}</code>\n"
+            "Начисление ожидает решения. Это не обычный FRP-отчёт.",
+            parse_mode="HTML"
+        )
+        await notify_agent_request_reviewers(req)
+
+
+def _agent_request_markup(req_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить начисление",
+                              callback_data=f"agentreview:approve:{req_id}", style="success")],
+        [InlineKeyboardButton(text="❌ Отклонить",
+                              callback_data=f"agentreview:reject:{req_id}", style="danger")]
+    ])
+
+
+def _agent_request_text(req):
+    return (
+        "📥 <b>FBI · Заявка агента на начисление</b>\n\n"
+        f"👤 От: <code>{html.escape(str(req['actor_nick']))}</code>"
+        f" (ID <code>{int(req['actor_id'])}</code>)\n"
+        f"🎮 Кому: <code>{html.escape(str(req['target']['nick']))}</code>\n"
+        f"➕ {int(req['amount'])} {'FRP' if req['sheet'] == 'fractionrp' else 'похвал'}\n"
+        f"📝 Причина: {html.escape(str(req.get('reason') or '[вложение]')[:600])}\n"
+        f"📎 Вложение: {html.escape(str(req.get('evidence_kind') or 'нет'))}\n\n"
+        "Решение руководства обязательно. Журнал действий агента отдельный."
+    )
+
+
+async def _forward_agent_evidence(chat_id, req):
+    kind, file_id = req.get("evidence_kind"), req.get("evidence_id")
+    if not kind or not file_id:
+        return
+    try:
+        if kind == "photo":
+            await bot.send_photo(chat_id=chat_id, photo=file_id)
+        elif kind == "video":
+            await bot.send_video(chat_id=chat_id, video=file_id)
+        elif kind == "document":
+            await bot.send_document(chat_id=chat_id, document=file_id)
+        elif kind == "link":
+            await bot.send_message(chat_id, "🔗 " + html.escape(str(file_id)[:700]),
+                                   parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as exc:
+        logger.warning("Agent evidence delivery failed: %s", type(exc).__name__)
+
+
+async def notify_agent_request_reviewers(req):
+    recipients = sorted(set(OWNER_TELEGRAM_IDS) | (
+        set(admins_db) if _cloud_state_hydrated else set()
+    ))
+    for uid in recipients:
+        if not is_admin(uid):
+            continue
+        try:
+            await bot.send_message(uid, _agent_request_text(req),
+                                   reply_markup=_agent_request_markup(req["id"]),
+                                   parse_mode="HTML")
+            await _forward_agent_evidence(uid, req)
+        except Exception as exc:
+            logger.warning("Cannot deliver agent request: %s", type(exc).__name__)
+
+
+@dp.message(Command("agentpending"))
+async def cmd_agent_pending(message: types.Message):
+    if not _agent_private(message) or not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступно только руководству в личном чате.")
+        return
+    try:
+        requests = await list_collection(
+            firebase_client, ClientSession, "agent_add_requests", limit=100
+        )
+    except Exception as exc:
+        logger.warning("Agent requests unavailable: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось открыть заявки агентов.")
+        return
+    pending = [r for r in requests if r.get("status") == "pending"]
+    if not pending:
+        await message.answer("✅ Нет ожидающих заявок агентов.")
+        return
+    await message.answer(f"📥 <b>Заявки агентов:</b> {len(pending)}",
+                         parse_mode="HTML")
+    for req in pending[:20]:
+        await message.answer(
+            _agent_request_text(req),
+            reply_markup=_agent_request_markup(req["id"]),
+            parse_mode="HTML"
+        )
+        await _forward_agent_evidence(message.chat.id, req)
+
+
+@dp.callback_query(F.data.startswith("agentreview:"))
+async def review_agent_add_request(callback: types.CallbackQuery):
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id
+            or not is_admin(callback.from_user.id)):
+        await callback.answer("Нет прав руководства.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in ("approve", "reject"):
+        await callback.answer("Неверная заявка.", show_alert=True)
+        return
+    decision, req_id = parts[1:]
+    try:
+        req = await get_add_request(firebase_client, ClientSession, req_id)
+        if req.get("status") != "pending":
+            await callback.answer("Заявка уже обработана.", show_alert=True)
+            return
+        requester = get_verified_agent(int(req["actor_id"]))
+        if decision == "approve" and (
+            not requester or requester.get("nick", "").casefold()
+                             != str(req.get("actor_nick") or "").casefold()
+        ):
+            await callback.answer(
+                "Профиль заявителя изменился. Начисление запрещено.",
+                show_alert=True
+            )
+            return
+        result, processed = await decide_add_request(
+            firebase_client, ClientSession, request_id=req_id,
+            reviewer_id=callback.from_user.id, decision=decision
+        )
+    except AgentOperationError as exc:
+        await callback.answer(html.escape(str(exc))[:180], show_alert=True)
+        return
+    except Exception as exc:
+        logger.warning("Agent credit review uncertain: %s", type(exc).__name__)
+        await callback.answer(
+            "Firebase не подтвердила решение. Проверьте отдельный журнал.",
+            show_alert=True
+        )
+        return
+    if result == "already_decided":
+        await callback.answer("Заявка уже рассмотрена.", show_alert=True)
+        return
+    await callback.answer("Решение записано в Firebase.")
+    status = "✅ Начислено" if decision == "approve" else "❌ Отклонено"
+    await callback.message.edit_text(
+        f"{status} · заявка <code>{html.escape(req_id)}</code>\n"
+        f"🎮 <code>{html.escape(processed['target']['nick'])}</code>\n"
+        f"Решение руководителя: <code>{callback.from_user.id}</code>",
+        parse_mode="HTML"
+    )
+    try:
+        await bot.send_message(
+            int(processed["actor_id"]),
+            f"{status} · <b>Заявка агента</b>\n"
+            f"ID: <code>{html.escape(req_id)}</code>\n"
+            f"Ник: <code>{html.escape(processed['target']['nick'])}</code>\n"
+            f"Количество: +{processed['amount']} "
+            f"{'FRP' if processed['sheet'] == 'fractionrp' else 'похвал'}",
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.info("Could not notify agent of request outcome: %s", type(exc).__name__)
+
+
+@dp.message(Command("agentlogs"))
+async def cmd_agent_logs(message: types.Message):
+    if not _agent_private(message) or not is_admin(message.from_user.id):
+        await message.answer("⛔ Журнал действий доступен только руководству.")
+        return
+    try:
+        records = await list_collection(
+            firebase_client, ClientSession, "agent_action_logs", limit=60
+        )
+    except Exception as exc:
+        logger.warning("Agent audit read failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось получить журнал агентов.")
+        return
+    if not records:
+        await message.answer("📜 Журнал действий агентов пока пуст.")
+        return
+    for offset in range(0, min(len(records), 30), 10):
+        text = ["📜 <b>Отдельный журнал действий агентов</b>\n"]
+        for entry in records[offset:offset + 10]:
+            actor, target = (html.escape(str(entry.get("actor_nick") or "?")),
+                             html.escape(str(entry.get("target_nick") or "?")))
+            action = html.escape(str(entry.get("action") or "?"))
+            kind = "FRP" if entry.get("sheet") == "fractionrp" else "похвалы"
+            text.append(
+                f"• {actor} → {target}: "
+                f"{int(entry.get('amount') or 0):+d} {kind}\n"
+                f"  {action} · {html.escape(str(entry.get('created_at') or '')[:16])}"
+            )
+        await message.answer("\n".join(text), parse_mode="HTML")
+
+
+
+# --- Signed-leadership-only news and release announcements -------------------
+_NEWS_SEND_LOCKS: Dict[int, asyncio.Lock] = {}
+_NEWS_BROADCAST_TASKS: set = set()
+
+
+def _news_recipients():
+    """All known private Telegram users except intentionally blocked profiles."""
+    targets = set()
+    for raw_uid, profile in users_db.items():
+        if not isinstance(profile, dict) or not str(raw_uid).isdecimal():
+            continue
+        uid = int(raw_uid)
+        if uid <= 0 or profile.get("verification_status") in ("disabled", "cooldown"):
+            continue
+        targets.add(uid)
+    return sorted(targets)
+
+
+def _news_content(raw):
+    raw = (raw or "").strip()
+    category = "news"
+    marker = re.match(r"^(?:update|обновление)\s*:\s*", raw, re.I)
+    if marker:
+        category, raw = "update", raw[marker.end():].strip()
+    if not 1 <= len(raw) <= 3000:
+        raise AgentOperationError(
+            "Новость должна содержать от 1 до 3000 символов."
+        )
+    title = "Обновление системы FBI" if category == "update" else "Новости FBI"
+    return title, category, raw
+
+
+def _news_message(title, category, message):
+    icon = "🔔" if category == "update" else "📰"
+    return (
+        f"{icon} <b>FBI · {html.escape(title)}</b>\n\n"
+        + html.escape(message)
+        + "\n\n<i>Официальное сообщение руководства FBI.</i>"
+    )
+
+
+@dp.message(Command("news"))
+async def cmd_news(message: types.Message, state: FSMContext):
+    if not _agent_private(message) or not is_leader(message.from_user.id):
+        await message.answer(
+            "⛔ Публикация новостей доступна только владельцу и действующему лидеру."
+        )
+        return
+    if await state.get_state() is not None:
+        await message.answer(
+            "⏳ Завершите текущее действие или используйте /cancel."
+        )
+        return
+    words = (message.text or "").split(maxsplit=1)
+    if len(words) == 2:
+        await show_news_preview(message, state, words[1])
+        return
+    await state.set_state(NewsStates.waiting_for_text)
+    await message.answer(
+        "📰 <b>FBI · Рассылка новостей</b>\n\n"
+        "Отправьте следующим сообщением текст новости.\n"
+        "Для объявления обновления начните текст с "
+        "<code>обновление:</code>\n\n"
+        "<i>Перед отправкой всем пользователям появится предварительный "
+        "просмотр с подтверждением. /cancel — отменить.</i>",
+        parse_mode="HTML"
+    )
+
+
+async def show_news_preview(message, state, raw):
+    try:
+        title, category, body = _news_content(raw)
+    except AgentOperationError as exc:
+        await message.answer("⚠️ " + html.escape(str(exc)))
+        return
+    recipients = _news_recipients()
+    if not recipients:
+        await message.answer("Нет зарегистрированных адресатов рассылки.")
+        return
+    nonce = uuid.uuid4().hex[:16]
+    await state.update_data(news={
+        "title": title, "category": category, "message": body,
+        "nonce": nonce, "recipients": recipients
+    })
+    await state.set_state(NewsStates.confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📣 Отправить {len(recipients)} пользователям",
+            callback_data=f"newspublish:{nonce}", style="success")],
+        [InlineKeyboardButton(
+            text="❌ Отмена", callback_data="newscancel")]
+    ])
+    await message.answer(
+        _news_message(title, category, body)
+        + f"\n\n<blockquote>Адресатов: {len(recipients)}\n"
+          "Это только предварительный просмотр.</blockquote>",
+        parse_mode="HTML", reply_markup=kb
+    )
+
+
+@dp.message(NewsStates.waiting_for_text)
+async def receive_news_text(message: types.Message, state: FSMContext):
+    if not _agent_private(message) or not is_leader(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет прав на рассылку.")
+        return
+    if not message.text:
+        await message.answer("Отправьте новость текстом, максимум 3000 символов.")
+        return
+    await show_news_preview(message, state, message.text)
+
+
+async def _broadcast_fbi_news(actor_uid, news, recipients):
+    """Deliver at bounded speed, keep an independent delivery journal."""
+    sent, failed = 0, 0
+    final_text = _news_message(news["title"], news["category"], news["message"])
+    for uid in recipients:
+        try:
+            await bot.send_message(uid, final_text, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.info("News delivery to one user failed (%s)", type(exc).__name__)
+        # Telegram's global send limit: deliberately stay below ~20 messages/sec.
+        await asyncio.sleep(0.07)
+    try:
+        await finish_announcement(
+            firebase_client, ClientSession, news["id"],
+            sent=sent, failed=failed
+        )
+    except Exception as exc:
+        logger.warning("Could not finalize news journal: %s", type(exc).__name__)
+    try:
+        await bot.send_message(
+            actor_uid,
+            f"📣 <b>Рассылка завершена</b>\n\n"
+            f"ID: <code>{html.escape(news['id'])}</code>\n"
+            f"✅ Доставлено: {sent}\n⚠️ Ошибок доставки: {failed}\n\n"
+            "Журнал: /newslog",
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.info("Could not deliver broadcast summary: %s", type(exc).__name__)
+
+
+@dp.callback_query(F.data.startswith("newspublish:") | (F.data == "newscancel"))
+async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext):
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id
+            or not is_leader(callback.from_user.id)):
+        await callback.answer("Недостаточно прав для рассылки.", show_alert=True)
+        return
+    uid = callback.from_user.id
+    async with _NEWS_SEND_LOCKS.setdefault(uid, asyncio.Lock()):
+        if await state.get_state() != NewsStates.confirm.state:
+            await callback.answer("Рассылка уже подтверждена или отменена.",
+                                  show_alert=True)
+            return
+        data = (await state.get_data()).get("news")
+        if not isinstance(data, dict):
+            await callback.answer("Устаревший черновик.", show_alert=True)
+            return
+        if callback.data == "newscancel":
+            await state.clear()
+            await callback.answer("Отменено.")
+            await callback.message.edit_text("❌ Публикация отменена.")
+            return
+        if callback.data != f"newspublish:{data['nonce']}":
+            await callback.answer("Кнопка устарела.", show_alert=True)
+            return
+        await state.clear()
+        recipients = [int(x) for x in data["recipients"] if int(x) > 0]
+        try:
+            news = await create_announcement(
+                firebase_client, ClientSession, actor_id=uid,
+                title=data["title"], category=data["category"],
+                message=data["message"], recipients=len(recipients)
+            )
+        except Exception as exc:
+            logger.warning("News persistence failed: %s", type(exc).__name__)
+            await callback.answer("Не удалось сохранить рассылку. Проверьте /newslog.",
+                                  show_alert=True)
+            return
+        await callback.answer("Рассылка сохранена, начинаю отправку.")
+        await callback.message.edit_text(
+            "📣 <b>Рассылка началась</b>\n\n"
+            f"Новость <code>{html.escape(news['id'])}</code>\n"
+            f"Адресатов: {len(recipients)}\n\n"
+            "По окончании придёт отчёт о доставке.",
+            parse_mode="HTML"
+        )
+        task = asyncio.create_task(_broadcast_fbi_news(uid, news, recipients))
+        _NEWS_BROADCAST_TASKS.add(task)
+        task.add_done_callback(_NEWS_BROADCAST_TASKS.discard)
+
+
+@dp.message(Command("newslog"))
+async def cmd_news_log(message: types.Message):
+    if not _agent_private(message) or not is_leader(message.from_user.id):
+        await message.answer("⛔ Журнал рассылок доступен владельцу и лидеру.")
+        return
+    try:
+        records = await list_collection(
+            firebase_client, ClientSession, "fbi_announcements", limit=40
+        )
+    except Exception as exc:
+        logger.warning("News journal unavailable: %s", type(exc).__name__)
+        await message.answer("⚠️ Журнал новостей недоступен.")
+        return
+    if not records:
+        await message.answer("📰 Новостей пока не публиковали.")
+        return
+    lines = ["📰 <b>FBI · История рассылок</b>\n"]
+    for entry in records[:15]:
+        lines.append(
+            f"• <code>{html.escape(str(entry.get('id') or '')[-8:])}</code> — "
+            f"{html.escape(str(entry.get('title') or 'Новость'))}\n"
+            f"  {html.escape(str(entry.get('status') or '?'))} · "
+            f"✅ {int(entry.get('sent') or 0)} / "
+            f"⚠️ {int(entry.get('failed') or 0)}"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+
 # A plain natural-language instruction in a private admin chat works without /ai.
 # State-specific registration/report/support handlers are registered earlier and
 # continue to take priority; this late handler never handles agent messages.
@@ -4135,11 +5026,15 @@ async def conversational_admin_command(message: types.Message, state: FSMContext
     # This also protects states that expect callback buttons rather than text.
     if await state.get_state() is not None:
         return
-    if (message.chat.type != "private" or message.chat.id != message.from_user.id
-            or not is_admin(message.from_user.id)):
+    if message.chat.type != "private" or message.chat.id != message.from_user.id:
         return
-    if looks_like_operation(message.text or ""):
+    if not looks_like_operation(message.text or ""):
+        return
+    if is_admin(message.from_user.id):
         await handle_natural_command(message, message.text)
+    elif get_verified_agent(message.from_user.id):
+        # Agent text is never routed to the unmoderated administrator credit path.
+        await agent_operation_from_text(message, message.text)
 
 
 
