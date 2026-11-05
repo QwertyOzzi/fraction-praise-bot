@@ -5996,8 +5996,7 @@ async def schedule_wizard_input(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("schedopt:"))
 async def schedule_options(callback: types.CallbackQuery, state: FSMContext):
-    if not _schedule_private_actor(callback.message) and (
-            callback.message.chat.id != callback.from_user.id
+    if (callback.message.chat.id != callback.from_user.id
             or callback.message.chat.type != "private"):
         await callback.answer("Доступно только в личном чате.", show_alert=True)
         return
@@ -6094,6 +6093,15 @@ async def schedule_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Доступно только в личном чате.", show_alert=True)
         return
     data = callback.data or ""
+    if data == "sched:list":
+        try:
+            await show_schedule_list(callback.message, callback.from_user.id,
+                                     include_messages=is_admin(callback.from_user.id))
+            await callback.answer()
+        except Exception as exc:
+            logger.warning("Schedule menu failed: %s", type(exc).__name__)
+            await callback.answer("Расписание недоступно.", show_alert=True)
+        return
     if data == "sched:abort":
         await state.clear()
         await callback.message.edit_text("❌ Создание расписания отменено.")
