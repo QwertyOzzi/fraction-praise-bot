@@ -136,6 +136,19 @@ class TestNewsPersistenceRetry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.created), 1)
         self.assertEqual(len(self.broadcast), 1)
 
+    async def test_existing_journal_never_sends_same_news_twice(self):
+        async def persisted(*args, **kwargs):
+            self.created.append(kwargs)
+            return {"id": kwargs["news_id"],
+                    "status": "sending", "_already_persisted": True}
+        self.env["create_announcement"] = persisted
+        state, callback = State(), Callback()
+        await self.env["confirm_news_publish"](callback, state)
+        self.assertEqual(state.cleared, 1)
+        self.assertEqual(self.broadcast, [])
+        self.assertTrue(callback.answers[-1][1]["show_alert"])
+        self.assertIn("/newslog", callback.message.edits[-1][0])
+
     async def test_different_nonce_does_not_publish_stale_draft(self):
         state = State()
         await self.env["confirm_news_publish"](
