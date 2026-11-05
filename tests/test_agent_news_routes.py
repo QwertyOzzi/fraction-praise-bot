@@ -6,7 +6,7 @@ import difflib
 import re
 import types
 import unittest
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 from natural_commands import looks_like_operation, simplified
@@ -19,6 +19,7 @@ def load_functions(names, env):
     env.setdefault("Optional", Optional)
     env.setdefault("Dict", Dict)
     env.setdefault("Any", Any)
+    env.setdefault("List", List)
     env.setdefault("types", types.SimpleNamespace(Message=FakeMessage, CallbackQuery=object))
     env.setdefault("FSMContext", State)
     nodes = []
