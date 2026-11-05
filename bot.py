@@ -3320,6 +3320,7 @@ agent_action_tokens: Dict[str, Dict[str, Any]] = {}
 
 class AgentPanelStates(StatesGroup):
     waiting_for_search = State()
+    waiting_for_reason = State()
 
 
 async def remove_agent_everywhere(nick: str) -> bool:
@@ -3809,8 +3810,8 @@ async def agent_view(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("agask:"))
-async def agent_ask_action(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "points.grant"):
+async def agent_ask_action(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3820,11 +3821,25 @@ async def agent_ask_action(callback: types.CallbackQuery):
             raise ValueError("Invalid action")
         if kind == "d" and qty != 1:
             raise ValueError("Invalid debit")
+        action_permission = "points.grant" if kind == "g" else "points.debit"
+        if not has_permission(callback.from_user.id, action_permission):
+            await callback.answer("Нет права на эту операцию.", show_alert=True)
+            return
         agents = await fetch_agent_directory()
         agent = next((item for item in agents if agent_hash(item["nick"]) == key), None)
         if not agent:
             await callback.answer("Агент не найден", show_alert=True)
             return
+        target_snapshot = None
+        if kind == "d":
+            sheet = "fractionrp" if which == "f" else "praise"
+            rows = await firebase_client.get_sheet(sheet)
+            candidates = [r for r in rows
+                          if str(r.get("nick") or "").casefold() == agent["nick"].casefold()]
+            if len(candidates) != 1 or int(candidates[0].get("qty") or 0) < 1:
+                await callback.answer("Не найдена запись с доступным балансом.", show_alert=True)
+                return
+            target_snapshot = _agent_key_row(candidates[0])
         now = datetime.now(timezone.utc).timestamp()
         for token, task in list(agent_action_tokens.items()):
             if now - task["created"] > 600:
@@ -3834,8 +3849,26 @@ async def agent_ask_action(callback: types.CallbackQuery):
             "uid": callback.from_user.id, "chat_id": callback.message.chat.id,
             "nick": agent["nick"], "rank": agent["rank"],
             "kind": kind, "which": which, "qty": qty, "page": page,
-            "key": key, "created": now, "status": "new"
+            "key": key, "created": now, "status": "new",
+            "target": target_snapshot, "reason": "",
+            "op_id": "agent-" + uuid.uuid4().hex
         }
+        if kind == "d":
+            if callback.message.chat.type != "private":
+                await callback.answer("Списание с причиной доступно только в личном чате.", show_alert=True)
+                agent_action_tokens.pop(token, None)
+                return
+            await state.update_data(agent_panel_debit_token=token)
+            await state.set_state(AgentPanelStates.waiting_for_reason)
+            await callback.message.answer(
+                f"📝 Причина списания 1 {'FRP' if which == 'f' else 'похвалы'} "
+                f"для <code>{html.escape(agent['nick'])}</code>:
+"
+                "Введите текст причины (5–200 символов). Для отмены /cancel.",
+                parse_mode="HTML"
+            )
+            await callback.answer()
+            return
         operation = f"+{qty}" if kind == "g" else "−1"
         type_name = "FRP" if which == "f" else "похвалы"
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3855,15 +3888,63 @@ async def agent_ask_action(callback: types.CallbackQuery):
         await callback.answer("Не удалось подготовить действие", show_alert=True)
 
 
+
+
+@dp.message(AgentPanelStates.waiting_for_reason)
+async def agent_panel_debit_reason(message: types.Message, state: FSMContext):
+    if not _agent_private(message):
+        await message.answer("Введите причину в личном чате с ботом.")
+        return
+    data = await state.get_data()
+    token = data.get("agent_panel_debit_token")
+    action = agent_action_tokens.get(token)
+    if not action or action["uid"] != message.from_user.id or action["status"] != "new":
+        await state.clear()
+        await message.answer("Заявка устарела, начните списание заново через /agents.")
+        return
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "points.debit"):
+        await state.clear()
+        await message.answer("Право списания отозвано.")
+        return
+    reason = (message.text or "").strip()
+    if not 5 <= len(reason) <= 200 or reason.startswith("/"):
+        await message.answer("Введите понятную причину длиной 5–200 символов или /cancel.")
+        return
+    action["reason"] = reason
+    await state.clear()
+    label = "FRP" if action["which"] == "f" else "похвалы"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(style="success", text="✅ Подтвердить списание",
+                              callback_data=f"agdo:{token}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{action['key']}:{action['page']}")]
+    ])
+    await message.answer(
+        f"⚠️ <b>Списание 1 {label}</b>\n\n"
+        f"👤 <code>{html.escape(action['nick'])}</code>\n"
+        f"📋 Причина: {html.escape(reason)}\n\n"
+        "Перед подтверждением бот повторно проверит право и баланс.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
 @dp.callback_query(F.data.startswith("agdo:"))
 async def agent_do_action(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "points.grant"):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     token = callback.data.removeprefix("agdo:")
     action = agent_action_tokens.get(token)
     if not action or action["uid"] != callback.from_user.id or action["chat_id"] != callback.message.chat.id:
         await callback.answer("Это действие уже недоступно. Откройте панель заново.", show_alert=True)
+        return
+    required = "points.grant" if action["kind"] == "g" else "points.debit"
+    if not has_permission(callback.from_user.id, required):
+        await callback.answer("Право на операцию отозвано.", show_alert=True)
+        return
+    if action["kind"] == "d" and (
+            not 5 <= len(action.get("reason", "")) <= 200
+            or not isinstance(action.get("target"), dict)):
+        await callback.answer("Сначала укажите причину списания.", show_alert=True)
         return
     if action["status"] != "new" or datetime.now(timezone.utc).timestamp() - action["created"] > 600:
         await callback.answer("Действие уже обработано или устарело.", show_alert=True)
@@ -3879,12 +3960,18 @@ async def agent_do_action(callback: types.CallbackQuery):
                 "", "panel-" + token, quantity=action["qty"]
             )
         else:
-            await firebase_client.debit_one(sheet, action["nick"])
+            await commit_agent_debit(
+                firebase_client, ClientSession, op_id=action["op_id"],
+                actor_id=callback.from_user.id,
+                actor_nick=str(users_db.get(str(callback.from_user.id), {}).get("nick") or "Руководство"),
+                sheet=sheet, target=action["target"], amount=1,
+                reason=action["reason"], raw=action["nick"]
+            )
         action["status"] = "done"
         activity = "panel_grant" if action["kind"] == "g" else "panel_debit"
         amount = "+" + str(action["qty"]) if action["kind"] == "g" else "-1"
         asyncio.create_task(record_admin_activity(activity, callback.from_user.id,
-            f"{action['nick']}: {amount}", sheet))
+            f"{action['nick']}: {amount}; причина: {action['reason']}" if action["kind"] == "d" else f"{action['nick']}: {amount}", sheet))
     except Exception as exc:
         # No blind retry after a possibly successful but timed-out write.
         action["status"] = "uncertain"
