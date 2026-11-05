@@ -15,7 +15,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from aiohttp import ClientSession, ClientTimeout
 
 logger = logging.getLogger(__name__)
 TZ_NAME = "Europe/Moscow"
@@ -243,6 +242,7 @@ async def get_schedule(client, sid):
     if not isinstance(sid, str) or not VALID_ID.fullmatch(sid):
         raise ScheduleError("Недопустимый ID.")
     headers = await _headers(client)
+    from aiohttp import ClientSession, ClientTimeout
     async with ClientSession(timeout=ClientTimeout(total=15)) as session:
         async with session.get(_base(client) + "/" + NEWS_COLLECTION + "/" + sid,
                                headers=headers) as resp:
@@ -267,6 +267,7 @@ async def list_active(client):
         }},
         "limit": 100
     }}
+    from aiohttp import ClientSession, ClientTimeout
     async with ClientSession(timeout=ClientTimeout(total=18)) as session:
         async with session.post(_base(client) + ":runQuery",
                                 headers=headers, json=query) as resp:
@@ -304,6 +305,7 @@ async def create_schedule(client, item):
             "updatedAt": {"timestampValue": now},
         }}, "currentDocument": {"exists": False}
     }
+    from aiohttp import ClientSession, ClientTimeout
     async with ClientSession(timeout=ClientTimeout(total=15)) as session:
         async with session.post(_base(client) + ":commit",
                                 headers=headers, json={"writes": [write]}) as resp:
@@ -326,6 +328,7 @@ async def _replace(client, item, revision):
         "currentDocument": {"updateTime": revision}
     }
     headers = await _headers(client)
+    from aiohttp import ClientSession, ClientTimeout
     async with ClientSession(timeout=ClientTimeout(total=15)) as session:
         async with session.post(_base(client) + ":commit",
                                 headers=headers, json={"writes": [write]}) as resp:
