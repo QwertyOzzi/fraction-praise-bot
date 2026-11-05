@@ -50,6 +50,7 @@ from aiogram.types import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+VK_ACL_SIGNING_KEY = os.getenv("VK_ACL_SIGNING_KEY", "").strip()
 RELEASE_TAG = "durable-admin-recovery-v6"
 
 # Ключи доступа:
@@ -120,7 +121,7 @@ _pending_legacy_nonce: str = ""
 # A positive chat ID can also be a Telegram user ID; treating it as an admin
 # would let an environment configuration accidentally bypass owner approval.
 
-def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
+def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str], *, signing_secret=None) -> str:
     """Sign permission grants, so untrusted Firestore edits cannot grant admin."""
     valid_ids = sorted({n for n in admin_ids if type(n) is int and n > 0
                         and n not in OWNER_TELEGRAM_IDS})
@@ -128,7 +129,8 @@ def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
         "admins": valid_ids,
         "roles": {str(n): roles.get(str(n), "deputy") for n in valid_ids}
     }
-    secret = (os.getenv("ADMIN_ACL_SIGNING_KEY", "").strip() or BOT_TOKEN).encode("utf-8")
+    secret = (signing_secret if signing_secret is not None else
+              (os.getenv("ADMIN_ACL_SIGNING_KEY", "").strip() or BOT_TOKEN)).encode("utf-8")
     msg = json.dumps(signed_payload, ensure_ascii=True, sort_keys=True,
                      separators=(",", ":")).encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()
@@ -676,6 +678,9 @@ async def sync_state_to_cloud():
                 "admins": admins_db,
                 "admin_roles": admin_roles,
                 "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
+                **({"vk_acl_signature": sign_admin_permissions(
+                    admins_db, admin_roles, signing_secret=VK_ACL_SIGNING_KEY)}
+                   if len(VK_ACL_SIGNING_KEY) >= 32 else {}),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db
@@ -856,6 +861,8 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="min", description="Списать FRP/похвалу агенту"),
     BotCommand(command="plus", description="Запросить начисление с причиной"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
+    BotCommand(command="vklink", description="Привязать ВКонтакте"),
+    BotCommand(command="vkunlink", description="Отвязать ВКонтакте"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
 ]
@@ -869,10 +876,13 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="ai", description="ИИ-команды: начисление и списание FRP"),
     BotCommand(command="agentpending", description="Заявки агентов на начисление"),
     BotCommand(command="agentlogs", description="Отдельный журнал действий агентов"),
+    BotCommand(command="vkpending", description="VK-отчёты на проверке"),
+    BotCommand(command="vkreview", description="Проверить VK-отчёт"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
     BotCommand(command="notifications", description="Уведомления руководства"),
+    BotCommand(command="vkacl", description="Синхронизировать роли VK"),
 ]
 
 
@@ -5049,6 +5059,119 @@ async def cmd_news_log(message: types.Message):
         )
     await message.answer("\n".join(lines), parse_mode="HTML")
 
+
+
+
+# VK linking is initiated from the user's authenticated Telegram account.
+# Never accept a Telegram user id supplied by a VK message.
+@dp.message(Command("vklink"))
+async def cmd_vklink(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Привязка доступна только в личном чате.")
+        return
+    if not _cloud_state_hydrated:
+        await message.answer("⚠️ Профили Firebase ещё не подтверждены.")
+        return
+    if not isinstance(users_db.get(str(message.from_user.id)), dict):
+        await message.answer("Сначала зарегистрируйте игровой ник через /start.")
+        return
+    from vk_bot.backend import create_link_code
+    try:
+        code = await create_link_code(firebase_client, message.from_user.id)
+    except Exception as exc:
+        logger.warning("VK code creation failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не получилось создать код, попробуйте позже.")
+        return
+    await message.answer(
+        "🔗 <b>Привязка VK к Telegram</b>\n\n"
+        f"Одноразовый код: <code>{html.escape(code)}</code>\n\n"
+        "Откройте личные сообщения сообщества FBI во ВКонтакте и отправьте:\n"
+        f"<code>/link {html.escape(code)}</code>\n\n"
+        "Код действует 10 минут. Никому его не пересылайте.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("vkunlink"))
+async def cmd_vkunlink(message: types.Message):
+    if not _agent_private(message):
+        return
+    from vk_bot.backend import revoke_link
+    try:
+        removed = await revoke_link(firebase_client, message.from_user.id)
+        await message.answer(
+            "✅ Привязка VK отключена." if removed else "VK пока не был привязан."
+        )
+    except Exception as exc:
+        logger.warning("VK unlink failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось отключить привязку.")
+
+
+@dp.message(Command("vkacl"))
+async def cmd_vkacl(message: types.Message):
+    """Owner publishes a separate VK HMAC, leaving the existing TG ACL intact."""
+    if not _agent_private(message) or not is_owner(message.from_user.id):
+        await message.answer("⛔ Только владелец.")
+        return
+    if len(VK_ACL_SIGNING_KEY) < 32:
+        await message.answer("⚠️ Настройте VK_ACL_SIGNING_KEY (32+ символа) в Telegram.")
+        return
+    success = await sync_state_to_cloud()
+    await message.answer(
+        "✅ Права VK синхронизированы." if success
+        else "⚠️ Firebase не подтвердил сохранение прав VK."
+    )
+
+
+@dp.message(Command("vkpending"))
+async def cmd_vk_pending(message: types.Message):
+    if not _agent_private(message) or not is_admin(message.from_user.id):
+        await message.answer("⛔ Только руководство.")
+        return
+    from vk_bot.backend import Firebase, get_reports
+    try:
+        records = await get_reports(Firebase(), limit=100)
+        pending = [r for r in records if r.get("status") == "pending"]
+        if not pending:
+            await message.answer("📌 VK-отчётов на рассмотрении нет.")
+            return
+        lines = ["📌 <b>VK-отчёты</b>"]
+        for r in pending[:15]:
+            lines.append(
+                f"\n<code>{html.escape(str(r['id']))}</code> "
+                f"{html.escape(str(r['nick']))}: +{int(r['amount'])} "
+                f"({html.escape(str(r['sheet']))})\n"
+                f"Причина: {html.escape(str(r['reason'])[:250])}\n"
+                f"Доказательство: {html.escape(str(r['proof'])[:400])}"
+            )
+        lines.append("\n/vkreview ID approve или /vkreview ID reject")
+        await message.answer("\n".join(lines)[:3900], parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("VK pending unavailable: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось загрузить VK-отчёты.")
+
+
+@dp.message(Command("vkreview"))
+async def cmd_vk_review(message: types.Message):
+    if not _agent_private(message) or not is_admin(message.from_user.id):
+        await message.answer("⛔ Только руководство.")
+        return
+    args = (message.text or "").split()
+    if len(args) != 3 or args[2] not in ("approve", "reject"):
+        await message.answer("Формат: /vkreview vr-ID approve|reject")
+        return
+    from vk_bot.backend import Firebase, decide_report
+    profile = users_db.get(str(message.from_user.id)) or {}
+    reviewer = {"tg_id": message.from_user.id,
+                "profile": {"nick": str(profile.get("nick") or "Руководство")}}
+    try:
+        _, req = await decide_report(Firebase(), args[1], reviewer, args[2])
+        await message.answer(
+            f"📌 VK-отчёт <code>{html.escape(args[1])}</code>: "
+            f"<b>{html.escape(str(req['status']))}</b>", parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("VK report decision failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Решение не подтверждено Firebase. Проверьте отчёт.")
 
 
 # A plain natural-language instruction in a private admin chat works without /ai.

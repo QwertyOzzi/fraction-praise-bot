@@ -1,3 +1,5 @@
+> ⚠️ Ранние версии этой инструкции содержали реальные секреты. История Git сохраняет удалённые значения. Перевыпустите токен Telegram и старые ключи, если они были действующими, и смените раскрытые пароли.
+
 # 🚀 Пошаговая инструкция: Запуск Telegram-бота на Render (24/7 Бесплатно)
 
 Бот уже полностью написан и готов к работе в папке:
@@ -56,12 +58,12 @@ git push -u origin main
 
 | Key (Имя переменной) | Value (Значение) |
 |---|---|
-| `BOT_TOKEN` | `9223445475:AAHGbzQpmaaV_eohmTF_PC62f9_ufGBAAtY` |
-| `ADMIN_KEY` | `kiidsg12#$$` |
+| `BOT_TOKEN` | Создайте и храните токен в секретных переменных Render; никогда не добавляйте его в GitHub |
+| `ADMIN_KEY` | Устаревший способ; текущий бот использует проверенный Telegram ID владельца и подписанные роли |
 | `FIREBASE_PROJECT_ID` | `fraction-praise` |
-| `FIREBASE_API_KEY` | `AIzaSyBX7JWz6ay-ozED5ZmKoC7Umn58ae2lvIE` |
-| `FIREBASE_EMAIL` | `goponos12@gmail.com` |
-| `FIREBASE_PASSWORD` | *Ваш пароль от goponos12@gmail.com в Firebase* |
+| `FIREBASE_API_KEY` | Скопируйте API key из настроек проекта Firebase в переменную Render |
+| `FIREBASE_EMAIL` | Firebase Auth email владельца, храните в Render |
+| `FIREBASE_PASSWORD` | Пароль Firebase Auth; не публикуйте и не присылайте в чат |
 
 ---
 
@@ -80,7 +82,7 @@ git push -u origin main
 2. Нажмите **`/start`** и укажите свой ник.
 3. Чтобы стать главным администратором / лидером в боте, отправьте сообщение:
    ```text
-   /admin kiidsg12#$$
+   /start
    ```
 4. Бот подтвердит: *«Вы успешно авторизованы как Администратор / Руководитель!»*
 5. Теперь:
