@@ -47,7 +47,7 @@ def newslog_list(records, page=0):
             state = {"delivered": "✅", "partial": "⚠️", "sending": "⏳"}.get(
                 str(item.get("status") or ""), "❔"
             )
-            lines.append(f"{offset}. {state} {title}")
+            lines.append(f"{offset}. {state} {title} (#{item['id'][-6:]})")
     return "\n".join(lines), selected, page, pages
 
 
