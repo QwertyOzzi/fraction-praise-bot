@@ -91,6 +91,7 @@ class TestNewsPersistenceRetry(unittest.IsolatedAsyncioTestCase):
 
         self.env = handler_env({
             "is_leader": lambda uid: uid == 42,
+            "has_permission": lambda uid, capability: uid == 42 and capability == "news.publish",
             "NewsStates": types.SimpleNamespace(
                 confirm=types.SimpleNamespace(state="news:confirm")
             ),
