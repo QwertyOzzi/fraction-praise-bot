@@ -734,10 +734,12 @@ class AiStates(StatesGroup):
 
 class AgentActionStates(StatesGroup):
     waiting_add_evidence = State()
+    confirm_add = State()
 
 
 class NewsStates(StatesGroup):
     waiting_for_text = State()
+    confirm = State()
 
 
 class SupportStates(StatesGroup):
@@ -1567,7 +1569,11 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         if await state.get_state():
             await callback.answer("Завершите текущее действие или используйте /cancel.", show_alert=True)
             return
-        source = callback.message.model_copy(update={"from_user": callback.from_user})
+        source = callback.message.model_copy(update={
+            "from_user": callback.from_user,
+            # Menu callback points at the BOT's previous message, not /news.
+            "text": "/news"
+        })
         await callback.answer()
         await cmd_news(source, state)
         return
