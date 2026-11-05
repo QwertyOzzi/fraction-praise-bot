@@ -122,10 +122,10 @@ class TestAdminInvites(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAdminAuthStatic(unittest.TestCase):
-    def test_leader_only_rank_changes(self):
+    def test_rank_changes_require_explicit_granular_permission(self):
         for handler in ("agent_rank_menu", "agent_set_rank"):
             body = SOURCE.split(f"async def {handler}(", 1)[1].split("\\n\\n@dp.", 1)[0]
-            self.assertIn("if not is_leader(callback.from_user.id):", body)
+            self.assertIn('if not has_permission(callback.from_user.id, "agents.rank"):', body)
         self.assertIn('admin_roles[str(target_id)] = role', SOURCE)
         self.assertIn('role not in ("leader", "deputy")', SOURCE)
 
