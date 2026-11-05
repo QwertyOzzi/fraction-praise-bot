@@ -4832,21 +4832,200 @@ async def cmd_agent_log(message: types.Message):
     await show_agent_log(message, message.from_user.id)
 
 
+
+# ── Manual owner/leader news, completely separate from points and audit ────
+async def begin_news(message: types.Message, state: FSMContext,
+                     category: str = "news"):
+    if (not is_leader(message.from_user.id)
+            or message.chat.type != "private"
+            or message.chat.id != message.from_user.id):
+        await message.answer("⛔ Публикация доступна только лидеру и владельцу.")
+        return
+    if await state.get_state() is not None:
+        await message.answer(
+            "⏳ Сначала завершите текущее действие либо используйте /cancel."
+        )
+        return
+    await state.set_state(NewsStates.waiting_for_post)
+    await state.update_data(news_category=category)
+    kind = "об обновлении бота" if category == "update" else "с новостями"
+    await message.answer(
+        "📢 <b>FBI · Рассылка</b>\n\n"
+        f"Отправьте сообщение {kind} для всех пользователей. "
+        "Можно отправить текст с форматированием, фото или видео с подписью.\n\n"
+        "<i>Сначала покажу предварительный просмотр и количество получателей. "
+        "Без подтверждения рассылки не будет. Для отмены: /cancel.</i>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("news", "update"))
+async def cmd_news(message: types.Message, state: FSMContext):
+    first = (message.text or "").split(maxsplit=1)[0].split("@", 1)[0]
+    await begin_news(
+        message, state,
+        category="update" if first.casefold() == "/update" else "news"
+    )
+
+
+@dp.message(NewsStates.waiting_for_post)
+async def receive_news_post(message: types.Message, state: FSMContext):
+    if (not is_leader(message.from_user.id) or
+            message.chat.type != "private" or message.chat.id != message.from_user.id):
+        await state.clear()
+        await message.answer("⛔ Нет доступа.")
+        return
+    body = (message.text or message.caption or "").strip()
+    if ((not body and not message.photo and not message.video) or
+            len(body) > 3500 or (not body and (message.photo or message.video))):
+        await message.answer(
+            "⚠️ Отправьте текст до 3500 символов или фото/видео с подписью. "
+            "Секреты и личные данные не публикуйте."
+        )
+        return
+    data = await state.get_data()
+    category = data.get("news_category", "news")
+    await state.clear()
+
+    # Store only a reference to a user's Telegram message. No user text or
+    # media bytes are retained in Firebase, and no message is broadcast yet.
+    now = datetime.now(timezone.utc).timestamp()
+    for k, v in list(NEWS_DRAFTS.items()):
+        if now - v["created"] > 600:
+            NEWS_DRAFTS.pop(k, None)
+    token = uuid.uuid4().hex[:20]
+    recipients = [
+        int(uid) for uid, profile in users_db.items()
+        if str(uid).isdecimal() and int(uid) > 0
+        and isinstance(profile, dict)
+        and (profile.get("nick") or profile.get("claimed_nick"))
+        and profile.get("verification_status") not in ("disabled", "cooldown")
+    ]
+    recipients = sorted(set(recipients))
+    NEWS_DRAFTS[token] = {
+        "owner": message.from_user.id, "chat": message.chat.id,
+        "source_message": message.message_id, "created": now,
+        "status": "preview", "category": category,
+        "recipients": recipients
+    }
+    try:
+        await message.answer("👀 <b>Предпросмотр сообщения:</b>", parse_mode="HTML")
+        await bot.copy_message(
+            chat_id=message.chat.id, from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+    except Exception as exc:
+        NEWS_DRAFTS.pop(token, None)
+        logger.warning("Broadcast preview failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось сделать предпросмотр. Ничего не отправлено.")
+        return
+    await message.answer(
+        f"📢 <b>Отправить {len(recipients)} пользователям?</b>\n\n"
+        "Выполнится одна массовая рассылка без повторного отправления "
+        "при двойном нажатии.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Отправить всем", callback_data=f"newssend:{token}",
+                style="success"
+            )],
+            [InlineKeyboardButton(
+                text="❌ Отмена", callback_data=f"newscancel:{token}"
+            )]
+        ]), parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("newssend:")
+                   | F.data.startswith("newscancel:"))
+async def news_confirm(callback: types.CallbackQuery):
+    if (not is_leader(callback.from_user.id)
+            or not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Нет доступа к рассылке.", show_alert=True)
+        return
+    action, _, token = (callback.data or "").partition(":")
+    draft = NEWS_DRAFTS.get(token)
+    if (not draft or draft.get("owner") != callback.from_user.id
+            or draft.get("chat") != callback.message.chat.id
+            or datetime.now(timezone.utc).timestamp() - draft.get("created", 0) > 600
+            or draft.get("status") != "preview"):
+        await callback.answer("Рассылка уже обработана или устарела.", show_alert=True)
+        return
+    if action == "newscancel":
+        draft["status"] = "cancelled"
+        await callback.message.edit_text("❌ Рассылка отменена.")
+        await callback.answer()
+        return
+    if action != "newssend":
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
+    # Protect against repeated clicks before any Telegram network await.
+    draft["status"] = "sending"
+    await callback.answer("Рассылка запущена.")
+    try:
+        await callback.message.edit_text(
+            f"📢 Рассылаю сообщение {len(draft['recipients'])} пользователям."
+        )
+    except Exception:
+        pass
+    sent, failed = 0, 0
+    for uid in draft["recipients"]:
+        try:
+            await bot.copy_message(
+                chat_id=uid, from_chat_id=draft["chat"],
+                message_id=draft["source_message"]
+            )
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.info("User %s did not receive broadcast: %s",
+                        uid, type(exc).__name__)
+        # Stay below Telegram's global send limits.
+        await asyncio.sleep(0.08)
+    draft["status"] = "done"
+    try:
+        ok = await save_broadcast_log(
+            firebase_client, ClientSession,
+            "news-" + token, author_id=callback.from_user.id,
+            category=draft["category"], total=len(draft["recipients"]),
+            delivered=sent, failed=failed
+        )
+        if not ok:
+            logger.warning("Broadcast result not confirmed in Firestore")
+    except Exception as exc:
+        logger.warning("Broadcast log failed: %s", type(exc).__name__)
+    try:
+        await callback.message.edit_text(
+            "✅ <b>FBI · Рассылка завершена</b>\n\n"
+            f"📨 Отправлено: <b>{sent}</b>\n"
+            f"⚠️ Не доставлено: <b>{failed}</b>\n"
+            "<i>История рассылки хранится отдельно от журнала агентов.</i>",
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.info("Could not refresh completed news: %s", type(exc).__name__)
+
+
 # A plain natural-language instruction in a private admin chat works without /ai.
 # State-specific registration/report/support handlers are registered earlier and
 # continue to take priority; this late handler never handles agent messages.
 @dp.message(F.text)
 async def conversational_admin_command(message: types.Message, state: FSMContext):
-    # The last-resort handler must not interpret evidence links, rank selection,
-    # nicknames, report quantities, praise counts or manual-grant input as AI.
-    # This also protects states that expect callback buttons rather than text.
+    # Never intercept a link, nickname, proof, point quantity or news draft
+    # while another action is in progress. Only idle private chats qualify.
     if await state.get_state() is not None:
         return
     if (message.chat.type != "private" or message.chat.id != message.from_user.id
-            or not is_admin(message.from_user.id)):
+            or not message.from_user):
         return
-    if looks_like_operation(message.text or ""):
+    if not looks_like_operation(message.text or ""):
+        return
+    if is_admin(message.from_user.id):
+        # Existing leadership workflow and audit remain unchanged.
         await handle_natural_command(message, message.text)
+    elif active_profile(users_db.get(str(message.from_user.id))):
+        await propose_agent_points(message, message.text)
 
 
 
