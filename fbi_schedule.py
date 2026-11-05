@@ -193,6 +193,7 @@ def display_schedule(item):
     status = {"active": "Активно", "cancelled": "Отменено",
               "completed": "Завершено"}.get(item.get("status"), "Неизвестно")
     pending = sum(j.get("state") == "pending" for j in item["jobs"])
+    uncertain = sum(j.get("state") == "claimed" for j in item["jobs"])
     sent = sum(int(j.get("sent", 0)) for j in item["jobs"])
     failed = sum(int(j.get("failed", 0)) for j in item["jobs"])
     return (
@@ -203,6 +204,7 @@ def display_schedule(item):
         f"Описание: {item['description']}\n"
         f"Статус: {status}\n"
         f"Осталось отправок: {pending}\n"
+        f"Отправок с неподтверждённым результатом: {uncertain}\n"
         f"Доставлено сообщений: {sent}\n"
         f"Ошибок отправки: {failed}\n"
         f"ID: {item['id']}"
@@ -309,9 +311,16 @@ async def create_schedule(client, item):
     async with ClientSession(timeout=ClientTimeout(total=15)) as session:
         async with session.post(_base(client) + ":commit",
                                 headers=headers, json={"writes": [write]}) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                return item
+            if resp.status not in (409, 412):
                 raise ScheduleError(f"Firebase не подтвердила создание (HTTP {resp.status}).")
-    return item
+    # A timeout or duplicate click may have persisted the SAME ID already.
+    # Verify exact stored content, never insert a second schedule.
+    persisted = await get_schedule(client, item["id"])
+    if persisted and persisted[0] == item:
+        return item
+    raise ScheduleError("ID уже занят другой записью. Изменения не повторены.")
 
 
 async def _replace(client, item, revision):
