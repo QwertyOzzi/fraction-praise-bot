@@ -3862,8 +3862,7 @@ async def agent_ask_action(callback: types.CallbackQuery, state: FSMContext):
             await state.set_state(AgentPanelStates.waiting_for_reason)
             await callback.message.answer(
                 f"📝 Причина списания 1 {'FRP' if which == 'f' else 'похвалы'} "
-                f"для <code>{html.escape(agent['nick'])}</code>:
-"
+                f"для <code>{html.escape(agent['nick'])}</code>:\n"
                 "Введите текст причины (5–200 символов). Для отмены /cancel.",
                 parse_mode="HTML"
             )
