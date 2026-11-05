@@ -217,9 +217,11 @@ def _log(*, op_id, action, actor_id, actor_nick, target, sheet, amount,
 
 async def commit_agent_debit(client, session_factory, *,
                              op_id, actor_id, actor_nick,
-                             sheet, target, amount, alias="", raw=""):
+                             sheet, target, amount, alias="", raw="", reason=""):
     """One debit and a separate agent audit log are committed ATOMICALLY."""
     _valid_sheet(sheet, amount)
+    if not isinstance(reason, str) or len(reason) > 200:
+        raise AgentOperationError("Некорректная причина списания.")
     if not _valid_id(op_id) or not op_id.startswith("agent-"):
         raise AgentOperationError("Некорректный ID операции.")
     if not isinstance(target, dict):
@@ -260,7 +262,8 @@ async def commit_agent_debit(client, session_factory, *,
             audit = _log(
                 op_id=op_id, action="debit", actor_id=actor_id,
                 actor_nick=actor_nick, target=target, sheet=sheet,
-                amount=-amount, before=before, after=before - amount
+                amount=-amount, before=before, after=before - amount,
+                reason=reason
             )
             writes = [
                 _sheet_update(client, sheet, doc["updateTime"], rows,
