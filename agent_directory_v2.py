@@ -43,6 +43,8 @@ def build_projection(frp_rows, praise_rows, users=None):
             if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick):
                 raise MigrationConflict("A row has a missing or invalid nick")
             key = nick.casefold()
+            if row.get("profileId") and not _binding(row.get("profileId")):
+                raise MigrationConflict(f"Invalid profile binding in {sheet}: {nick}")
             if key in seen:
                 raise MigrationConflict(f"Duplicate nickname in {sheet}: {nick}")
             seen.add(key)
@@ -78,6 +80,8 @@ def build_projection(frp_rows, praise_rows, users=None):
             continue
         key = str(profile["nick"]).strip().casefold()
         binding = _binding(profile.get("profileId"))
+        if profile.get("profileId") and not binding:
+            raise MigrationConflict("Invalid Telegram profile binding")
         if binding:
             if binding in seen_profile_bindings and seen_profile_bindings[binding] != str(uid):
                 raise MigrationConflict("Duplicated Telegram profile binding")
