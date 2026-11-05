@@ -292,8 +292,17 @@ class FirebaseClient:
                 payload = {"fields": {"rows": {"arrayValue": {"values": [self._row_to_firestore(row) for row in rows]}},
                                       "updatedAt": {"timestampValue": datetime.now(timezone.utc).isoformat()},
                                       "appliedReportIds": {"arrayValue": {"values": [{"stringValue": report} for report in [*applied_ids, report_id]]}}}}
+                # Preserve confirmed nickname memory and separate agent logs
+                # when regular FRP/praise reports are approved. Without an
+                # updateMask a Firestore PATCH can erase unrelated metadata.
+                params = [
+                    ("currentDocument.updateTime", revision),
+                    ("updateMask.fieldPaths", "rows"),
+                    ("updateMask.fieldPaths", "updatedAt"),
+                    ("updateMask.fieldPaths", "appliedReportIds"),
+                ]
                 async with session.patch(url, headers={**headers, "Content-Type": "application/json"},
-                                         params={"currentDocument.updateTime": revision}, json=payload) as response:
+                                         params=params, json=payload) as response:
                     if response.status == 200:
                         return True
                     if response.status not in (409, 412):
