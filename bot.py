@@ -1363,6 +1363,108 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
                          reply_markup=get_main_menu(message.from_user.id))
 
 
+@dp.message(Command("setbanner"))
+async def cmd_set_menu_banner(message: types.Message, state: FSMContext):
+    """Only the technical Telegram owner can change the home banner."""
+    uid = message.from_user.id if message.from_user else 0
+    if (message.chat.type != "private" or message.chat.id != uid
+            or not is_owner(uid)):
+        await message.answer("⛔ Изменение баннера доступно только владельцу.")
+        return
+    if await state.get_state():
+        await message.answer(
+            "⏳ Сначала завершите текущее действие или используйте /cancel."
+        )
+        return
+    await state.set_state(MenuBannerStates.waiting_for_photo)
+    await message.answer(
+        "🖼️ <b>Баннер главного меню</b>\n\n"
+        "Отправьте картинку <b>как фото</b> (не файлом). "
+        "Рекомендуется формат <b>16:9</b>, ширина от 640 пикселей.\n\n"
+        "Баннер появится в /start, /menu и при возврате в личный кабинет. "
+        "Кнопки и данные агента останутся под изображением.\n"
+        "<i>Отмена: /cancel</i>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("removebanner"))
+async def cmd_remove_menu_banner(message: types.Message, state: FSMContext):
+    """Restore the original text card without changing roles or user profiles."""
+    uid = message.from_user.id if message.from_user else 0
+    if (message.chat.type != "private" or message.chat.id != uid
+            or not is_owner(uid)):
+        await message.answer("⛔ Только владелец может отключить баннер.")
+        return
+    if await state.get_state():
+        await message.answer("⏳ Завершите текущее действие или /cancel.")
+        return
+    global MENU_BANNER_FILE_ID
+    previous = MENU_BANNER_FILE_ID
+    if not previous:
+        await message.answer("Баннер уже отключён.")
+        return
+    MENU_BANNER_FILE_ID = ""
+    if not await sync_state_to_cloud():
+        MENU_BANNER_FILE_ID = previous
+        await message.answer("⚠️ Firebase не подтвердила изменение. Баннер сохранён.")
+        return
+    await message.answer(
+        "✅ Баннер убран. Главное меню снова отображается обычной текстовой карточкой."
+    )
+
+
+@dp.message(MenuBannerStates.waiting_for_photo)
+async def receive_menu_banner_photo(message: types.Message, state: FSMContext):
+    uid = message.from_user.id if message.from_user else 0
+    if (message.chat.type != "private" or message.chat.id != uid
+            or not is_owner(uid)):
+        await state.clear()
+        await message.answer("⛔ Только владелец может менять баннер.")
+        return
+    if not message.photo:
+        await message.answer(
+            "📷 Отправьте изображение именно как <b>фото</b>, "
+            "не как документ. Для отмены: /cancel.",
+            parse_mode="HTML"
+        )
+        return
+    picture = message.photo[-1]
+    if (picture.width < 640 or picture.height < 320 or
+            not 1.6 <= picture.width / picture.height <= 2.05):
+        await message.answer(
+            "⚠️ Нужен горизонтальный баннер примерно 16:9, "
+            "шириной от 640 пикселей. Отправьте другое фото."
+        )
+        return
+    new_file_id = picture.file_id
+    if not isinstance(new_file_id, str) or not 10 <= len(new_file_id) <= 256:
+        await message.answer(
+            "⚠️ Telegram не вернул корректный идентификатор фото."
+        )
+        return
+    global MENU_BANNER_FILE_ID
+    previous = MENU_BANNER_FILE_ID
+    MENU_BANNER_FILE_ID = new_file_id
+    if not await sync_state_to_cloud():
+        MENU_BANNER_FILE_ID = previous
+        await message.answer(
+            "⚠️ Firebase не подтвердила сохранение. "
+            "Баннер не изменён, можно отправить фото ещё раз."
+        )
+        return
+    await state.clear()
+    await message.answer("✅ <b>Баннер сохранён!</b> Он появится у всех в главном меню.",
+                         parse_mode="HTML")
+    profile = users_db.get(str(uid), {})
+    if isinstance(profile, dict) and profile.get("nick"):
+        await send_home_banner_card(
+            message, home_card_text(profile, uid),
+            reply_markup=get_main_menu(uid), lea=True,
+            banner_file_id=MENU_BANNER_FILE_ID
+        )
+
+
 @dp.message(Command("menu", "help"))
 async def cmd_menu(message: types.Message, state: FSMContext):
     """Always send a fresh menu at the bottom, irrespective of current FSM state."""
