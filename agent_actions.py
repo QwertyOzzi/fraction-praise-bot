@@ -485,3 +485,19 @@ async def finish_announcement(client, session_factory, news_id, *, sent, failed)
     if result != "applied":
         raise AgentOperationError("Не удалось подтвердить статус рассылки.")
     return payload
+
+
+async def get_announcement(client, session_factory, news_id):
+    """Fetch an announcement by validated ID, not an untrusted Firestore path."""
+    if not isinstance(news_id, str) or not re.fullmatch(r"news-[a-f0-9]{16,32}", news_id):
+        raise AgentOperationError("Некорректный ID рассылки.")
+    headers = await _token(client)
+    async with session_factory() as session:
+        doc = await _get(session, client, headers, f"{COLLECTION_NEWS}/{news_id}",
+                         optional=True)
+    if doc is None:
+        return None
+    payload = _decode(doc)
+    if payload.get("id") != news_id:
+        raise AgentOperationError("ID новости в Firestore не совпадает.")
+    return payload
