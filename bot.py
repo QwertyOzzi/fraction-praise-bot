@@ -3588,6 +3588,9 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
 
 @dp.message(Command("permissions"))
 async def cmd_permissions(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
     """Owner-only capabilities; never replace existing Telegram role assignments."""
     if not is_owner(message.from_user.id):
         await message.answer("⛔ Настраивать права может только владелец.")
@@ -3638,6 +3641,9 @@ async def cmd_permissions(message: types.Message):
 
 @dp.message(Command("profile"))
 async def cmd_employee_profile(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
     """Private self-service card; never show another user's Telegram profile."""
     profile = get_verified_agent(message.from_user.id)
     if not profile:
@@ -3666,6 +3672,9 @@ async def cmd_employee_profile(message: types.Message):
 
 @dp.message(Command("stats"))
 async def cmd_activity_stats(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
     """Leadership only; figures are Telegram report activity, not online time."""
     if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "stats.view"):
         await message.answer("⛔ Статистика сотрудников доступна руководству.")
@@ -3691,6 +3700,9 @@ async def cmd_activity_stats(message: types.Message):
 
 @dp.message(Command("department"))
 async def cmd_set_department(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
     """Leader-managed optional department, without presuming server departments."""
     if not has_permission(message.from_user.id, "department.manage"):
         await message.answer("⛔ Назначение отделов доступно владельцу и лидеру.")
@@ -4133,7 +4145,7 @@ def render_queue(rows: List[Dict[str, Any]]):
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
 @dp.message(Command("queue"))
 async def cmd_queue(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("Доступно только руководству.")
         return
     try:
@@ -4147,7 +4159,7 @@ async def cmd_queue(message: types.Message):
 
 @dp.callback_query(F.data.startswith("issue_1_"))
 async def process_issue_one(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "points.debit"):
         await callback.answer("У вас нет прав!", show_alert=True)
         return
     nick = callback.data[len("issue_1_"):]
@@ -4497,6 +4509,8 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⛔ ИИ-команды доступны только руководству в личном чате.")
         return
     raw = raw.strip()
+    command_text, delimiter, debit_reason = raw.partition("|")
+    debit_reason = debit_reason.strip()
     if not raw:
         await message.answer("Напишите команду, например: <code>норто, гоммез -3 фрп</code>",
                              parse_mode="HTML")
@@ -4510,7 +4524,7 @@ async def handle_natural_command(message: types.Message, raw: str):
     recent.append(now)
     _AI_LIMIT[uid] = recent
     try:
-        plan, origin = await interpret_natural(raw, GEMINI_API_KEY, gemini_json_request)
+        plan, origin = await interpret_natural(command_text.strip(), GEMINI_API_KEY, gemini_json_request)
     except ParseError as exc:
         await message.answer("⚠️ " + html.escape(str(exc)))
         return
@@ -4518,6 +4532,17 @@ async def handle_natural_command(message: types.Message, raw: str):
         logger.warning("Gemini parsing request failed: %s", type(exc).__name__)
         await message.answer("⚠️ Не удалось получить ответ Gemini. Попробуйте ещё раз.")
         return
+    capability = "points.grant" if plan["action"] == "credit" else "points.debit"
+    if not has_permission(uid, capability):
+        await message.answer("⛔ Нет разрешения на эту операцию.")
+        return
+    if plan["action"] == "debit":
+        if not delimiter or not 5 <= len(debit_reason) <= 200:
+            await message.answer("⚠️ Укажите причину списания после | (5–200 символов).")
+            return
+        if plan["amount"] > debit_limit(uid):
+            await message.answer(f"⛔ Лимит списания для вашей роли: {debit_limit(uid)}.")
+            return
     try:
         # Memory is never sent to Gemini. Each operation uses the current sheet
         # AND persisted aliases from both sheets to revalidate identity.
@@ -4562,7 +4587,8 @@ async def handle_natural_command(message: types.Message, raw: str):
         "uid": uid, "chat_id": message.chat.id,
         "created": now, "status": "new",
         "plan": plan, "targets": targets,
-        "raw": raw,
+        "raw": command_text.strip(),
+        "reason": debit_reason if plan["action"] == "debit" else "",
         "operation_id": "ai-" + uuid.uuid4().hex
     }
     sheet_label = "FRP" if plan["sheet"] == "fractionrp" else "похвал"
@@ -4584,6 +4610,7 @@ async def handle_natural_command(message: types.Message, raw: str):
     await message.answer(
         "🤖 <b>FBI · Проверка ИИ-команды</b>\n\n" +
         summary +
+        (("\n📋 Причина: " + html.escape(debit_reason)) if plan["action"] == "debit" else "") +
         f"\n\n<blockquote>Агентов: <b>{len(targets)}</b>\n"
         f"Источник разбора: {source}</blockquote>\n"
         "<i>Firebase изменится только после нажатия «Подтвердить».</i>",
@@ -4643,6 +4670,16 @@ async def confirm_natural_command(callback: types.CallbackQuery):
         await callback.answer("Некорректное действие.", show_alert=True)
         return
 
+    plan = task["plan"]
+    capability = "points.grant" if plan["action"] == "credit" else "points.debit"
+    if not has_permission(callback.from_user.id, capability):
+        await callback.answer("Право на операцию отозвано.", show_alert=True)
+        return
+    if plan["action"] == "debit" and (
+            not 5 <= len(task.get("reason", "")) <= 200 or
+            plan["amount"] > debit_limit(callback.from_user.id)):
+        await callback.answer("Причина или лимит списания не подтверждены.", show_alert=True)
+        return
     # Claim the token before the first network await: double-click safe.
     task["status"] = "processing"
     await callback.answer("Проверяю Firebase и выполняю операцию...")
@@ -4678,7 +4715,8 @@ async def confirm_natural_command(callback: types.CallbackQuery):
         asyncio.create_task(record_admin_activity(
             "ai_grant" if plan["action"] == "credit" else "ai_debit",
             callback.from_user.id,
-            f"{target['nick']}: {sign}{plan['amount']}; op={task['operation_id']}",
+            f"{target['nick']}: {sign}{plan['amount']}; op={task['operation_id']}" +
+            (f"; причина: {task['reason']}" if plan["action"] == "debit" else ""),
             plan["sheet"]
         ))
     try:
