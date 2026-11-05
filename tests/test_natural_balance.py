@@ -28,6 +28,7 @@ class FirestoreFake:
         ]
         self.ids = []
         self.aliases = ""
+        self.agent_actions = []
         self.rev = 1
         self.writes = 0
 
@@ -41,7 +42,10 @@ class FirestoreFake:
                 "appliedNaturalIds": {"arrayValue": {"values": [
                     {"stringValue": value} for value in self.ids
                 ]}},
-                MEMORY_FIELD: {"stringValue": self.aliases}
+                MEMORY_FIELD: {"stringValue": self.aliases},
+                "appliedAgentActions": {"arrayValue": {
+                    "values": copy.deepcopy(self.agent_actions)
+                }}
             }
         })
 
@@ -60,6 +64,11 @@ class FirestoreFake:
         if MEMORY_FIELD in fields:
             self.aliases = fields[MEMORY_FIELD]["stringValue"]
             assert ("updateMask.fieldPaths", MEMORY_FIELD) in params
+        if "appliedAgentActions" in fields:
+            assert ("updateMask.fieldPaths", "appliedAgentActions") in params
+            self.agent_actions = copy.deepcopy(
+                fields["appliedAgentActions"]["arrayValue"]["values"]
+            )
         self.rev += 1
         self.writes += 1
         return FakeResponse(200)
@@ -208,6 +217,52 @@ class TestAtomicBalanceChanges(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.run_batch("debit", 2, targets=[prepared[0], prepared[0]])
         self.assertEqual(self.store.writes, 0)
+
+    async def test_agent_debit_writes_atomic_separate_journal(self):
+        targets = self.targets()[:1]
+        result = await apply_batch(
+            self.client, "fractionrp", targets, "debit", 2,
+            "ai-agent-audit-01", self.session_factory,
+            agent_audit={
+                "actor_id": 42, "actor_nick": "Gomez_Addams",
+                "reason": "Самостоятельное списание агентом"
+            }
+        )
+        self.assertEqual(result, "applied")
+        self.assertEqual(self.store.rows[0]["qty"], 7)
+        self.assertEqual(len(self.store.agent_actions), 1)
+        import json
+        note = json.loads(self.store.agent_actions[0]["stringValue"])
+        self.assertEqual(note["actor_id"], 42)
+        self.assertEqual(note["action"], "debit")
+        self.assertEqual(note["targets"], ["Samuel_Norton"])
+        self.assertEqual(self.store.writes, 1)
+
+    async def test_failed_agent_debit_has_no_audit_entry(self):
+        with self.assertRaises(BalanceConflict):
+            await apply_batch(
+                self.client, "fractionrp", self.targets(), "debit", 10,
+                "ai-agent-audit-02", self.session_factory,
+                agent_audit={
+                    "actor_id": 42, "actor_nick": "Gomez_Addams"
+                }
+            )
+        self.assertEqual(self.store.writes, 0)
+        self.assertEqual(self.store.agent_actions, [])
+
+    async def test_repeat_agent_callback_keeps_single_audit(self):
+        prepared = self.targets()[:1]
+        for _ in range(2):
+            await apply_batch(
+                self.client, "fractionrp", prepared, "debit", 1,
+                "ai-agent-audit-03", self.session_factory,
+                agent_audit={
+                    "actor_id": 42, "actor_nick": "Gomez_Addams"
+                }
+            )
+        self.assertEqual(self.store.rows[0]["qty"], 8)
+        self.assertEqual(len(self.store.agent_actions), 1)
+        self.assertEqual(self.store.writes, 1)
 
     async def test_invalid_amount_rejected(self):
         with self.assertRaises(ValueError):
