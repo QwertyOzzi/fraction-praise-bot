@@ -272,6 +272,74 @@ class TestSeparateAgentTransactions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0]["action"], "credit_requested")
 
+    async def test_retry_same_news_id_is_idempotent(self):
+        fixed_id = "news-" + "a" * 16
+        first = await create_announcement(
+            self.client, self.session_factory,
+            actor_id=777, title="Обновление",
+            message="Тест", category="update",
+            recipients=7, news_id=fixed_id
+        )
+        second = await create_announcement(
+            self.client, self.session_factory,
+            actor_id=777, title="Обновление",
+            message="Тест", category="update",
+            recipients=7, news_id=fixed_id
+        )
+        self.assertEqual(first["id"], fixed_id)
+        self.assertEqual(second["id"], fixed_id)
+        self.assertEqual(second["status"], "sending")
+        self.assertEqual(len(self.cloud.commits), 1)
+
+    async def test_existing_id_with_different_payload_is_rejected(self):
+        fixed_id = "news-" + "b" * 16
+        await create_announcement(
+            self.client, self.session_factory, actor_id=777,
+            title="Обновление", message="Текст 1",
+            category="update", recipients=7, news_id=fixed_id
+        )
+        with self.assertRaises(AgentOperationError):
+            await create_announcement(
+                self.client, self.session_factory,
+                actor_id=777, title="Обновление",
+                message="Другой текст", category="update",
+                recipients=7, news_id=fixed_id
+            )
+        self.assertEqual(len(self.cloud.commits), 1)
+
+    async def test_http_403_names_missing_firebase_rules_not_a_second_log(self):
+        class ForbiddenSession:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                return None
+            def post(self, url, **kwargs):
+                return Response(403, {
+                    "error": {"status": "PERMISSION_DENIED",
+                              "message": "secret backend detail"}
+                })
+        with self.assertRaises(AgentOperationError) as ctx:
+            await create_announcement(
+                self.client, ForbiddenSession,
+                actor_id=777, title="Новости",
+                message="Тестовая новость",
+                category="news", recipients=7,
+                news_id="news-" + "c" * 16
+            )
+        self.assertIn("HTTP 403", str(ctx.exception))
+        self.assertIn("fbi_announcements", str(ctx.exception))
+        self.assertNotIn("secret backend detail", str(ctx.exception))
+        self.assertEqual(self.cloud.commits, [])
+
+    async def test_invalid_news_id_fails_without_request(self):
+        with self.assertRaises(AgentOperationError):
+            await create_announcement(
+                self.client, self.session_factory, actor_id=777,
+                title="Новости", message="Тест", category="news",
+                recipients=7, news_id="../bad"
+            )
+        self.assertEqual(self.cloud.commits, [])
+
     async def test_manual_news_created_and_finalized_in_separate_collection(self):
         notice = await create_announcement(
             self.client, self.session_factory,
