@@ -6,7 +6,8 @@ import unittest
 from agent_actions import (
     AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
     decide_add_request, list_collection, create_announcement, finish_announcement,
-    COLLECTION_ACTIONS, COLLECTION_REQUESTS, COLLECTION_NEWS, MEMORY_FIELD
+    COLLECTION_ACTIONS, COLLECTION_REQUESTS, COLLECTION_NEWS, MEMORY_FIELD,
+    _create, _replace, _sheet_update, _resource_name, _base
 )
 
 
@@ -61,6 +62,15 @@ class FakeCloud:
 
     def commit(self, payload):
         writes = payload["writes"]
+        # Emulate Firestore's strict Write.update.name resource-name contract.
+        # A full HTTPS URL in the JSON body returns HTTP 400 INVALID_ARGUMENT.
+        for write in writes:
+            name = write["update"]["name"]
+            if not name.startswith("projects/test/databases/(default)/documents/"):
+                return Response(400, {"error": {
+                    "status": "INVALID_ARGUMENT",
+                    "message": "Invalid document resource name"
+                }})
         for write in writes:
             update = write["update"]
             path = update["name"].split("/documents/", 1)[1]
@@ -118,6 +128,54 @@ class Client:
     @staticmethod
     def _row_to_firestore(row):
         return {"mapValue": {"fields": copy.deepcopy(row)}}
+
+
+class TestFirestoreResourceNames(unittest.TestCase):
+    def test_url_and_resource_name_are_different(self):
+        client = Client()
+        expected = "projects/test/databases/(default)/documents"
+        self.assertEqual(_resource_name(client), expected)
+        self.assertEqual(
+            _base(client),
+            "https://firestore.googleapis.com/v1/" + expected
+        )
+
+    def test_create_announcement_write_name_has_no_api_host(self):
+        client = Client()
+        write = _create(client, "fbi_announcements/news-123", {
+            "title": "Тест", "message": "Проверка"
+        })
+        self.assertEqual(
+            write["update"]["name"],
+            "projects/test/databases/(default)/documents/"
+            "fbi_announcements/news-123"
+        )
+        self.assertFalse(write["update"]["name"].startswith("https://"))
+        self.assertEqual(write["currentDocument"], {"exists": False})
+
+    def test_existing_document_update_names_for_agent_requests(self):
+        client = Client()
+        write = _replace(
+            client, "agent_add_requests/req-123",
+            "2026-11-05T12:00:00Z", {"status": "approved"}
+        )
+        self.assertEqual(
+            write["update"]["name"],
+            "projects/test/databases/(default)/documents/"
+            "agent_add_requests/req-123"
+        )
+        self.assertIn("updateMask", write)
+
+    def test_balance_updates_use_resource_names_too(self):
+        client = Client()
+        write = _sheet_update(client, "fractionrp", "rev-1", [
+            {"nick": "Sample_Agent", "qty": 5}
+        ])
+        self.assertEqual(
+            write["update"]["name"],
+            "projects/test/databases/(default)/documents/sheets/fractionrp"
+        )
+        self.assertIn("currentDocument", write)
 
 
 class TestSeparateAgentTransactions(unittest.IsolatedAsyncioTestCase):
