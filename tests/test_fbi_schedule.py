@@ -36,7 +36,7 @@ class ScheduleDomainTests(unittest.TestCase):
 
     def test_event_reminders_skip_times_already_passed(self):
         event = prepare_schedule(
-            "event", "Общий сбор", "На парковке", "06.11.2026", "17:00",
+            "event", "Общий сбор", "На парковке", "06.11.2026", "13:00",
             "5-10", creator_id=42, reminders=(1440, 60, 15), now=NOW
         )
         self.assertEqual([x["id"] for x in event["jobs"]],
