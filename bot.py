@@ -5618,7 +5618,7 @@ def newslog_list_keyboard(entries, page: int, pages: int):
             str(entry.get("status") or ""), "❔"
         )
         buttons.append([InlineKeyboardButton(
-            text=f"{icon} {title} · {date}",
+            text=f"{icon} {title[:24]} · {date} · #{entry['id'][-4:]}",
             callback_data=f"newslog:view:{entry['id']}:{page}"
         )])
     nav = []
