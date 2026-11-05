@@ -5609,33 +5609,99 @@ async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext)
         task.add_done_callback(_NEWS_BROADCAST_TASKS.discard)
 
 
+def newslog_list_keyboard(entries, page: int, pages: int):
+    buttons = []
+    for entry in entries:
+        title = str(entry.get("title") or "Новость").replace("\n", " ")[:29]
+        date = news_date(entry.get("created_at")).split(" ", 1)[0]
+        icon = {"delivered": "✅", "partial": "⚠️", "sending": "⏳"}.get(
+            str(entry.get("status") or ""), "❔"
+        )
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {title} · {date}",
+            callback_data=f"newslog:view:{entry['id']}:{page}"
+        )])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"newslog:page:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="Далее ▶️", callback_data=f"newslog:page:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"newslog:page:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def show_newslog_list(message: types.Message, *, page: int = 0, edit: bool = False):
+    """Read current cloud records. Callbacks do not depend on process memory."""
+    records = await list_collection(
+        firebase_client, ClientSession, "fbi_announcements", limit=NEWSLOG_FETCH_LIMIT
+    )
+    text, entries, page, pages = newslog_list(records, page)
+    markup = newslog_list_keyboard(entries, page, pages)
+    if edit:
+        await message.edit_text(text, reply_markup=markup, parse_mode=None)
+    else:
+        await message.answer(text, reply_markup=markup, parse_mode=None)
+
+
 @dp.message(Command("newslog"))
 async def cmd_news_log(message: types.Message):
     if not _agent_private(message) or not is_leader(message.from_user.id):
         await message.answer("⛔ Журнал рассылок доступен владельцу и лидеру.")
         return
     try:
-        records = await list_collection(
-            firebase_client, ClientSession, "fbi_announcements", limit=40
-        )
+        await show_newslog_list(message)
     except Exception as exc:
         logger.warning("News journal unavailable: %s", type(exc).__name__)
-        await message.answer("⚠️ Журнал новостей недоступен.")
-        return
-    if not records:
-        await message.answer("📰 Новостей пока не публиковали.")
-        return
-    lines = ["📰 <b>FBI · История рассылок</b>\n"]
-    for entry in records[:15]:
-        lines.append(
-            f"• <code>{html.escape(str(entry.get('id') or '')[-8:])}</code> — "
-            f"{html.escape(str(entry.get('title') or 'Новость'))}\n"
-            f"  {html.escape(str(entry.get('status') or '?'))} · "
-            f"✅ {int(entry.get('sent') or 0)} / "
-            f"⚠️ {int(entry.get('failed') or 0)}"
-        )
-    await message.answer("\n".join(lines), parse_mode="HTML")
+        await message.answer("⚠️ Не удалось загрузить журнал новостей из Firebase.")
 
+
+@dp.callback_query(F.data.startswith("newslog:"))
+async def newslog_callback(callback: types.CallbackQuery):
+    """Every click rechecks the caller and Firestore; no cached role or entry."""
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id
+            or not is_leader(callback.from_user.id)):
+        await callback.answer("⛔ Доступно только владельцу и лидеру в личном чате.",
+                              show_alert=True)
+        return
+    data = callback.data or ""
+    page_match = re.fullmatch(r"newslog:page:(\d{1,3})", data)
+    view_match = re.fullmatch(r"newslog:view:(news-[a-f0-9]{16,32}):(\d{1,3})", data)
+    if not page_match and not view_match:
+        await callback.answer("⚠️ Некорректная или устаревшая кнопка.", show_alert=True)
+        return
+    try:
+        if page_match:
+            await show_newslog_list(callback.message, page=int(page_match.group(1)), edit=True)
+        else:
+            news_id, page = view_match.group(1), int(view_match.group(2))
+            item = await get_announcement(firebase_client, ClientSession, news_id)
+            if not item:
+                await callback.answer("⚠️ Новость больше не найдена.", show_alert=True)
+                return
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"newslog:page:{page}"),
+                 InlineKeyboardButton(text="🔄 Обновить", callback_data=data)]
+            ])
+            detail = newslog_detail(item, users_db)
+            if text_size_utf16(detail) > 3900:
+                metadata = newslog_detail(item, users_db, include_text=False)
+                await callback.message.edit_text(
+                    metadata + "\n\n📝 Полный текст новости отправлен отдельным сообщением ниже.",
+                    parse_mode=None, reply_markup=kb
+                )
+                for part in split_telegram_text(str(item.get("message") or "(нет текста)")):
+                    await callback.message.answer(part, parse_mode=None)
+            else:
+                await callback.message.edit_text(detail, reply_markup=kb, parse_mode=None)
+        await callback.answer()
+    except Exception as exc:
+        logger.warning("Newslog callback failed: %s", type(exc).__name__)
+        await callback.answer("⚠️ Не удалось открыть новость. Повторите попытку.",
+                              show_alert=True)
 
 
 # A plain natural-language instruction in a private admin chat works without /ai.
