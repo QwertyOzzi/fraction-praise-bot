@@ -24,6 +24,7 @@ from agent_actions import (
     AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
     decide_add_request, list_collection, create_announcement, finish_announcement
 )
+from personnel import personnel_details, ranked_reporters
 from telegram_design import (send_fbi_card, send_home_banner_card,
                              edit_fbi_card, hide_old_reply_keyboard,
                              with_home_button)
@@ -794,6 +795,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📌 Заявки", callback_data="main:pending"),
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
+            [InlineKeyboardButton(text="📊 Статистика отчётов", callback_data="main:stats")],
             [InlineKeyboardButton(text="📥 Запросы агентов", callback_data="main:agentpending")],
             [InlineKeyboardButton(text="📜 Журнал агентов", callback_data="main:agentlogs")],
             [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
@@ -807,6 +809,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
+            [InlineKeyboardButton(text="👤 Моя карточка", callback_data="main:profile")],
             [InlineKeyboardButton(text="➖ Списать FRP / похвалу", callback_data="main:min")],
             [InlineKeyboardButton(text="➕ Запросить начисление", callback_data="main:plus")],
             [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
@@ -867,6 +870,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="menu", description="Показать главное меню внизу чата"),
     BotCommand(command="report", description="Подать отчёт FRP / похвала"),
     BotCommand(command="status", description="Мои FRP и похвалы"),
+    BotCommand(command="profile", description="Полная карточка сотрудника"),
     BotCommand(command="nick", description="Изменить игровой ник"),
     BotCommand(command="rank", description="Запросить смену ранга"),
     BotCommand(command="min", description="Списать FRP/похвалу агенту"),
@@ -877,6 +881,8 @@ PUBLIC_BOT_COMMANDS = [
 ]
 ADMIN_BOT_COMMANDS = [
     BotCommand(command="agents", description="Управление агентами"),
+    BotCommand(command="stats", description="Статистика отчётов агентов"),
+    BotCommand(command="department", description="Назначить отдел сотруднику"),
     BotCommand(command="pending", description="Ожидающие заявки"),
     BotCommand(command="queue", description="Очередь на выдачу"),
     BotCommand(command="grant", description="Начислить FRP / похвалы"),
@@ -1629,7 +1635,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs"}
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs", "stats"}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1775,10 +1781,12 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     routes = {
         "report": (start_report, True),
         "status": (cmd_my_status, False),
+        "profile": (cmd_employee_profile, False),
         "nick": (cmd_change_nick, True),
         "rank": (cmd_change_rank, True),
         "support": (cmd_support, True),
         "agents": (cmd_agent_panel, True),
+        "stats": (cmd_activity_stats, False),
         "queue": (cmd_queue, False),
         "pending": (cmd_pending, False),
         "grant": (cmd_grant_menu, True),
@@ -3438,7 +3446,101 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
         await message.edit_text("⚠️ Агент больше не найден. Откройте список снова.")
         return
     text, kb = agent_detail_markup(agent, page)
+    uid = agent.get("uid")
+    if uid and isinstance(users_db.get(str(uid)), dict):
+        details = personnel_details(users_db[str(uid)], requests_db, uid)
+        text = text.replace("<i>Выберите действие.", details + "\n\n<i>Выберите действие.")
     await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
+
+
+
+@dp.message(Command("profile"))
+async def cmd_employee_profile(message: types.Message):
+    """Private self-service card; never show another user's Telegram profile."""
+    profile = get_verified_agent(message.from_user.id)
+    if not profile:
+        await message.answer("Для просмотра карточки подтвердите свой ник через /start.")
+        return
+    try:
+        roster = await fetch_agent_directory()
+    except Exception as exc:
+        logger.warning("Personnel roster unavailable: %s", type(exc).__name__)
+        await message.answer("Не удалось получить актуальные балансы Firebase.")
+        return
+    matching = next((agent for agent in roster
+                     if agent.get("uid") == str(message.from_user.id)), None)
+    if matching is None:
+        await message.answer("Карточка пока не найдена в реестре.")
+        return
+    details = personnel_details(profile, requests_db, message.from_user.id)
+    await send_fbi_card(
+        message, f"👤 <b>FBI · Карточка сотрудника</b>\n\n"
+        f"<b>{html.escape(str(profile['nick']))}</b> · ранг "
+        f"{html.escape(str(profile.get('rank') or '?'))}\n"
+        f"🎖️ FRP: <b>{matching['frp']}</b> · "
+        f"🌟 Похвалы: <b>{matching['praise']}</b>\n\n" + details
+    )
+
+
+@dp.message(Command("stats"))
+async def cmd_activity_stats(message: types.Message):
+    """Leadership only; figures are Telegram report activity, not online time."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Статистика сотрудников доступна руководству.")
+        return
+    weekly = ranked_reporters(requests_db, users_db, days=7, limit=10)
+    monthly = ranked_reporters(requests_db, users_db, days=30, limit=10)
+    def render(rows):
+        return "\n".join(
+            f"{i}. <code>{html.escape(item['nick'])}</code> "
+            f"({html.escape(item['rank'])}) — ✅ {item['approved']}, "
+            f"всего {item['total']}"
+            for i, item in enumerate(rows, 1)
+            if item["total"] > 0
+        ) or "Нет отчётов за период."
+    await send_fbi_card(
+        message, "📊 <b>FBI · Активность по отчётам</b>\n\n"
+        "🗓 <b>За последние 7 дней</b>\n" + render(weekly) +
+        "\n\n🗓 <b>За последние 30 дней</b>\n" + render(monthly) +
+        "\n\n<i>Статистика учитывает только поданные отчёты в боте, "
+        "а не игровое время или все виды деятельности.</i>"
+    )
+
+
+@dp.message(Command("department"))
+async def cmd_set_department(message: types.Message):
+    """Leader-managed optional department, without presuming server departments."""
+    if not is_leader(message.from_user.id):
+        await message.answer("⛔ Назначение отделов доступно владельцу и лидеру.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Формат: /department Nick_Name Название отдела")
+        return
+    nick, department = parts[1].strip(), parts[2].strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick) or not 2 <= len(department) <= 60:
+        await message.answer("Некорректный ник или название отдела (2–60 символов).")
+        return
+    if any(ord(char) < 32 or char in "<>" for char in department):
+        await message.answer("Название содержит недопустимые символы.")
+        return
+    matches = [(uid, p) for uid, p in users_db.items()
+               if isinstance(p, dict) and str(p.get("nick") or "").casefold() == nick.casefold()]
+    if len(matches) != 1:
+        await message.answer("Не найден однозначно зарегистрированный агент.")
+        return
+    uid, profile = matches[0]
+    before = dict(profile)
+    profile["department"] = department
+    if not await sync_state_to_cloud():
+        users_db[uid] = before
+        await message.answer("Firebase не подтвердила изменение отдела.")
+        return
+    save_json(USERS_FILE, users_db)
+    await record_admin_activity("department_changed", message.from_user.id,
+                                f"{nick}: отдел {department}")
+    await message.answer(f"✅ Отдел агента {html.escape(nick)} изменён: "
+                         f"{html.escape(department)}", parse_mode="HTML")
 
 
 @dp.message(Command("agents"))
@@ -3714,9 +3816,22 @@ async def agent_set_rank(callback: types.CallbackQuery):
         if not agent or agent["uid"] is None or agent["uid"] not in users_db:
             await callback.answer("Агент не найден", show_alert=True)
             return
-        users_db[agent["uid"]]["rank"] = "X" if rank == 10 else str(rank)
+        profile = users_db[agent["uid"]]
+        previous = dict(profile)
+        new_rank = "X" if rank == 10 else str(rank)
+        old_rank = str(profile.get("rank") or "?")
+        profile["rank"] = new_rank
+        if old_rank != new_rank:
+            history = profile.get("rank_history", [])
+            history = list(history) if isinstance(history, list) else []
+            profile["rank_history"] = (history + [{"from": old_rank, "to": new_rank,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "actor_id": str(callback.from_user.id)}])[-50:]
+        if not await sync_state_to_cloud():
+            users_db[agent["uid"]] = previous
+            await callback.answer("Firebase не подтвердила изменение.", show_alert=True)
+            return
         save_json(USERS_FILE, users_db)
-        await sync_state_to_cloud()
         asyncio.create_task(record_admin_activity("rank_changed", callback.from_user.id,
             f"{agent['nick']}: новый ранг {rank}"))
         await callback.answer("✅ Ранг обновлён")
