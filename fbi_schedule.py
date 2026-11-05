@@ -293,6 +293,8 @@ async def list_active(client):
 async def create_schedule(client, item):
     if not VALID_ID.fullmatch(item["id"]):
         raise ScheduleError("Неправильный ID мероприятия.")
+    if from_iso(item["at"]) <= utcnow() + timedelta(seconds=30):
+        raise ScheduleError("Время уже наступило. Создайте расписание заново.")
     active = await list_active(client)
     if len(active) >= MAX_ACTIVE:
         raise ScheduleError(f"Лимит: {MAX_ACTIVE} активных мероприятий и объявлений.")
