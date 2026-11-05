@@ -6,6 +6,7 @@ import difflib
 import re
 import types
 import unittest
+from typing import Optional, Dict, Any
 from pathlib import Path
 
 from natural_commands import looks_like_operation, simplified
@@ -15,6 +16,11 @@ TREE = ast.parse(CODE)
 
 
 def load_functions(names, env):
+    env.setdefault("Optional", Optional)
+    env.setdefault("Dict", Dict)
+    env.setdefault("Any", Any)
+    env.setdefault("types", types.SimpleNamespace(Message=FakeMessage, CallbackQuery=object))
+    env.setdefault("FSMContext", State)
     nodes = []
     for node in TREE.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
@@ -192,7 +198,7 @@ class TestBroadcastGuards(unittest.TestCase):
             "def parse_agent_slash(", 1)[0]
         self.assertNotIn("credit_report(", agent_block)
         self.assertNotIn("record_admin_activity(", agent_block)
-        self.assertIn('"credit"', agent_block)
+        self.assertIn('else "📎 Продолжить заявку"', agent_block)
         handler = CODE.split("async def review_agent_add_request(", 1)[1].split(
             '@dp.message(Command("agentlogs"))', 1)[0]
         self.assertIn("decide_add_request(", handler)
