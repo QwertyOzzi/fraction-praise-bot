@@ -2586,7 +2586,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
 # ╚══════════════════════════════════════════════════════════════════╝
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_report(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "reports.review"):
         await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
@@ -2650,7 +2650,7 @@ async def approve_report(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_report(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "reports.review"):
         await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
@@ -3090,7 +3090,7 @@ async def cmd_set_firebase_pass(message: types.Message):
 @dp.message(F.text == "👥 Список админов")
 @dp.message(Command("admins"))
 async def cmd_list_admins(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("Доступно только руководству фракции.")
         return
 
@@ -3183,7 +3183,7 @@ async def process_remove_admin(callback: types.CallbackQuery):
 @dp.message(Command("pending"))
 @dp.message(F.text == "📌 Ожидающие заявки")
 async def cmd_pending(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "reports.review"):
         await message.answer("⛔ Доступно только руководству.")
         return
     pending = [(rid, req) for rid, req in requests_db.items() if req.get("status") == "pending"]
@@ -3239,7 +3239,7 @@ def parse_grant_args(raw: str):
 
 
 async def perform_manual_grant(message: types.Message, raw: str):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "points.grant"):
         await message.answer("⛔ Только лидер или заместитель может начислять баллы.")
         return
     try:
@@ -3287,7 +3287,7 @@ async def cmd_grant(message: types.Message):
 
 @dp.message(F.text == "➕ Начислить FRP / Похвалу")
 async def cmd_grant_menu(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "points.grant"):
         await message.answer("⛔ Только для руководства.")
         return
     await state.set_state(GrantStates.waiting_for_details)
@@ -3651,7 +3651,7 @@ async def cmd_employee_profile(message: types.Message):
 @dp.message(Command("stats"))
 async def cmd_activity_stats(message: types.Message):
     """Leadership only; figures are Telegram report activity, not online time."""
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "stats.view"):
         await message.answer("⛔ Статистика сотрудников доступна руководству.")
         return
     weekly = ranked_reporters(requests_db, users_db, days=7, limit=10)
@@ -3676,7 +3676,7 @@ async def cmd_activity_stats(message: types.Message):
 @dp.message(Command("department"))
 async def cmd_set_department(message: types.Message):
     """Leader-managed optional department, without presuming server departments."""
-    if not is_leader(message.from_user.id):
+    if not has_permission(message.from_user.id, "department.manage"):
         await message.answer("⛔ Назначение отделов доступно владельцу и лидеру.")
         return
     parts = (message.text or "").split(maxsplit=2)
@@ -3712,7 +3712,7 @@ async def cmd_set_department(message: types.Message):
 @dp.message(Command("agents"))
 @dp.message(F.text == "🧑‍💼 Управление агентами")
 async def cmd_agent_panel(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("⛔ Панель доступна только руководству.")
         return
     await state.clear()
@@ -3726,7 +3726,7 @@ async def cmd_agent_panel(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("agpage:") | (F.data == "agreset"))
 async def agent_page(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
     if callback.data == "agreset":
@@ -3753,7 +3753,7 @@ async def agent_noop(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "agsearch")
 async def agent_search(callback: types.CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AgentPanelStates.waiting_for_search)
@@ -3763,7 +3763,7 @@ async def agent_search(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AgentPanelStates.waiting_for_search)
 async def agent_search_term(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await state.clear()
         return
     value = (message.text or "").strip().casefold()
@@ -3781,7 +3781,7 @@ async def agent_search_term(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("agview:"))
 async def agent_view(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3795,7 +3795,7 @@ async def agent_view(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agask:"))
 async def agent_ask_action(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "points.grant"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3842,7 +3842,7 @@ async def agent_ask_action(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agdo:"))
 async def agent_do_action(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "points.grant"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     token = callback.data.removeprefix("agdo:")
@@ -3941,7 +3941,7 @@ async def agent_delete_confirm(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agranks:"))
 async def agent_rank_menu(callback: types.CallbackQuery):
-    if not is_leader(callback.from_user.id):
+    if not has_permission(callback.from_user.id, "agents.rank"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3969,7 +3969,7 @@ async def agent_rank_menu(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agrank:"))
 async def agent_set_rank(callback: types.CallbackQuery):
-    if not is_leader(callback.from_user.id):
+    if not has_permission(callback.from_user.id, "agents.rank"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -5097,7 +5097,7 @@ async def notify_agent_request_reviewers(req):
 
 @dp.message(Command("agentpending"))
 async def cmd_agent_pending(message: types.Message):
-    if not _agent_private(message) or not is_admin(message.from_user.id):
+    if not _agent_private(message) or not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "reports.review"):
         await message.answer("⛔ Доступно только руководству в личном чате.")
         return
     try:
@@ -5128,7 +5128,7 @@ async def review_agent_add_request(callback: types.CallbackQuery):
     if (not isinstance(callback.message, types.Message)
             or callback.message.chat.type != "private"
             or callback.message.chat.id != callback.from_user.id
-            or not is_admin(callback.from_user.id)):
+            or not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "reports.review")):
         await callback.answer("Нет прав руководства.", show_alert=True)
         return
     parts = (callback.data or "").split(":")
@@ -5192,7 +5192,7 @@ async def review_agent_add_request(callback: types.CallbackQuery):
 
 @dp.message(Command("agentlogs"))
 async def cmd_agent_logs(message: types.Message):
-    if not _agent_private(message) or not is_admin(message.from_user.id):
+    if not _agent_private(message) or not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("⛔ Журнал действий доступен только руководству.")
         return
     try:
@@ -5265,7 +5265,7 @@ def _news_message(title, category, message):
 
 @dp.message(Command("news"))
 async def cmd_news(message: types.Message, state: FSMContext):
-    if not _agent_private(message) or not is_leader(message.from_user.id):
+    if not _agent_private(message) or not has_permission(message.from_user.id, "news.publish"):
         await message.answer(
             "⛔ Публикация новостей доступна только владельцу и действующему лидеру."
         )
@@ -5373,7 +5373,7 @@ async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext)
     if (not isinstance(callback.message, types.Message)
             or callback.message.chat.type != "private"
             or callback.message.chat.id != callback.from_user.id
-            or not is_leader(callback.from_user.id)):
+            or not has_permission(callback.from_user.id, "news.publish")):
         await callback.answer("Недостаточно прав для рассылки.", show_alert=True)
         return
     uid = callback.from_user.id
