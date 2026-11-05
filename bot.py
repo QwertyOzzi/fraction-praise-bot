@@ -4782,6 +4782,234 @@ async def cmd_agent_logs(message: types.Message):
         await message.answer("\n".join(text), parse_mode="HTML")
 
 
+
+# --- Signed-leadership-only news and release announcements -------------------
+_NEWS_SEND_LOCKS: Dict[int, asyncio.Lock] = {}
+_NEWS_BROADCAST_TASKS: set = set()
+
+
+def _news_recipients():
+    """All known private Telegram users except intentionally blocked profiles."""
+    targets = set()
+    for raw_uid, profile in users_db.items():
+        if not isinstance(profile, dict) or not str(raw_uid).isdecimal():
+            continue
+        uid = int(raw_uid)
+        if uid <= 0 or profile.get("verification_status") in ("disabled", "cooldown"):
+            continue
+        targets.add(uid)
+    return sorted(targets)
+
+
+def _news_content(raw):
+    raw = (raw or "").strip()
+    category = "news"
+    marker = re.match(r"^(?:update|обновление)\s*:\s*", raw, re.I)
+    if marker:
+        category, raw = "update", raw[marker.end():].strip()
+    if not 1 <= len(raw) <= 3000:
+        raise AgentOperationError(
+            "Новость должна содержать от 1 до 3000 символов."
+        )
+    title = "Обновление системы FBI" if category == "update" else "Новости FBI"
+    return title, category, raw
+
+
+def _news_message(title, category, message):
+    icon = "🔔" if category == "update" else "📰"
+    return (
+        f"{icon} <b>FBI · {html.escape(title)}</b>\n\n"
+        + html.escape(message)
+        + "\n\n<i>Официальное сообщение руководства FBI.</i>"
+    )
+
+
+@dp.message(Command("news"))
+async def cmd_news(message: types.Message, state: FSMContext):
+    if not _agent_private(message) or not is_leader(message.from_user.id):
+        await message.answer(
+            "⛔ Публикация новостей доступна только владельцу и действующему лидеру."
+        )
+        return
+    if await state.get_state() is not None:
+        await message.answer(
+            "⏳ Завершите текущее действие или используйте /cancel."
+        )
+        return
+    words = (message.text or "").split(maxsplit=1)
+    if len(words) == 2:
+        await show_news_preview(message, state, words[1])
+        return
+    await state.set_state(NewsStates.waiting_for_text)
+    await message.answer(
+        "📰 <b>FBI · Рассылка новостей</b>\n\n"
+        "Отправьте следующим сообщением текст новости.\n"
+        "Для объявления обновления начните текст с "
+        "<code>обновление:</code>\n\n"
+        "<i>Перед отправкой всем пользователям появится предварительный "
+        "просмотр с подтверждением. /cancel — отменить.</i>",
+        parse_mode="HTML"
+    )
+
+
+async def show_news_preview(message, state, raw):
+    try:
+        title, category, body = _news_content(raw)
+    except AgentOperationError as exc:
+        await message.answer("⚠️ " + html.escape(str(exc)))
+        return
+    recipients = _news_recipients()
+    if not recipients:
+        await message.answer("Нет зарегистрированных адресатов рассылки.")
+        return
+    nonce = uuid.uuid4().hex[:16]
+    await state.update_data(news={
+        "title": title, "category": category, "message": body,
+        "nonce": nonce, "recipients": recipients
+    })
+    await state.set_state(NewsStates.confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📣 Отправить {len(recipients)} пользователям",
+            callback_data=f"newspublish:{nonce}", style="success")],
+        [InlineKeyboardButton(
+            text="❌ Отмена", callback_data="newscancel")]
+    ])
+    await message.answer(
+        _news_message(title, category, body)
+        + f"\n\n<blockquote>Адресатов: {len(recipients)}\n"
+          "Это только предварительный просмотр.</blockquote>",
+        parse_mode="HTML", reply_markup=kb
+    )
+
+
+@dp.message(NewsStates.waiting_for_text)
+async def receive_news_text(message: types.Message, state: FSMContext):
+    if not _agent_private(message) or not is_leader(message.from_user.id):
+        await state.clear()
+        await message.answer("Нет прав на рассылку.")
+        return
+    if not message.text:
+        await message.answer("Отправьте новость текстом, максимум 3000 символов.")
+        return
+    await show_news_preview(message, state, message.text)
+
+
+async def _broadcast_fbi_news(actor_uid, news, recipients):
+    """Deliver at bounded speed, keep an independent delivery journal."""
+    sent, failed = 0, 0
+    final_text = _news_message(news["title"], news["category"], news["message"])
+    for uid in recipients:
+        try:
+            await bot.send_message(uid, final_text, parse_mode="HTML",
+                                   disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logger.info("News delivery to one user failed (%s)", type(exc).__name__)
+        # Telegram's global send limit: deliberately stay below ~20 messages/sec.
+        await asyncio.sleep(0.07)
+    try:
+        await finish_announcement(
+            firebase_client, ClientSession, news["id"],
+            sent=sent, failed=failed
+        )
+    except Exception as exc:
+        logger.warning("Could not finalize news journal: %s", type(exc).__name__)
+    try:
+        await bot.send_message(
+            actor_uid,
+            f"📣 <b>Рассылка завершена</b>\n\n"
+            f"ID: <code>{html.escape(news['id'])}</code>\n"
+            f"✅ Доставлено: {sent}\n⚠️ Ошибок доставки: {failed}\n\n"
+            "Журнал: /newslog",
+            parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.info("Could not deliver broadcast summary: %s", type(exc).__name__)
+
+
+@dp.callback_query(F.data.startswith("newspublish:") | (F.data == "newscancel"))
+async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext):
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id
+            or not is_leader(callback.from_user.id)):
+        await callback.answer("Недостаточно прав для рассылки.", show_alert=True)
+        return
+    uid = callback.from_user.id
+    async with _NEWS_SEND_LOCKS.setdefault(uid, asyncio.Lock()):
+        if await state.get_state() != NewsStates.confirm.state:
+            await callback.answer("Рассылка уже подтверждена или отменена.",
+                                  show_alert=True)
+            return
+        data = (await state.get_data()).get("news")
+        if not isinstance(data, dict):
+            await callback.answer("Устаревший черновик.", show_alert=True)
+            return
+        if callback.data == "newscancel":
+            await state.clear()
+            await callback.answer("Отменено.")
+            await callback.message.edit_text("❌ Публикация отменена.")
+            return
+        if callback.data != f"newspublish:{data['nonce']}":
+            await callback.answer("Кнопка устарела.", show_alert=True)
+            return
+        await state.clear()
+        recipients = [int(x) for x in data["recipients"] if int(x) > 0]
+        try:
+            news = await create_announcement(
+                firebase_client, ClientSession, actor_id=uid,
+                title=data["title"], category=data["category"],
+                message=data["message"], recipients=len(recipients)
+            )
+        except Exception as exc:
+            logger.warning("News persistence failed: %s", type(exc).__name__)
+            await callback.answer("Не удалось сохранить рассылку. Проверьте /newslog.",
+                                  show_alert=True)
+            return
+        await callback.answer("Рассылка сохранена, начинаю отправку.")
+        await callback.message.edit_text(
+            "📣 <b>Рассылка началась</b>\n\n"
+            f"Новость <code>{html.escape(news['id'])}</code>\n"
+            f"Адресатов: {len(recipients)}\n\n"
+            "По окончании придёт отчёт о доставке.",
+            parse_mode="HTML"
+        )
+        task = asyncio.create_task(_broadcast_fbi_news(uid, news, recipients))
+        _NEWS_BROADCAST_TASKS.add(task)
+        task.add_done_callback(_NEWS_BROADCAST_TASKS.discard)
+
+
+@dp.message(Command("newslog"))
+async def cmd_news_log(message: types.Message):
+    if not _agent_private(message) or not is_leader(message.from_user.id):
+        await message.answer("⛔ Журнал рассылок доступен владельцу и лидеру.")
+        return
+    try:
+        records = await list_collection(
+            firebase_client, ClientSession, "fbi_announcements", limit=40
+        )
+    except Exception as exc:
+        logger.warning("News journal unavailable: %s", type(exc).__name__)
+        await message.answer("⚠️ Журнал новостей недоступен.")
+        return
+    if not records:
+        await message.answer("📰 Новостей пока не публиковали.")
+        return
+    lines = ["📰 <b>FBI · История рассылок</b>\n"]
+    for entry in records[:15]:
+        lines.append(
+            f"• <code>{html.escape(str(entry.get('id') or '')[-8:])}</code> — "
+            f"{html.escape(str(entry.get('title') or 'Новость'))}\n"
+            f"  {html.escape(str(entry.get('status') or '?'))} · "
+            f"✅ {int(entry.get('sent') or 0)} / "
+            f"⚠️ {int(entry.get('failed') or 0)}"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+
 # A plain natural-language instruction in a private admin chat works without /ai.
 # State-specific registration/report/support handlers are registered earlier and
 # continue to take priority; this late handler never handles agent messages.
@@ -4792,11 +5020,15 @@ async def conversational_admin_command(message: types.Message, state: FSMContext
     # This also protects states that expect callback buttons rather than text.
     if await state.get_state() is not None:
         return
-    if (message.chat.type != "private" or message.chat.id != message.from_user.id
-            or not is_admin(message.from_user.id)):
+    if message.chat.type != "private" or message.chat.id != message.from_user.id:
         return
-    if looks_like_operation(message.text or ""):
+    if not looks_like_operation(message.text or ""):
+        return
+    if is_admin(message.from_user.id):
         await handle_natural_command(message, message.text)
+    elif get_verified_agent(message.from_user.id):
+        # Agent text is never routed to the unmoderated administrator credit path.
+        await agent_operation_from_text(message, message.text)
 
 
 
