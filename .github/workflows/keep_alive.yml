@@ -1,19 +1,25 @@
+name: Render Keep Alive (HTTP)
+
+on:
+  # Render Free becomes idle after 15 minutes without inbound HTTP traffic.
+  # Offset from minute 0: GitHub's cron scheduling is busiest there.
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
 permissions:
   contents: read
 
-name: Render 24/7 Keep Alive
-
-on:
-  schedule:
-    # Запуск каждые 10 минут
-    - cron: '*/10 * * * *'
-  workflow_dispatch:
-
 jobs:
   keep_alive:
+    name: Check public Render health endpoint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Ping Render Service
+      - name: Wake service / verify HTTP 200
+        env:
+          HEALTH_URL: https://fraction-praise-bot-1.onrender.com/health
         run: |
-          echo "Pinging FractionRp Render Service..."
-          curl -f -s https://fraction-praise-bot-1.onrender.com/health || echo "Ping attempted"
+          set -euo pipefail
+          echo "Checking Render HTTP health endpoint..."
+          curl             --fail             --silent             --show-error             --location             --connect-timeout 15             --max-time 80             --retry 2             --retry-delay 5             --retry-all-errors             --output /dev/null             --write-out "Render returned HTTP %{http_code}\n"             "$HEALTH_URL"
