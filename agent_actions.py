@@ -444,7 +444,9 @@ async def create_announcement(client, session_factory, *, actor_id, title,
             persisted = _decode(existing)
             keys = ("id", "actor_id", "title", "message", "category", "recipients")
             if all(persisted.get(key) == payload.get(key) for key in keys):
-                return persisted
+                # A stored record might already have been broadcast before a
+                # Render restart. Never automatically resend this message.
+                return {**persisted, "_already_persisted": True}
     raise AgentOperationError(
         "Не удалось подтвердить сохранение новости. "
         "Проверьте /newslog перед новой попыткой."
