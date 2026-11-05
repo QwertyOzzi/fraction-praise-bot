@@ -118,5 +118,36 @@ class ScheduleWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, [])
 
 
+class ScheduleClaimTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_job_claimed_at_most_once_across_workers(self):
+        from copy import deepcopy
+        from fbi_schedule import claim_schedule_job
+        item = prepare_schedule(
+            "event", "Сбор состава", "Место старта",
+            "06.11.2026", "18:00", "8-10", creator_id=42, now=NOW
+        )
+        state = {"item": item, "revision": 1}
+
+        async def get(client, sid):
+            return deepcopy(state["item"]), str(state["revision"])
+
+        async def replace(client, changed, revision):
+            if revision != str(state["revision"]):
+                return False
+            state["item"] = deepcopy(changed)
+            state["revision"] += 1
+            return True
+
+        with patch("fbi_schedule.get_schedule", new=get), \
+                patch("fbi_schedule._replace", new=replace):
+            first = await claim_schedule_job(object(), item["id"],
+                                             "announcement", now=NOW + timedelta(seconds=1))
+            second = await claim_schedule_job(object(), item["id"],
+                                              "announcement", now=NOW + timedelta(seconds=2))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(state["item"]["jobs"][0]["state"], "claimed")
+
+
 if __name__ == "__main__":
     unittest.main()
