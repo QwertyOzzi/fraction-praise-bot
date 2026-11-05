@@ -22,4 +22,4 @@ jobs:
         run: |
           set -euo pipefail
           echo "Checking Render HTTP health endpoint..."
-          curl             --fail             --silent             --show-error             --location             --connect-timeout 15             --max-time 100             --retry 2             --retry-delay 5             --retry-all-errors             --output /dev/null             --write-out "Render returned HTTP %{http_code}\n"             "$HEALTH_URL"
+          curl             --fail             --silent             --show-error             --location             --connect-timeout 15             --max-time 80             --retry 2             --retry-delay 5             --retry-all-errors             --output /dev/null             --write-out "Render returned HTTP %{http_code}\n"             "$HEALTH_URL"
