@@ -22,6 +22,7 @@ from agent_tools import (
     parse_min_args, active_profile, suggest_nicks,
     describe_command, audit_fields, audit_preview
 )
+from agent_audit import save_agent_audit, get_agent_audit, save_broadcast_log
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
