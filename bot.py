@@ -30,6 +30,7 @@ from newslog_view import (
     text_size_utf16, split_telegram_text
 )
 from personnel import personnel_details, ranked_reporters
+from help_catalog import full_help_text
 from fbi_schedule import (
     ScheduleError, TZ_NAME, prepare_schedule, parse_ranks, parse_moscow_date,
     moscow_label, current_rank, BLOCKED_STATUSES, list_active, get_schedule,
@@ -932,7 +933,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="min", description="Списать FRP/похвалу агенту"),
     BotCommand(command="plus", description="Запросить начисление с причиной"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
-    BotCommand(command="help", description="Помощь и разделы бота"),
+    BotCommand(command="help", description="Полный список всех команд"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
 ]
 ADMIN_BOT_COMMANDS = [
@@ -1531,7 +1532,19 @@ async def receive_menu_banner_photo(message: types.Message, state: FSMContext):
         )
 
 
-@dp.message(Command("menu", "help"))
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    """A complete role-labelled command reference, never the home menu.
+
+    Does not clear FSM input: agents can check the reference mid-report.
+    """
+    if getattr(message.chat, "type", "") != "private":
+        await message.answer("Откройте бота в личном чате.")
+        return
+    await message.answer(full_help_text(), parse_mode="HTML")
+
+
+@dp.message(Command("menu"))
 async def cmd_menu(message: types.Message, state: FSMContext):
     """Always send a fresh menu at the bottom, irrespective of current FSM state."""
     if getattr(message.chat, "type", "") != "private":
