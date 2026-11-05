@@ -861,6 +861,8 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="min", description="Списать FRP/похвалу агенту"),
     BotCommand(command="plus", description="Запросить начисление с причиной"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
+    BotCommand(command="vklink", description="Привязать ВКонтакте"),
+    BotCommand(command="vkunlink", description="Отвязать ВКонтакте"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
 ]
@@ -874,10 +876,13 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="ai", description="ИИ-команды: начисление и списание FRP"),
     BotCommand(command="agentpending", description="Заявки агентов на начисление"),
     BotCommand(command="agentlogs", description="Отдельный журнал действий агентов"),
+    BotCommand(command="vkpending", description="VK-отчёты на проверке"),
+    BotCommand(command="vkreview", description="Проверить VK-отчёт"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
     BotCommand(command="notifications", description="Уведомления руководства"),
+    BotCommand(command="vkacl", description="Синхронизировать роли VK"),
 ]
 
 
