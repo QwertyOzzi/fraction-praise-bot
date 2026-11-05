@@ -30,6 +30,12 @@ from newslog_view import (
     text_size_utf16, split_telegram_text
 )
 from personnel import personnel_details, ranked_reporters
+from fbi_schedule import (
+    ScheduleError, TZ_NAME, prepare_schedule, parse_ranks, parse_moscow_date,
+    moscow_label, current_rank, BLOCKED_STATUSES, list_active, get_schedule,
+    create_schedule, cancel_schedule, display_schedule, scheduler_loop,
+    scheduled_tick, utcnow
+)
 from access_control import (PERMISSIONS, AGENT_DELEGATABLE,
     normalize_overrides, sign_overrides, has_permission as resolve_permission,
     max_debit_for)
@@ -795,6 +801,10 @@ class NewsStates(StatesGroup):
     waiting_for_text = State()
     confirm = State()
 
+class ScheduleStates(StatesGroup):
+    waiting_for_fields = State()
+    confirm = State()
+
 
 class MenuBannerStates(StatesGroup):
     waiting_for_photo = State()
@@ -837,6 +847,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
             [InlineKeyboardButton(text="📊 Статистика отчётов", callback_data="main:stats")],
+            [InlineKeyboardButton(text="📅 Мероприятия", callback_data="main:events"),
+             InlineKeyboardButton(text="📨 Авторассылка", callback_data="main:autopost")],
             [InlineKeyboardButton(text="📥 Запросы агентов", callback_data="main:agentpending")],
             [InlineKeyboardButton(text="📜 Журнал агентов", callback_data="main:agentlogs")],
             [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
@@ -851,6 +863,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
             [InlineKeyboardButton(text="👤 Моя карточка", callback_data="main:profile")],
+            [InlineKeyboardButton(text="📅 Мероприятия FBI", callback_data="main:events")],
             [InlineKeyboardButton(text="➖ Списать FRP / похвалу", callback_data="main:min")],
             [InlineKeyboardButton(text="➕ Запросить начисление", callback_data="main:plus")],
             [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
@@ -912,6 +925,8 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="report", description="Подать отчёт FRP / похвала"),
     BotCommand(command="status", description="Мои FRP и похвалы"),
     BotCommand(command="profile", description="Полная карточка сотрудника"),
+    BotCommand(command="events", description="Предстоящие мероприятия FBI"),
+    BotCommand(command="eventnotify", description="Вкл/выкл уведомления о МП"),
     BotCommand(command="nick", description="Изменить игровой ник"),
     BotCommand(command="rank", description="Запросить смену ранга"),
     BotCommand(command="min", description="Списать FRP/похвалу агенту"),
@@ -923,6 +938,9 @@ PUBLIC_BOT_COMMANDS = [
 ADMIN_BOT_COMMANDS = [
     BotCommand(command="agents", description="Управление агентами"),
     BotCommand(command="stats", description="Статистика отчётов агентов"),
+    BotCommand(command="event", description="Создать мероприятие FBI"),
+    BotCommand(command="autopost", description="Отложенная рассылка по рангам"),
+    BotCommand(command="schedule", description="Управление расписанием"),
     BotCommand(command="department", description="Назначить отдел сотруднику"),
     BotCommand(command="pending", description="Ожидающие заявки"),
     BotCommand(command="queue", description="Очередь на выдачу"),
@@ -1541,7 +1559,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("report", "status", "nick", "rank", "support", "ai", "profile", "stats", "department", "permissions", "newslog"))
+@dp.message(Command("report", "status", "nick", "rank", "support", "ai", "profile", "stats", "department", "permissions", "newslog", "events", "event", "autopost", "schedule", "eventnotify"))
 async def cmd_quick_navigation(message: types.Message, state: FSMContext):
     """Run public commands even when a registration/report state is active."""
     if getattr(message.chat, "type", "") != "private":
@@ -1577,6 +1595,16 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await cmd_permissions(message)
     elif command == "newslog":
         await cmd_news_log(message)
+    elif command == "events":
+        await cmd_events(message)
+    elif command == "schedule":
+        await cmd_schedule(message)
+    elif command == "event":
+        await start_schedule_wizard(message, state, message.from_user.id, "event")
+    elif command == "autopost":
+        await start_schedule_wizard(message, state, message.from_user.id, "message")
+    elif command == "eventnotify":
+        await cmd_eventnotify(message)
 
 
 @dp.message(Command("notifications"))
@@ -1687,7 +1715,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs", "stats"}
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs", "stats", "autopost"}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1703,6 +1731,24 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     if action in MAIN_MENU_ADMIN_ACTIONS and not is_admin(uid):
         await callback.answer("Доступно только руководству.", show_alert=True)
+        return
+
+    if action == "events":
+        await state.clear()
+        try:
+            await show_schedule_list(callback.message, uid, include_messages=False)
+            await callback.answer()
+        except Exception as exc:
+            logger.warning("Events menu failed: %s", type(exc).__name__)
+            await callback.answer("Расписание недоступно. Попробуйте /events.", show_alert=True)
+        return
+    if action == "autopost":
+        if not _schedule_can_manage(uid, "message"):
+            await callback.answer("Недостаточно прав.", show_alert=True)
+            return
+        await state.clear()
+        await start_schedule_wizard(callback.message, state, uid, "message")
+        await callback.answer()
         return
 
     if action == "claim_status":
@@ -5756,8 +5802,27 @@ async def main():
             logger.warning(f"Could not clean up accidental duplicate: {exc}")
 
     await register_native_command_menu()
-    logger.info("Bot polling starting...")
-    await dp.start_polling(bot)
+    async def schedule_delivery(uid, message):
+        await bot.send_message(uid, message, parse_mode=None,
+                               disable_web_page_preview=True)
+    async def schedule_poller():
+        # Prevent accidental zero-recipient delivery while Firebase ACL is stale.
+        while True:
+            if _cloud_state_hydrated:
+                try:
+                    await scheduled_tick(firebase_client, users_db, schedule_delivery)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Schedule cycle failed: %s", type(exc).__name__)
+            await asyncio.sleep(30)
+    schedule_task = asyncio.create_task(schedule_poller(), name="fbi-scheduler")
+    try:
+        logger.info("Bot polling starting...")
+        await dp.start_polling(bot)
+    finally:
+        schedule_task.cancel()
+        await asyncio.gather(schedule_task, return_exceptions=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
