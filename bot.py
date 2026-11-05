@@ -5750,6 +5750,441 @@ async def newslog_callback(callback: types.CallbackQuery):
                               show_alert=True)
 
 
+
+# ─── FBI event planning and scheduled notifications ──────────────────
+
+def _schedule_can_manage(uid: int, kind: str) -> bool:
+    permission = "events.manage" if kind == "event" else "messages.schedule"
+    return is_admin(uid) and has_permission(uid, permission)
+
+
+def _schedule_private_actor(message) -> bool:
+    return (isinstance(message, types.Message) and
+            message.chat.type == "private" and
+            message.chat.id == message.from_user.id)
+
+
+async def start_schedule_wizard(message: types.Message, state: FSMContext,
+                                actor_id: int, kind: str):
+    if not _schedule_can_manage(actor_id, kind):
+        await message.answer("⛔ Только руководство с соответствующими правами.")
+        return
+    await state.clear()
+    await state.update_data(sched_kind=kind, sched_step="title",
+                            sched_actor=actor_id, sched_fields={})
+    await state.set_state(ScheduleStates.waiting_for_fields)
+    label = "мероприятия" if kind == "event" else "автоматического сообщения"
+    await message.answer(
+        f"🗓 FBI · Создание {label}\n\n"
+        "Шаг 1/5: отправьте название (3–80 символов).\n\n"
+        "Даты и время указываются по МСК (UTC+3).\nОтмена: /cancel",
+        parse_mode=None
+    )
+
+
+@dp.message(Command("events"))
+async def cmd_events(message: types.Message):
+    if not _schedule_private_actor(message):
+        await message.answer("Откройте бота в личных сообщениях.")
+        return
+    try:
+        await show_schedule_list(message, message.from_user.id, include_messages=False)
+    except Exception as exc:
+        logger.warning("Event list failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось открыть мероприятия Firebase.")
+
+
+@dp.message(Command("schedule"))
+async def cmd_schedule(message: types.Message):
+    if not _schedule_private_actor(message):
+        await message.answer("Доступно только в личном чате.")
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Расписание доступно руководству.")
+        return
+    try:
+        await show_schedule_list(message, message.from_user.id, include_messages=True)
+    except Exception as exc:
+        logger.warning("Schedule list failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось открыть расписание Firebase.")
+
+
+@dp.message(Command("event"))
+async def cmd_create_event(message: types.Message, state: FSMContext):
+    if not _schedule_private_actor(message):
+        await message.answer("Доступно только в личном чате.")
+        return
+    await start_schedule_wizard(message, state, message.from_user.id, "event")
+
+
+@dp.message(Command("autopost"))
+async def cmd_create_autopost(message: types.Message, state: FSMContext):
+    if not _schedule_private_actor(message):
+        await message.answer("Доступно только в личном чате.")
+        return
+    await start_schedule_wizard(message, state, message.from_user.id, "message")
+
+
+@dp.message(Command("eventnotify"))
+async def cmd_eventnotify(message: types.Message):
+    if not _schedule_private_actor(message):
+        await message.answer("Откройте личный чат.")
+        return
+    profile = get_verified_agent(message.from_user.id)
+    if not profile:
+        await message.answer("Для настройки уведомлений подтвердите профиль в /start.")
+        return
+    args = (message.text or "").split()
+    if len(args) != 2 or args[1].lower() not in ("on", "off"):
+        current = "включены" if profile.get("event_notifications") is not False else "отключены"
+        await message.answer(
+            f"🔔 Уведомления о мероприятиях сейчас {current}.\n\n"
+            "Команды: /eventnotify on и /eventnotify off."
+        )
+        return
+    previous = dict(profile)
+    enabled = args[1].lower() == "on"
+    profile["event_notifications"] = enabled
+    if not await sync_state_to_cloud():
+        users_db[str(message.from_user.id)] = previous
+        await message.answer("⚠️ Firebase не подтвердила настройку.")
+        return
+    save_json(USERS_FILE, users_db)
+    await message.answer(
+        "✅ Уведомления о мероприятиях включены." if enabled
+        else "🔕 Уведомления о мероприятиях отключены."
+    )
+
+
+async def show_schedule_list(message: types.Message, actor_id: int,
+                             *, include_messages: bool):
+    records = await list_active(firebase_client)
+    profile = users_db.get(str(actor_id), {})
+    rank = current_rank(profile.get("rank") if isinstance(profile, dict) else "")
+    verified = (isinstance(profile, dict) and bool(profile.get("nick"))
+                and profile.get("verification_status") not in BLOCKED_STATUSES)
+    can_event = _schedule_can_manage(actor_id, "event")
+    can_message = _schedule_can_manage(actor_id, "message")
+    managed = can_event or can_message
+    if include_messages and not managed:
+        await message.answer("⛔ Недостаточно прав.")
+        return
+    visible = [
+        item for item in records
+        if ((include_messages and (
+            (item["kind"] == "event" and can_event) or
+            (item["kind"] == "message" and can_message)))
+            or (not include_messages and item["kind"] == "event" and (
+                can_event or (verified and rank is not None
+                              and item["min_rank"] <= rank <= item["max_rank"]))))
+    ]
+    head = "📅 FBI · Ближайшие мероприятия" if not include_messages else "🗓 FBI · Запланированные рассылки"
+    text = head + "\n\n" + (
+        "Нет активных записей." if not visible
+        else f"Всего: {len(visible)}. Все даты и часы — МСК (UTC+3)."
+    )
+    kb = []
+    for item in visible[:20]:
+        date = moscow_label(item["at"]).split(" ", 1)[0]
+        icon = "🎯" if item["kind"] == "event" else "📨"
+        kb.append([InlineKeyboardButton(
+            text=f"{icon} {item['title'][:28]} · {date}",
+            callback_data=f"sched:view:{item['id']}"
+        )])
+    if can_event:
+        kb.append([InlineKeyboardButton(text="➕ Новое мероприятие",
+                                         callback_data="sched:new:event")])
+    if can_message:
+        kb.append([InlineKeyboardButton(text="📨 Запланировать сообщение",
+                                         callback_data="sched:new:message")])
+    await message.answer(text, parse_mode=None,
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+                         if kb else None)
+
+
+@dp.message(ScheduleStates.waiting_for_fields)
+async def schedule_wizard_input(message: types.Message, state: FSMContext):
+    if not _schedule_private_actor(message):
+        await message.answer("Форма доступна только в личном чате.")
+        return
+    data = await state.get_data()
+    kind, step = data.get("sched_kind"), data.get("sched_step")
+    if (data.get("sched_actor") != message.from_user.id
+            or kind not in ("event", "message")
+            or not _schedule_can_manage(message.from_user.id, kind)):
+        await state.clear()
+        await message.answer("⛔ Права на создание расписания не подтверждены.")
+        return
+    value = (message.text or "").strip()
+    fields = dict(data.get("sched_fields", {}))
+    if not value or value.startswith("/"):
+        await message.answer("Отправьте текст для текущего шага или /cancel.")
+        return
+    try:
+        if step == "title":
+            if not 3 <= len(value) <= 80:
+                raise ScheduleError("Название должно быть от 3 до 80 символов.")
+            fields["title"] = value
+            next_step = "date"
+            prompt = "Шаг 2/5: введите дату ДД.ММ.ГГГГ (например, 15.11.2026)."
+        elif step == "date":
+            datetime.strptime(value, "%d.%m.%Y")
+            fields["date"] = value
+            next_step = "time"
+            prompt = "Шаг 3/5: время по МСК, формат ЧЧ:ММ (например, 19:30)."
+        elif step == "time":
+            parse_moscow_date(fields.get("date", ""), value)
+            fields["time"] = value
+            next_step = "ranks"
+            prompt = ("Шаг 4/5: каким рангам отправить?\n"
+                      "Примеры: 1-10, 4-8, 8-X или 7.")
+        elif step == "ranks":
+            minimum, maximum = parse_ranks(value)
+            fields["ranks"] = f"{minimum}-{maximum}"
+            next_step = "description"
+            prompt = ("Шаг 5/5: укажите место сбора и информацию о МП (3–900 символов)."
+                      if kind == "event"
+                      else "Шаг 5/5: введите текст автоматической рассылки (3–900 символов).")
+        elif step == "description":
+            if not 3 <= len(value) <= 900:
+                raise ScheduleError("Введите от 3 до 900 символов.")
+            fields["description"] = value
+            next_step = "options"
+            prompt = ""
+        else:
+            await message.answer("Выберите вариант кнопкой или используйте /cancel.")
+            return
+    except (ValueError, ScheduleError) as exc:
+        await message.answer("⚠️ " + str(exc), parse_mode=None)
+        return
+
+    await state.update_data(sched_fields=fields, sched_step=next_step)
+    if next_step != "options":
+        await message.answer(prompt, parse_mode=None)
+        return
+    if kind == "event":
+        buttons = [
+            [InlineKeyboardButton(text="⏰ За 60 и 15 минут",
+                                  callback_data="schedopt:event:both")],
+            [InlineKeyboardButton(text="⏰ За 1 день + за 1 час",
+                                  callback_data="schedopt:event:day")],
+            [InlineKeyboardButton(text="⏰ Только за 15 минут",
+                                  callback_data="schedopt:event:15")],
+            [InlineKeyboardButton(text="🔕 Без напоминаний",
+                                  callback_data="schedopt:event:none")]
+        ]
+        await message.answer(
+            "✅ Данные заполнены.\n\nПри создании МП агенты получат первое объявление "
+            "сразу. Выберите дополнительные напоминания:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+    else:
+        buttons = [
+            [InlineKeyboardButton(text="📨 Один раз",
+                                  callback_data="schedopt:message:none")],
+            [InlineKeyboardButton(text="🔁 Ежедневно (4 отправки)",
+                                  callback_data="schedopt:message:daily")],
+            [InlineKeyboardButton(text="🔁 Еженедельно (4 отправки)",
+                                  callback_data="schedopt:message:weekly")]
+        ]
+        await message.answer(
+            "✅ Данные заполнены. Выберите автоматизацию сообщений. "
+            "Повторения ограничены четырьмя отправками:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+
+@dp.callback_query(F.data.startswith("schedopt:"))
+async def schedule_options(callback: types.CallbackQuery, state: FSMContext):
+    if not _schedule_private_actor(callback.message) and (
+            callback.message.chat.id != callback.from_user.id
+            or callback.message.chat.type != "private"):
+        await callback.answer("Доступно только в личном чате.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in ("event", "message"):
+        await callback.answer("Неизвестный вариант.", show_alert=True)
+        return
+    data = await state.get_data()
+    kind = parts[1]
+    if (await state.get_state() != ScheduleStates.waiting_for_fields.state
+            or data.get("sched_step") != "options"
+            or data.get("sched_kind") != kind
+            or data.get("sched_actor") != callback.from_user.id
+            or not _schedule_can_manage(callback.from_user.id, kind)):
+        await callback.answer("Форма устарела или недоступна.", show_alert=True)
+        return
+    options = {"both": (60, 15), "day": (1440, 60),
+               "15": (15,), "none": ()}
+    if kind == "event" and parts[2] not in options:
+        await callback.answer("Неизвестный вариант.", show_alert=True)
+        return
+    if kind == "message" and parts[2] not in ("none", "daily", "weekly"):
+        await callback.answer("Неизвестный повтор.", show_alert=True)
+        return
+    fields = data["sched_fields"]
+    try:
+        item = prepare_schedule(
+            kind, fields["title"], fields["description"], fields["date"],
+            fields["time"], fields["ranks"], creator_id=callback.from_user.id,
+            reminders=options.get(parts[2], ()), repeat=parts[2] if kind == "message" else "none"
+        )
+    except ScheduleError as exc:
+        await callback.answer(str(exc)[:190], show_alert=True)
+        return
+    await state.update_data(sched_preview=item)
+    await state.set_state(ScheduleStates.confirm)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить в Firebase",
+                              callback_data=f"schedsave:{item['id']}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="sched:abort")]
+    ])
+    await callback.message.answer(
+        "🔎 Предварительный просмотр — ничего ещё не отправлено.\n\n" +
+        display_schedule(item) +
+        "\n\nОповещения начнутся только после подтверждения.",
+        parse_mode=None, reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("schedsave:"))
+async def schedule_save(callback: types.CallbackQuery, state: FSMContext):
+    if (callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    data = await state.get_data()
+    item = data.get("sched_preview")
+    if (await state.get_state() != ScheduleStates.confirm.state
+            or not isinstance(item, dict)
+            or callback.data != "schedsave:" + item.get("id", "")
+            or data.get("sched_actor") != callback.from_user.id
+            or not _schedule_can_manage(callback.from_user.id, item.get("kind"))):
+        await callback.answer("Подтверждение устарело или право отозвано.", show_alert=True)
+        return
+    # Lock before the first network call to avoid double-click commits.
+    await state.set_state(ScheduleStates.waiting_for_fields)
+    await state.update_data(sched_step="saving")
+    try:
+        await create_schedule(firebase_client, item)
+    except Exception as exc:
+        await state.set_state(ScheduleStates.confirm)
+        logger.warning("Schedule persist failed: %s", type(exc).__name__)
+        await callback.answer("Firebase не подтвердила запись. Проверьте /schedule.",
+                              show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ Сохранено в Firebase.\n\n" + display_schedule(item) +
+        "\n\nМероприятие/рассылка будут обработаны по расписанию.",
+        parse_mode=None
+    )
+    asyncio.create_task(record_admin_activity(
+        "event_created" if item["kind"] == "event" else "autopost_created",
+        callback.from_user.id, f"{item['id']} {item['title'][:70]}"
+    ))
+    await callback.answer("✅ Расписание сохранено!")
+
+
+@dp.callback_query(F.data.startswith("sched:"))
+async def schedule_callback(callback: types.CallbackQuery, state: FSMContext):
+    if (callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Доступно только в личном чате.", show_alert=True)
+        return
+    data = callback.data or ""
+    if data == "sched:abort":
+        await state.clear()
+        await callback.message.edit_text("❌ Создание расписания отменено.")
+        await callback.answer()
+        return
+    if data in ("sched:new:event", "sched:new:message"):
+        kind = data.rsplit(":", 1)[-1]
+        if not _schedule_can_manage(callback.from_user.id, kind):
+            await callback.answer("Нет права на создание.", show_alert=True)
+            return
+        await start_schedule_wizard(callback.message, state, callback.from_user.id, kind)
+        await callback.answer()
+        return
+    match = re.fullmatch(r"sched:(view|cancel|cancelok):(sched-[a-f0-9]{20})", data)
+    if not match:
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
+    action, sid = match.groups()
+    try:
+        result = await get_schedule(firebase_client, sid)
+        if not result:
+            await callback.answer("Запись не найдена.", show_alert=True)
+            return
+        item, _ = result
+        can_manage = _schedule_can_manage(callback.from_user.id, item["kind"])
+        profile = users_db.get(str(callback.from_user.id), {})
+        rank = current_rank(profile.get("rank") if isinstance(profile, dict) else "")
+        verified = (isinstance(profile, dict) and bool(profile.get("nick"))
+                    and profile.get("verification_status") not in BLOCKED_STATUSES)
+        can_view = (can_manage or (item["kind"] == "event" and verified
+                                  and rank is not None
+                                  and item["min_rank"] <= rank <= item["max_rank"]))
+        if not can_view or (action != "view" and not can_manage):
+            await callback.answer("Недостаточно прав.", show_alert=True)
+            return
+        if action == "cancelok":
+            result_code = await cancel_schedule(firebase_client, sid)
+            await callback.message.edit_text(
+                "✅ Запись отменена." if result_code == "cancelled"
+                else "ℹ️ Запись уже неактивна или не найдена.", parse_mode=None
+            )
+            await callback.answer()
+            return
+        if action == "cancel":
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Да, отменить будущие сообщения",
+                                      callback_data=f"sched:cancelok:{sid}")],
+                [InlineKeyboardButton(text="⬅️ Назад",
+                                      callback_data=f"sched:view:{sid}")]
+            ])
+            await callback.message.edit_text(
+                "⚠️ Отменить запись?\n\n" + display_schedule(item) +
+                "\n\nУже доставленные сообщения нельзя отозвать.",
+                parse_mode=None, reply_markup=kb
+            )
+            await callback.answer()
+            return
+        buttons = []
+        if can_manage and item["status"] == "active":
+            buttons.append([InlineKeyboardButton(
+                text="🗑 Отменить будущие оповещения",
+                callback_data=f"sched:cancel:{sid}"
+            )])
+        buttons.append([InlineKeyboardButton(text="📅 К расписанию",
+                                             callback_data="sched:list")])
+        await callback.message.edit_text(
+            display_schedule(item), parse_mode=None,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+        await callback.answer()
+    except Exception as exc:
+        logger.warning("Schedule detail failed: %s", type(exc).__name__)
+        await callback.answer("Ошибка Firebase. Попробуйте ещё раз.", show_alert=True)
+
+
+@dp.callback_query(F.data == "sched:list")
+async def schedule_list_callback(callback: types.CallbackQuery):
+    if (callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Откройте личный чат.", show_alert=True)
+        return
+    try:
+        await show_schedule_list(callback.message, callback.from_user.id,
+                                 include_messages=is_admin(callback.from_user.id))
+    except Exception as exc:
+        logger.warning("Scheduled list callback failed: %s", type(exc).__name__)
+        await callback.answer("Расписание недоступно.", show_alert=True)
+        return
+    await callback.answer()
+
+
 # A plain natural-language instruction in a private admin chat works without /ai.
 # State-specific registration/report/support handlers are registered earlier and
 # continue to take priority; this late handler never handles agent messages.
