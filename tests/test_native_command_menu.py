@@ -66,7 +66,8 @@ class TestNativeCommandCatalog(unittest.IsolatedAsyncioTestCase):
             "BotCommandScopeChat": Data, "MenuButtonCommands": Data,
             "bot": self.bot, "logger": Logger(),
             "OWNER_TELEGRAM_IDS": {1}, "admins_db": [2], "_cloud_state_hydrated": True,
-            "is_admin": lambda uid: uid in (1, 2), "is_owner": lambda uid: uid == 1
+            "is_admin": lambda uid: uid in (1, 2), "is_owner": lambda uid: uid == 1,
+            "is_leader": lambda uid: uid == 1
         }, with_catalog=True)
 
     def test_user_admin_owner_have_relevant_commands(self):
@@ -77,11 +78,17 @@ class TestNativeCommandCatalog(unittest.IsolatedAsyncioTestCase):
         self.assertIn("help", user)
         self.assertIn("report", user)
         self.assertIn("rank", user)
+        self.assertIn("min", user)
+        self.assertIn("plus", user)
         self.assertIn("status", user)
         self.assertNotIn("agents", user)
         self.assertIn("agents", admin)
         self.assertIn("pending", admin)
         self.assertIn("grant", admin)
+        self.assertIn("agentpending", admin)
+        self.assertIn("agentlogs", admin)
+        self.assertNotIn("news", admin)
+        self.assertIn("news", owner)
         self.assertNotIn("security", admin)
         self.assertIn("security", owner)
         self.assertIn("notifications", owner)
