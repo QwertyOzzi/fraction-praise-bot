@@ -93,6 +93,16 @@ def build_projection(frp_rows, praise_rows, users=None):
             by_nick[key] = candidate
         candidate = by_nick[key]
         data = records[candidate]
+        if binding and not data["profileId"]:
+            # Upgrade the legacy candidate to a stable verified profile ID.
+            verified_id = candidate_document_id(data["nick"], binding)
+            if verified_id != candidate:
+                if verified_id in records:
+                    raise MigrationConflict("Conflicting verified document identity")
+                records[verified_id] = records.pop(candidate)
+                by_nick[key] = verified_id
+                candidate = verified_id
+                data = records[candidate]
         if data["profileId"] and binding and data["profileId"] != binding:
             raise MigrationConflict("Mismatched sheet and Telegram profile binding")
         data["profileId"] = data["profileId"] or binding
