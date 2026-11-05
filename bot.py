@@ -22,7 +22,12 @@ from natural_aliases import load_alias_memory, resolve_with_memory, AliasMemoryE
 from natural_commands import simplified
 from agent_actions import (
     AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
-    decide_add_request, list_collection, create_announcement, finish_announcement
+    decide_add_request, list_collection, get_announcement,
+    create_announcement, finish_announcement
+)
+from newslog_view import (
+    NEWSLOG_FETCH_LIMIT, newslog_list, newslog_detail, news_date,
+    text_size_utf16, split_telegram_text
 )
 from personnel import personnel_details, ranked_reporters
 from access_control import (PERMISSIONS, AGENT_DELEGATABLE,
@@ -1536,7 +1541,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("report", "status", "nick", "rank", "support", "ai", "profile", "stats", "department", "permissions"))
+@dp.message(Command("report", "status", "nick", "rank", "support", "ai", "profile", "stats", "department", "permissions", "newslog"))
 async def cmd_quick_navigation(message: types.Message, state: FSMContext):
     """Run public commands even when a registration/report state is active."""
     if getattr(message.chat, "type", "") != "private":
@@ -1570,6 +1575,8 @@ async def cmd_quick_navigation(message: types.Message, state: FSMContext):
         await cmd_set_department(message)
     elif command == "permissions":
         await cmd_permissions(message)
+    elif command == "newslog":
+        await cmd_news_log(message)
 
 
 @dp.message(Command("notifications"))
