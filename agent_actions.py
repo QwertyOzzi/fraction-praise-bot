@@ -6,6 +6,7 @@ their audit events use a single Firestore commit with revision preconditions.
 """
 import asyncio
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from natural_aliases import (
     MEMORY_FIELD, decode_alias_book, encode_alias_book, learn_confirmed_aliases,
 )
 from natural_commands import simplified
+
+logger = logging.getLogger(__name__)
 
 SHEETS = ("fractionrp", "praise")
 MAX_AMOUNT = 20
@@ -137,10 +140,36 @@ async def _commit(session, client, headers, writes):
             return "applied"
         if response.status in (409, 412):
             return "conflict"
-        # An HTTP error or transport failure can be ambiguous. Callers do not
-        # auto-repeat it without checking persisted status or audit ID first.
+        # Never print raw response data, bearer headers or document contents.
+        # An HTTP 403 often means the NEW collection rules are not published
+        # in Firebase Console, even when firestore.rules is committed to GitHub.
+        status = response.status
+        provider_code = ""
+        try:
+            body = await response.json()
+            code = body.get("error", {}).get("status", "") if isinstance(body, dict) else ""
+            if isinstance(code, str) and re.fullmatch(r"[A-Z_]{2,40}", code):
+                provider_code = code
+        except (ValueError, TypeError, AttributeError):
+            pass
+        logger.warning(
+            "Firestore agent/news transaction failed: HTTP %s, provider_status=%s",
+            status, provider_code or "unknown"
+        )
+        if status in (401, 403):
+            raise AgentOperationError(
+                f"Firestore HTTP {status}: доступ запрещён. "
+                "Проверьте опубликованные правила для fbi_announcements, "
+                "agent_action_logs и agent_add_requests, а также isOwner()."
+            )
+        if status == 400:
+            raise AgentOperationError(
+                "Firestore HTTP 400: неверный формат транзакции. "
+                "Проверьте логи Render."
+            )
         raise AgentOperationError(
-            "Firebase не подтвердил результат. Проверьте журнал перед повтором."
+            f"Firestore HTTP {status}: запись не подтверждена. "
+            "Проверьте журнал, прежде чем повторять операцию."
         )
 
 
@@ -381,12 +410,15 @@ async def list_collection(client, session_factory, collection, *, limit=40):
 
 
 async def create_announcement(client, session_factory, *, actor_id, title,
-                              message, category, recipients):
+                              message, category, recipients, news_id=None):
     if category not in ("news", "update"):
         raise AgentOperationError("Некорректная категория новости.")
     if not 1 <= len(message.strip()) <= 3000 or len(title) > 90:
         raise AgentOperationError("Текст новости должен содержать от 1 до 3000 символов.")
-    news_id = "news-" + uuid.uuid4().hex[:20]
+    if news_id is None:
+        news_id = "news-" + uuid.uuid4().hex[:20]
+    if not _valid_id(news_id) or not re.fullmatch(r"news-[a-f0-9]{16,32}", news_id):
+        raise AgentOperationError("Некорректный идентификатор рассылки.")
     payload = {
         "id": news_id, "actor_id": int(actor_id), "title": title[:90],
         "message": message[:3000], "category": category,
@@ -397,9 +429,28 @@ async def create_announcement(client, session_factory, *, actor_id, title,
     async with session_factory() as session:
         status = await _commit(session, client, headers,
                                [_create(client, f"{COLLECTION_NEWS}/{news_id}", payload)])
-    if status != "applied":
-        raise AgentOperationError("Не удалось сохранить новость.")
-    return payload
+    if status == "applied":
+        return payload
+    # A previous request may have committed successfully but its HTTP response
+    # was lost. Retry with the SAME news ID, verify exact contents and reuse it
+    # instead of making a second announcement or blindly sending duplicates.
+    if status == "conflict":
+        async with session_factory() as session:
+            existing = await _get(
+                session, client, headers,
+                f"{COLLECTION_NEWS}/{news_id}", optional=True
+            )
+        if existing:
+            persisted = _decode(existing)
+            keys = ("id", "actor_id", "title", "message", "category", "recipients")
+            if all(persisted.get(key) == payload.get(key) for key in keys):
+                # A stored record might already have been broadcast before a
+                # Render restart. Never automatically resend this message.
+                return {**persisted, "_already_persisted": True}
+    raise AgentOperationError(
+        "Не удалось подтвердить сохранение новости. "
+        "Проверьте /newslog перед новой попыткой."
+    )
 
 
 async def finish_announcement(client, session_factory, news_id, *, sent, failed):
