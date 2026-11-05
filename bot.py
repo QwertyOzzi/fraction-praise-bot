@@ -4988,6 +4988,24 @@ async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext)
                 show_alert=True
             )
             return
+        # If this nonce was already committed, we cannot prove whether
+        # individual recipients were delivered before a Render restart.
+        # Require review rather than risking a duplicate broadcast.
+        if news.get("_already_persisted"):
+            await state.clear()
+            await callback.answer(
+                "Эта новость уже зарегистрирована. Проверьте /newslog; "
+                "повторно рассылать её автоматически нельзя.",
+                show_alert=True
+            )
+            await callback.message.edit_text(
+                "⚠️ <b>Новость уже сохранена в Firebase</b>\n\n"
+                f"ID: <code>{html.escape(news['id'])}</code>\n"
+                "Автоматическая повторная отправка заблокирована, "
+                "чтобы пользователи не получили дубли. Проверьте /newslog.",
+                parse_mode="HTML"
+            )
+            return
         # Only clear draft after the durable journal is confirmed.
         # With the same nonce, a retry cannot generate another journal record.
         await state.clear()
