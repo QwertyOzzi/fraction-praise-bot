@@ -77,6 +77,9 @@ ADMINS_FILE = "admins_db.json"
 REQUESTS_FILE = "requests_db.json"
 OWNER_FILE = "owner_config.json"
 
+# Owner-selected Telegram photo, stored in signed Firebase bot state.
+MENU_BANNER_FILE_ID = ""
+
 def load_json(filepath: str, default: Any) -> Any:
     if os.path.exists(filepath):
         try:
@@ -530,7 +533,7 @@ firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE
 # ╚══════════════════════════════════════════════════════════════════╝
 async def sync_state_from_cloud():
     """Restore approved admins from the owner-restricted Firestore state document."""
-    global _cloud_state_hydrated, _pending_legacy_nonce
+    global _cloud_state_hydrated, _pending_legacy_nonce, MENU_BANNER_FILE_ID
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
         token = await firebase_client.get_token()
@@ -589,6 +592,12 @@ async def sync_state_from_cloud():
                     if signature and not hmac.compare_digest(str(signature), expected):
                         logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
                         return
+                    # Hydrate the banner only after validating the cloud ACL.
+                    saved_banner = cloud_data.get("menu_banner_file_id", "")
+                    MENU_BANNER_FILE_ID = (
+                        saved_banner if isinstance(saved_banner, str)
+                        and len(saved_banner) <= 256 else ""
+                    )
                     # Apply profiles only after the cloud administrator signature is verified.
                     users_db.clear()
                     users_db.update(restored_users)
@@ -617,6 +626,7 @@ async def sync_state_from_cloud():
                     # Owners retain their hardcoded Telegram identity to bootstrap the system.
                     admins_db.clear()
                     admin_roles.clear()
+                    MENU_BANNER_FILE_ID = ""
                     save_json(ADMINS_FILE, admins_db)
                     save_json("admin_roles.json", admin_roles)
                     _cloud_state_hydrated = True
@@ -679,7 +689,8 @@ async def sync_state_to_cloud():
                 "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
-                "requests": requests_db
+                "requests": requests_db,
+                "menu_banner_file_id": MENU_BANNER_FILE_ID
             }
 
             body = {
@@ -741,6 +752,10 @@ class AgentActionStates(StatesGroup):
 class NewsStates(StatesGroup):
     waiting_for_text = State()
     confirm = State()
+
+
+class MenuBannerStates(StatesGroup):
+    waiting_for_photo = State()
 
 
 class SupportStates(StatesGroup):
@@ -874,6 +889,8 @@ ADMIN_BOT_COMMANDS = [
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
     BotCommand(command="notifications", description="Уведомления руководства"),
+    BotCommand(command="setbanner", description="Установить баннер главного меню"),
+    BotCommand(command="removebanner", description="Убрать баннер из меню"),
 ]
 
 
@@ -1369,7 +1386,8 @@ async def cmd_menu(message: types.Message, state: FSMContext):
     await sync_user_command_scope(user_id)
     await send_home_banner_card(
         message, home_card_text(profile, user_id),
-        reply_markup=get_main_menu(user_id), lea=True
+        reply_markup=get_main_menu(user_id), lea=True,
+        banner_file_id=MENU_BANNER_FILE_ID
     )
 
 
@@ -1476,7 +1494,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             message,
             home_card_text(user_data, message.from_user.id),
             reply_markup=get_main_menu(message.from_user.id),
-            lea=True
+            lea=True, banner_file_id=MENU_BANNER_FILE_ID
         )
         # Bot registrations live in config/bot_state; the two visible tables
         # are independent. A website row deletion is NOT a profile deletion.
@@ -1558,7 +1576,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
         await send_home_banner_card(
             callback.message, home_card_text(profile, uid),
-            reply_markup=get_main_menu(uid), lea=True
+            reply_markup=get_main_menu(uid), lea=True,
+            banner_file_id=MENU_BANNER_FILE_ID
         )
         await callback.answer()
         return
@@ -1634,7 +1653,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             return
         await send_home_banner_card(
             callback.message, home_card_text(profile, uid),
-            reply_markup=get_main_menu(uid), lea=True
+            reply_markup=get_main_menu(uid), lea=True,
+            banner_file_id=MENU_BANNER_FILE_ID
         )
         await callback.answer()
         return
