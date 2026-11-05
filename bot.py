@@ -3362,11 +3362,19 @@ async def remove_agent_everywhere(nick: str) -> bool:
                 cloud_roles = state.get("admin_roles", {})
                 if not isinstance(users, dict) or not isinstance(cloud_admins, list) or not isinstance(cloud_roles, dict):
                     raise RuntimeError("Invalid cloud state")
-                if not hmac.compare_digest(
-                    str(state.get("admin_acl_signature") or ""),
-                    sign_admin_permissions(cloud_admins, cloud_roles)
-                ):
+                stored_acl = str(state.get("admin_acl_signature") or "")
+                if ((cloud_admins and not stored_acl) or
+                        (stored_acl and not hmac.compare_digest(
+                            stored_acl, sign_admin_permissions(cloud_admins, cloud_roles)))):
                     raise RuntimeError("Unverified cloud administrator ACL")
+                cloud_permissions = normalize_overrides(
+                    state.get("permission_overrides", {}))
+                stored_perm_sig = str(state.get("permission_overrides_signature") or "")
+                if ((cloud_permissions and not stored_perm_sig) or
+                        (stored_perm_sig and not hmac.compare_digest(
+                            stored_perm_sig,
+                            sign_overrides(cloud_permissions, permission_secret())))):
+                    raise RuntimeError("Unverified cloud permission overrides")
                 matches = [(uid, profile) for uid, profile in users.items()
                            if isinstance(profile, dict)
                            and str(profile.get("nick") or "").casefold() == nick.casefold()]
@@ -3391,7 +3399,12 @@ async def remove_agent_everywhere(nick: str) -> bool:
                     return True
                 for uid, _ in matches:
                     users.pop(uid, None)
+                    # Revocation is included in the SAME atomic operation.
+                    cloud_permissions.pop(str(uid), None)
                 state["users"] = users
+                state["permission_overrides"] = cloud_permissions
+                state["permission_overrides_signature"] = sign_overrides(
+                    cloud_permissions, permission_secret())
                 now = datetime.now(timezone.utc).isoformat()
                 writes = []
                 for sheet in ("fractionrp", "praise"):
@@ -3425,6 +3438,8 @@ async def remove_agent_everywhere(nick: str) -> bool:
                     if response.status == 200:
                         users_db.clear()
                         users_db.update(users)
+                        permission_overrides.clear()
+                        permission_overrides.update(cloud_permissions)
                         save_json(USERS_FILE, users_db)
                         return True
                     if response.status not in (409, 412):
