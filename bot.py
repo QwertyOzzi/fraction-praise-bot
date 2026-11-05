@@ -5265,7 +5265,7 @@ def _news_message(title, category, message):
 
 @dp.message(Command("news"))
 async def cmd_news(message: types.Message, state: FSMContext):
-    if not _agent_private(message) or not has_permission(message.from_user.id, "news.publish"):
+    if not _agent_private(message) or not is_leader(message.from_user.id) or not has_permission(message.from_user.id, "news.publish"):
         await message.answer(
             "⛔ Публикация новостей доступна только владельцу и действующему лидеру."
         )
@@ -5373,7 +5373,7 @@ async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext)
     if (not isinstance(callback.message, types.Message)
             or callback.message.chat.type != "private"
             or callback.message.chat.id != callback.from_user.id
-            or not has_permission(callback.from_user.id, "news.publish")):
+            or not is_leader(callback.from_user.id) or not has_permission(callback.from_user.id, "news.publish")):
         await callback.answer("Недостаточно прав для рассылки.", show_alert=True)
         return
     uid = callback.from_user.id
