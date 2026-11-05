@@ -62,6 +62,28 @@ async def send_fbi_card(message, text: str, *, reply_markup=None, lea: bool = Fa
     )
 
 
+async def send_home_banner_card(message, text: str, *, reply_markup=None,
+                                lea: bool = False, banner_file_id: str = ""):
+    """Show the owner-selected Telegram banner with the normal home keyboard.
+
+    Telegram file_id is stored in verified Firebase cloud state; it is not an
+    external URL, and no image needs to be checked into the public repository.
+    If media becomes unavailable, retain the original text menu and buttons.
+    """
+    if not banner_file_id:
+        return await send_fbi_card(message, text, reply_markup=reply_markup, lea=lea)
+    if lea and reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):
+        raise ValueError("LEA chip requires an inline keyboard")
+    markup = add_lea_button(reply_markup) if lea else reply_markup
+    try:
+        return await message.answer_photo(
+            photo=banner_file_id, caption=card_html(text),
+            parse_mode="HTML", reply_markup=markup
+        )
+    except Exception:
+        return await send_fbi_card(message, text, reply_markup=reply_markup, lea=lea)
+
+
 async def edit_fbi_card(message, text: str, *, reply_markup=None, lea: bool = False):
     if lea:
         if reply_markup is not None and not isinstance(reply_markup, InlineKeyboardMarkup):

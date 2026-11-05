@@ -24,8 +24,9 @@ from agent_actions import (
     AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
     decide_add_request, list_collection, create_announcement, finish_announcement
 )
-from telegram_design import (send_fbi_card, edit_fbi_card,
-                             hide_old_reply_keyboard, with_home_button)
+from telegram_design import (send_fbi_card, send_home_banner_card,
+                             edit_fbi_card, hide_old_reply_keyboard,
+                             with_home_button)
 
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command, CommandStart
@@ -75,6 +76,9 @@ USERS_FILE = "users_db.json"
 ADMINS_FILE = "admins_db.json"
 REQUESTS_FILE = "requests_db.json"
 OWNER_FILE = "owner_config.json"
+
+# Owner-selected Telegram photo, stored in signed Firebase bot state.
+MENU_BANNER_FILE_ID = ""
 
 def load_json(filepath: str, default: Any) -> Any:
     if os.path.exists(filepath):
@@ -529,7 +533,7 @@ firebase_client = FirebaseClient(FIREBASE_PROJECT_ID, FIREBASE_API_KEY, FIREBASE
 # ╚══════════════════════════════════════════════════════════════════╝
 async def sync_state_from_cloud():
     """Restore approved admins from the owner-restricted Firestore state document."""
-    global _cloud_state_hydrated, _pending_legacy_nonce
+    global _cloud_state_hydrated, _pending_legacy_nonce, MENU_BANNER_FILE_ID
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state"
         token = await firebase_client.get_token()
@@ -588,6 +592,12 @@ async def sync_state_from_cloud():
                     if signature and not hmac.compare_digest(str(signature), expected):
                         logger.error("Admin ACL signature mismatch. Refusing privilege restoration and cloud writes")
                         return
+                    # Hydrate the banner only after validating the cloud ACL.
+                    saved_banner = cloud_data.get("menu_banner_file_id", "")
+                    MENU_BANNER_FILE_ID = (
+                        saved_banner if isinstance(saved_banner, str)
+                        and len(saved_banner) <= 256 else ""
+                    )
                     # Apply profiles only after the cloud administrator signature is verified.
                     users_db.clear()
                     users_db.update(restored_users)
@@ -616,6 +626,7 @@ async def sync_state_from_cloud():
                     # Owners retain their hardcoded Telegram identity to bootstrap the system.
                     admins_db.clear()
                     admin_roles.clear()
+                    MENU_BANNER_FILE_ID = ""
                     save_json(ADMINS_FILE, admins_db)
                     save_json("admin_roles.json", admin_roles)
                     _cloud_state_hydrated = True
@@ -678,7 +689,8 @@ async def sync_state_to_cloud():
                 "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
-                "requests": requests_db
+                "requests": requests_db,
+                "menu_banner_file_id": MENU_BANNER_FILE_ID
             }
 
             body = {
@@ -740,6 +752,10 @@ class AgentActionStates(StatesGroup):
 class NewsStates(StatesGroup):
     waiting_for_text = State()
     confirm = State()
+
+
+class MenuBannerStates(StatesGroup):
+    waiting_for_photo = State()
 
 
 class SupportStates(StatesGroup):
@@ -873,6 +889,8 @@ ADMIN_BOT_COMMANDS = [
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
     BotCommand(command="notifications", description="Уведомления руководства"),
+    BotCommand(command="setbanner", description="Установить баннер главного меню"),
+    BotCommand(command="removebanner", description="Убрать баннер из меню"),
 ]
 
 
@@ -1345,6 +1363,108 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
                          reply_markup=get_main_menu(message.from_user.id))
 
 
+@dp.message(Command("setbanner"))
+async def cmd_set_menu_banner(message: types.Message, state: FSMContext):
+    """Only the technical Telegram owner can change the home banner."""
+    uid = message.from_user.id if message.from_user else 0
+    if (message.chat.type != "private" or message.chat.id != uid
+            or not is_owner(uid)):
+        await message.answer("⛔ Изменение баннера доступно только владельцу.")
+        return
+    if await state.get_state():
+        await message.answer(
+            "⏳ Сначала завершите текущее действие или используйте /cancel."
+        )
+        return
+    await state.set_state(MenuBannerStates.waiting_for_photo)
+    await message.answer(
+        "🖼️ <b>Баннер главного меню</b>\n\n"
+        "Отправьте картинку <b>как фото</b> (не файлом). "
+        "Рекомендуется формат <b>16:9</b>, ширина от 640 пикселей.\n\n"
+        "Баннер появится в /start, /menu и при возврате в личный кабинет. "
+        "Кнопки и данные агента останутся под изображением.\n"
+        "<i>Отмена: /cancel</i>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("removebanner"))
+async def cmd_remove_menu_banner(message: types.Message, state: FSMContext):
+    """Restore the original text card without changing roles or user profiles."""
+    uid = message.from_user.id if message.from_user else 0
+    if (message.chat.type != "private" or message.chat.id != uid
+            or not is_owner(uid)):
+        await message.answer("⛔ Только владелец может отключить баннер.")
+        return
+    if await state.get_state():
+        await message.answer("⏳ Завершите текущее действие или /cancel.")
+        return
+    global MENU_BANNER_FILE_ID
+    previous = MENU_BANNER_FILE_ID
+    if not previous:
+        await message.answer("Баннер уже отключён.")
+        return
+    MENU_BANNER_FILE_ID = ""
+    if not await sync_state_to_cloud():
+        MENU_BANNER_FILE_ID = previous
+        await message.answer("⚠️ Firebase не подтвердила изменение. Баннер сохранён.")
+        return
+    await message.answer(
+        "✅ Баннер убран. Главное меню снова отображается обычной текстовой карточкой."
+    )
+
+
+@dp.message(MenuBannerStates.waiting_for_photo)
+async def receive_menu_banner_photo(message: types.Message, state: FSMContext):
+    uid = message.from_user.id if message.from_user else 0
+    if (message.chat.type != "private" or message.chat.id != uid
+            or not is_owner(uid)):
+        await state.clear()
+        await message.answer("⛔ Только владелец может менять баннер.")
+        return
+    if not message.photo:
+        await message.answer(
+            "📷 Отправьте изображение именно как <b>фото</b>, "
+            "не как документ. Для отмены: /cancel.",
+            parse_mode="HTML"
+        )
+        return
+    picture = message.photo[-1]
+    if (picture.width < 640 or picture.height < 320 or
+            not 1.6 <= picture.width / picture.height <= 2.05):
+        await message.answer(
+            "⚠️ Нужен горизонтальный баннер примерно 16:9, "
+            "шириной от 640 пикселей. Отправьте другое фото."
+        )
+        return
+    new_file_id = picture.file_id
+    if not isinstance(new_file_id, str) or not 10 <= len(new_file_id) <= 256:
+        await message.answer(
+            "⚠️ Telegram не вернул корректный идентификатор фото."
+        )
+        return
+    global MENU_BANNER_FILE_ID
+    previous = MENU_BANNER_FILE_ID
+    MENU_BANNER_FILE_ID = new_file_id
+    if not await sync_state_to_cloud():
+        MENU_BANNER_FILE_ID = previous
+        await message.answer(
+            "⚠️ Firebase не подтвердила сохранение. "
+            "Баннер не изменён, можно отправить фото ещё раз."
+        )
+        return
+    await state.clear()
+    await message.answer("✅ <b>Баннер сохранён!</b> Он появится у всех в главном меню.",
+                         parse_mode="HTML")
+    profile = users_db.get(str(uid), {})
+    if isinstance(profile, dict) and profile.get("nick"):
+        await send_home_banner_card(
+            message, home_card_text(profile, uid),
+            reply_markup=get_main_menu(uid), lea=True,
+            banner_file_id=MENU_BANNER_FILE_ID
+        )
+
+
 @dp.message(Command("menu", "help"))
 async def cmd_menu(message: types.Message, state: FSMContext):
     """Always send a fresh menu at the bottom, irrespective of current FSM state."""
@@ -1366,9 +1486,10 @@ async def cmd_menu(message: types.Message, state: FSMContext):
         await cmd_start(message, state)
         return
     await sync_user_command_scope(user_id)
-    await send_fbi_card(
+    await send_home_banner_card(
         message, home_card_text(profile, user_id),
-        reply_markup=get_main_menu(user_id), lea=True
+        reply_markup=get_main_menu(user_id), lea=True,
+        banner_file_id=MENU_BANNER_FILE_ID
     )
 
 
@@ -1471,11 +1592,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(RegistrationStates.waiting_for_nick)
     else:
-        await send_fbi_card(
+        await send_home_banner_card(
             message,
             home_card_text(user_data, message.from_user.id),
             reply_markup=get_main_menu(message.from_user.id),
-            lea=True
+            lea=True, banner_file_id=MENU_BANNER_FILE_ID
         )
         # Bot registrations live in config/bot_state; the two visible tables
         # are independent. A website row deletion is NOT a profile deletion.
@@ -1555,9 +1676,10 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("Для начала регистрации используйте /start.", show_alert=True)
             return
         await state.clear()
-        await send_fbi_card(
+        await send_home_banner_card(
             callback.message, home_card_text(profile, uid),
-            reply_markup=get_main_menu(uid), lea=True
+            reply_markup=get_main_menu(uid), lea=True,
+            banner_file_id=MENU_BANNER_FILE_ID
         )
         await callback.answer()
         return
@@ -1631,9 +1753,10 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         if not isinstance(profile, dict) or not profile.get("nick"):
             await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
             return
-        await send_fbi_card(
+        await send_home_banner_card(
             callback.message, home_card_text(profile, uid),
-            reply_markup=get_main_menu(uid), lea=True
+            reply_markup=get_main_menu(uid), lea=True,
+            banner_file_id=MENU_BANNER_FILE_ID
         )
         await callback.answer()
         return

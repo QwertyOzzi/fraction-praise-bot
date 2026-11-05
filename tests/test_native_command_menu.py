@@ -92,6 +92,10 @@ class TestNativeCommandCatalog(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("security", admin)
         self.assertIn("security", owner)
         self.assertIn("notifications", owner)
+        self.assertIn("setbanner", owner)
+        self.assertIn("removebanner", owner)
+        self.assertNotIn("setbanner", admin)
+        self.assertNotIn("setbanner", user)
 
     async def test_startup_registers_global_menu_and_role_scopes(self):
         await self.env["register_native_command_menu"]()
@@ -142,6 +146,8 @@ class TestFreshMenu(unittest.IsolatedAsyncioTestCase):
             "types": Data(Message=Message), "FSMContext": State,
             "users_db": {"10": {"nick": "Gomez_Addams", "rank": "8"}},
             "send_fbi_card": send_card,
+            "send_home_banner_card": send_card,
+            "MENU_BANNER_FILE_ID": "stored-photo-id",
             "sync_user_command_scope": sync,
             "home_card_text": lambda profile, uid: profile["nick"],
             "get_main_menu": lambda uid: "inline-keyboard",
@@ -155,6 +161,7 @@ class TestFreshMenu(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.cards[0][1], "Gomez_Addams")
         self.assertEqual(self.cards[0][2]["reply_markup"], "inline-keyboard")
         self.assertTrue(self.cards[0][2]["lea"])
+        self.assertEqual(self.cards[0][2]["banner_file_id"], "stored-photo-id")
         self.assertEqual(self.changed, [10])
 
     async def test_group_does_not_show_profile(self):
