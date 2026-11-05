@@ -7,6 +7,7 @@ import uuid
 import hashlib
 import hmac
 import re
+import difflib
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -18,6 +19,11 @@ from natural_commands import (interpret as interpret_natural, resolve_names,
                               looks_like_operation, simple_parse, ParseError, MODEL)
 from natural_balance import apply_batch, BalanceConflict
 from natural_aliases import load_alias_memory, resolve_with_memory, AliasMemoryError
+from natural_commands import simplified
+from agent_actions import (
+    AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
+    decide_add_request, list_collection, create_announcement, finish_announcement
+)
 from telegram_design import (send_fbi_card, edit_fbi_card,
                              hide_old_reply_keyboard, with_home_button)
 
@@ -725,6 +731,15 @@ class GrantStates(StatesGroup):
 class AiStates(StatesGroup):
     waiting_for_text = State()
 
+
+class AgentActionStates(StatesGroup):
+    waiting_add_evidence = State()
+
+
+class NewsStates(StatesGroup):
+    waiting_for_text = State()
+
+
 class SupportStates(StatesGroup):
     waiting_for_message = State()
 
@@ -761,7 +776,11 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📌 Заявки", callback_data="main:pending"),
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
+            [InlineKeyboardButton(text="📥 Запросы агентов", callback_data="main:agentpending")],
+            [InlineKeyboardButton(text="📜 Журнал агентов", callback_data="main:agentlogs")],
             [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
+            *([[InlineKeyboardButton(text="📣 Новости для всех", callback_data="main:news")]]
+              if is_leader(user_id) else []),
             [InlineKeyboardButton(text="◀️ Личный кабинет", callback_data="main:home")],
         ]
     else:
@@ -770,6 +789,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
+            [InlineKeyboardButton(text="➖ Списать FRP / похвалу", callback_data="main:min")],
+            [InlineKeyboardButton(text="➕ Запросить начисление", callback_data="main:plus")],
             [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
             [InlineKeyboardButton(text="🌐 Таблица", web_app=WebAppInfo(url=WEBAPP_URL))],
         ]
@@ -830,6 +851,8 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="status", description="Мои FRP и похвалы"),
     BotCommand(command="nick", description="Изменить игровой ник"),
     BotCommand(command="rank", description="Запросить смену ранга"),
+    BotCommand(command="min", description="Списать FRP/похвалу агенту"),
+    BotCommand(command="plus", description="Запросить начисление с причиной"),
     BotCommand(command="support", description="Поддержка и баг-репорт"),
     BotCommand(command="help", description="Помощь и разделы бота"),
     BotCommand(command="cancel", description="Отменить текущее действие"),
@@ -842,6 +865,8 @@ ADMIN_BOT_COMMANDS = [
     BotCommand(command="admins", description="Список руководства"),
     BotCommand(command="claims", description="Проверка спорных регистраций"),
     BotCommand(command="ai", description="ИИ-команды: начисление и списание FRP"),
+    BotCommand(command="agentpending", description="Заявки агентов на начисление"),
+    BotCommand(command="agentlogs", description="Отдельный журнал действий агентов"),
 ]
 OWNER_BOT_COMMANDS = [
     BotCommand(command="security", description="Проверить права доступа"),
@@ -853,6 +878,9 @@ def commands_for_user(user_id: int) -> List[BotCommand]:
     commands = list(PUBLIC_BOT_COMMANDS)
     if is_admin(user_id):
         commands.extend(ADMIN_BOT_COMMANDS)
+    if is_leader(user_id):
+        commands.append(BotCommand(command="news", description="Новости и обновления для всех"))
+        commands.append(BotCommand(command="newslog", description="История рассылок"))
     if is_owner(user_id):
         commands.extend(OWNER_BOT_COMMANDS)
     return commands
@@ -1478,7 +1506,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai"}
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs"}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1530,6 +1558,38 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=get_main_menu(uid), lea=True
         )
         await callback.answer()
+        return
+
+    if action == "news":
+        if not is_leader(uid):
+            await callback.answer("Рассылка доступна только владельцу или лидеру.", show_alert=True)
+            return
+        if await state.get_state():
+            await callback.answer("Завершите текущее действие или используйте /cancel.", show_alert=True)
+            return
+        source = callback.message.model_copy(update={"from_user": callback.from_user})
+        await callback.answer()
+        await cmd_news(source, state)
+        return
+
+    if action in ("min", "plus"):
+        if await state.get_state():
+            await callback.answer("Сначала завершите текущее действие или /cancel.", show_alert=True)
+            return
+        profile = get_verified_agent(uid)
+        if not profile:
+            await callback.answer("Сначала подтвердите регистрацию.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer(
+            "➖ <b>Списание</b>: <code>/min frp Gomez_Addams -2</code>\n"
+            "➕ <b>Начисление</b>: <code>/plus praise Gomez_Addams +1</code>\n\n"
+            "Можно также написать обычную фразу, например "
+            "<code>Гомер -2 фрп</code>.\n"
+            "<i>Списание требует вашего подтверждения; начисление — причины "
+            "или доказательства и одобрения руководства.</i>",
+            parse_mode="HTML"
+        )
         return
 
     if action == "ai":
@@ -1594,6 +1654,8 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         "pending": (cmd_pending, False),
         "grant": (cmd_grant_menu, True),
         "admins": (cmd_list_admins, False),
+        "agentpending": (cmd_agent_pending, False),
+        "agentlogs": (cmd_agent_logs, False),
     }
     route = routes.get(action)
     if route is None:
