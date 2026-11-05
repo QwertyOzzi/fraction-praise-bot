@@ -10,12 +10,13 @@ import json
 PERMISSIONS = (
     "agents.view", "agents.rank", "agents.delete", "department.manage",
     "reports.review", "points.grant", "points.debit", "stats.view",
-    "news.publish",
+    "news.publish", "events.manage", "messages.schedule",
 )
 ROLE_DEFAULTS = {
     "leader": frozenset((
         "agents.view", "agents.rank", "department.manage", "reports.review",
         "points.grant", "points.debit", "stats.view", "news.publish",
+        "events.manage", "messages.schedule",
     )),
     "deputy": frozenset((
         "agents.view", "reports.review", "points.grant", "points.debit",
