@@ -358,6 +358,16 @@ async def resolve_nickname_claim(client, project_id, claimant_uid, claim_id,
                         displaced[previous_uid] = displaced_profile
 
                     applicant = dict(applicant)
+                    previous_rank = str(applicant.get("rank") or "")
+                    if previous_rank and previous_rank != rank:
+                        saved_history = applicant.get("rank_history", [])
+                        if not isinstance(saved_history, list):
+                            saved_history = []
+                        applicant["rank_history"] = (saved_history + [{
+                            "from": previous_rank, "to": rank,
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "actor": "leadership_claim_review"
+                        }])[-50:]
                     applicant.update({
                         "nick": nick, "rank": rank, "profileId": target_binding,
                         "verification_status": "verified"
