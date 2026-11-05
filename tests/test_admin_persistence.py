@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
+from access_control import normalize_overrides, sign_overrides
 
 SOURCE = Path(__file__).resolve().parents[1].joinpath("bot.py").read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
@@ -77,6 +78,10 @@ def build_context(cloud):
         "users_db": {},
         "admins_db": [],
         "admin_roles": {},
+        "permission_overrides": {},
+        "normalize_overrides": normalize_overrides,
+        "sign_overrides": sign_overrides,
+        "permission_secret": lambda: "test-telegram-secret",
         "owner_cfg": {"owner_ids": [6060562962]},
         "requests_db": {},
         "completed_cleanup_ids": set(),

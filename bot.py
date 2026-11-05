@@ -24,6 +24,10 @@ from agent_actions import (
     AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
     decide_add_request, list_collection, create_announcement, finish_announcement
 )
+from personnel import personnel_details, ranked_reporters
+from access_control import (PERMISSIONS, AGENT_DELEGATABLE,
+    normalize_overrides, sign_overrides, has_permission as resolve_permission,
+    max_debit_for)
 from telegram_design import (send_fbi_card, send_home_banner_card,
                              edit_fbi_card, hide_old_reply_keyboard,
                              with_home_button)
@@ -112,6 +116,7 @@ users_db: Dict[str, Any] = load_json(USERS_FILE, {})
 admins_db: List[int] = load_json(ADMINS_FILE, [])
 pending_admin_requests: Dict[int, Dict[str, Any]] = {}
 admin_roles: Dict[str, str] = load_json("admin_roles.json", {})
+permission_overrides: Dict[str, Dict[str, bool]] = {}
 requests_db: Dict[str, Any] = load_json(REQUESTS_FILE, {})
 owner_cfg: Dict[str, Any] = {"owner_ids": list(OWNER_TELEGRAM_IDS)}
 completed_cleanup_ids = set()
@@ -136,6 +141,22 @@ def sign_admin_permissions(admin_ids: List[int], roles: Dict[str, str]) -> str:
     msg = json.dumps(signed_payload, ensure_ascii=True, sort_keys=True,
                      separators=(",", ":")).encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def permission_secret() -> str:
+    return os.getenv("ADMIN_ACL_SIGNING_KEY", "").strip() or BOT_TOKEN
+
+
+def has_permission(user_id: int, permission: str) -> bool:
+    return resolve_permission(user_id, permission, owners=OWNER_TELEGRAM_IDS,
+        admins=admins_db, roles=admin_roles, overrides=permission_overrides,
+        hydrated=_cloud_state_hydrated)
+
+
+def debit_limit(user_id: int) -> int:
+    return max_debit_for(user_id, owners=OWNER_TELEGRAM_IDS,
+        admins=admins_db, roles=admin_roles, overrides=permission_overrides,
+        hydrated=_cloud_state_hydrated)
 
 
 def is_admin(user_id: int) -> bool:
@@ -577,6 +598,17 @@ async def sync_state_from_cloud():
                         if cloud_roles.get(str(item)) in ("leader", "deputy")
                         else "deputy" for item in filtered
                     }
+                    # Additional, separately signed capabilities do not alter the
+                    # existing admins/admin_roles signature or revoke old grants.
+                    cloud_permissions = normalize_overrides(
+                        cloud_data.get("permission_overrides", {}))
+                    permission_signature = str(cloud_data.get("permission_overrides_signature") or "")
+                    expected_permissions = sign_overrides(cloud_permissions, permission_secret())
+                    if ((cloud_permissions and not permission_signature) or
+                            (permission_signature and not hmac.compare_digest(
+                                permission_signature, expected_permissions))):
+                        logger.error("Permission override signature invalid; refusing state hydration")
+                        return
                     signature = cloud_data.get("admin_acl_signature", "")
                     expected = sign_admin_permissions(filtered, filtered_roles)
                     if filtered and not signature:
@@ -607,6 +639,8 @@ async def sync_state_from_cloud():
                     admins_db[:] = filtered
                     admin_roles.clear()
                     admin_roles.update(filtered_roles)
+                    permission_overrides.clear()
+                    permission_overrides.update(cloud_permissions)
                     save_json("admin_roles.json", admin_roles)
 
                     owner_cfg["owner_ids"] = list(OWNER_TELEGRAM_IDS)
@@ -626,6 +660,7 @@ async def sync_state_from_cloud():
                     # Owners retain their hardcoded Telegram identity to bootstrap the system.
                     admins_db.clear()
                     admin_roles.clear()
+                    permission_overrides.clear()
                     MENU_BANNER_FILE_ID = ""
                     save_json(ADMINS_FILE, admins_db)
                     save_json("admin_roles.json", admin_roles)
@@ -687,6 +722,8 @@ async def sync_state_to_cloud():
                 "admins": admins_db,
                 "admin_roles": admin_roles,
                 "admin_acl_signature": sign_admin_permissions(admins_db, admin_roles),
+                "permission_overrides": permission_overrides,
+                "permission_overrides_signature": sign_overrides(permission_overrides, permission_secret()),
                 "completed_cleanup_ids": sorted(completed_cleanup_ids),
                 "owners": owner_cfg.get("owner_ids", []),
                 "requests": requests_db,
@@ -794,6 +831,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
             [InlineKeyboardButton(text="📌 Заявки", callback_data="main:pending"),
              InlineKeyboardButton(text="➕ Начисления", callback_data="main:grant")],
             [InlineKeyboardButton(text="👥 Руководство", callback_data="main:admins")],
+            [InlineKeyboardButton(text="📊 Статистика отчётов", callback_data="main:stats")],
             [InlineKeyboardButton(text="📥 Запросы агентов", callback_data="main:agentpending")],
             [InlineKeyboardButton(text="📜 Журнал агентов", callback_data="main:agentlogs")],
             [InlineKeyboardButton(text="🤖 ИИ-команда", callback_data="main:ai", style="primary")],
@@ -807,6 +845,7 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
+            [InlineKeyboardButton(text="👤 Моя карточка", callback_data="main:profile")],
             [InlineKeyboardButton(text="➖ Списать FRP / похвалу", callback_data="main:min")],
             [InlineKeyboardButton(text="➕ Запросить начисление", callback_data="main:plus")],
             [InlineKeyboardButton(text="💬 Поддержка", callback_data="main:support")],
@@ -867,6 +906,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="menu", description="Показать главное меню внизу чата"),
     BotCommand(command="report", description="Подать отчёт FRP / похвала"),
     BotCommand(command="status", description="Мои FRP и похвалы"),
+    BotCommand(command="profile", description="Полная карточка сотрудника"),
     BotCommand(command="nick", description="Изменить игровой ник"),
     BotCommand(command="rank", description="Запросить смену ранга"),
     BotCommand(command="min", description="Списать FRP/похвалу агенту"),
@@ -877,6 +917,8 @@ PUBLIC_BOT_COMMANDS = [
 ]
 ADMIN_BOT_COMMANDS = [
     BotCommand(command="agents", description="Управление агентами"),
+    BotCommand(command="stats", description="Статистика отчётов агентов"),
+    BotCommand(command="department", description="Назначить отдел сотруднику"),
     BotCommand(command="pending", description="Ожидающие заявки"),
     BotCommand(command="queue", description="Очередь на выдачу"),
     BotCommand(command="grant", description="Начислить FRP / похвалы"),
@@ -891,6 +933,7 @@ OWNER_BOT_COMMANDS = [
     BotCommand(command="notifications", description="Уведомления руководства"),
     BotCommand(command="setbanner", description="Установить баннер главного меню"),
     BotCommand(command="removebanner", description="Убрать баннер из меню"),
+    BotCommand(command="permissions", description="Управление правами сотрудников"),
 ]
 
 
@@ -1629,7 +1672,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # Every inline control is mapped to the existing validated handler; no new
 # permissions, billing logic, or Firebase routes are introduced.
-MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs"}
+MAIN_MENU_ADMIN_ACTIONS = {"admin", "agents", "queue", "pending", "grant", "admins", "ai", "agentpending", "agentlogs", "stats"}
 
 
 @dp.callback_query(F.data.startswith("main:"))
@@ -1710,7 +1753,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             return
         await callback.answer()
         await callback.message.answer(
-            "➖ <b>Списание</b>: <code>/min frp Gomez_Addams -2</code>\n"
+            "➖ <b>Списание</b>: <code>/min frp Gomez_Addams -2 | причина</code>\n"
             "➕ <b>Начисление</b>: <code>/plus praise Gomez_Addams +1</code>\n\n"
             "Можно также написать обычную фразу, например "
             "<code>Гомер -2 фрп</code>.\n"
@@ -1775,10 +1818,12 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     routes = {
         "report": (start_report, True),
         "status": (cmd_my_status, False),
+        "profile": (cmd_employee_profile, False),
         "nick": (cmd_change_nick, True),
         "rank": (cmd_change_rank, True),
         "support": (cmd_support, True),
         "agents": (cmd_agent_panel, True),
+        "stats": (cmd_activity_stats, False),
         "queue": (cmd_queue, False),
         "pending": (cmd_pending, False),
         "grant": (cmd_grant_menu, True),
@@ -2541,7 +2586,7 @@ async def send_report_confirmed(callback: types.CallbackQuery, state: FSMContext
 # ╚══════════════════════════════════════════════════════════════════╝
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_report(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "reports.review"):
         await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
@@ -2605,7 +2650,7 @@ async def approve_report(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_report(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "reports.review"):
         await callback.answer("У вас нет прав администратора!", show_alert=True)
         return
 
@@ -3045,7 +3090,7 @@ async def cmd_set_firebase_pass(message: types.Message):
 @dp.message(F.text == "👥 Список админов")
 @dp.message(Command("admins"))
 async def cmd_list_admins(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("Доступно только руководству фракции.")
         return
 
@@ -3138,7 +3183,7 @@ async def process_remove_admin(callback: types.CallbackQuery):
 @dp.message(Command("pending"))
 @dp.message(F.text == "📌 Ожидающие заявки")
 async def cmd_pending(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "reports.review"):
         await message.answer("⛔ Доступно только руководству.")
         return
     pending = [(rid, req) for rid, req in requests_db.items() if req.get("status") == "pending"]
@@ -3194,7 +3239,7 @@ def parse_grant_args(raw: str):
 
 
 async def perform_manual_grant(message: types.Message, raw: str):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "points.grant"):
         await message.answer("⛔ Только лидер или заместитель может начислять баллы.")
         return
     try:
@@ -3242,7 +3287,7 @@ async def cmd_grant(message: types.Message):
 
 @dp.message(F.text == "➕ Начислить FRP / Похвалу")
 async def cmd_grant_menu(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "points.grant"):
         await message.answer("⛔ Только для руководства.")
         return
     await state.set_state(GrantStates.waiting_for_details)
@@ -3275,40 +3320,134 @@ agent_action_tokens: Dict[str, Dict[str, Any]] = {}
 
 class AgentPanelStates(StatesGroup):
     waiting_for_search = State()
+    waiting_for_reason = State()
 
 
 async def remove_agent_everywhere(nick: str) -> bool:
-    """Remove an unneeded agent only when its two outstanding balances are zero."""
+    """Atomically remove zero-balance rows AND the cloud Telegram profile.
+
+    A single Firestore commit covers both sheets and config/bot_state. On any
+    conflict all changes are rejected, not half-applied.
+    """
     if not _cloud_state_hydrated:
         raise RuntimeError("Cannot delete agents before cloud state is loaded")
     if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", nick):
         raise ValueError("Invalid agent nickname")
-    matches = [(uid, entry) for uid, entry in users_db.items()
-               if isinstance(entry, dict)
-               and str(entry.get("nick", "")).casefold() == nick.casefold()]
-    if any(uid.isdecimal() and (int(uid) in OWNER_TELEGRAM_IDS or int(uid) in admins_db)
-           for uid, _ in matches):
-        raise ValueError("Нельзя удалить руководство через очистку агентов.")
-    # Verify balances before touching any persistent data.
-    rows_by_sheet = await asyncio.gather(
-        firebase_client.get_sheet("fractionrp"), firebase_client.get_sheet("praise")
-    )
-    for rows in rows_by_sheet:
-        if any(str(row.get("nick", "")).casefold() == nick.casefold() and
-               int(row.get("qty") or 0) != 0 for row in rows):
-            raise ValueError("У агента есть ненулевой баланс. Очистка отменена.")
+    base = (f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}"
+            "/databases/(default)/documents")
+    async with _state_sync_lock:
+        token = await firebase_client.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        headers = {"Authorization": f"Bearer {token}",
+                   "Content-Type": "application/json"}
+        for retry in range(5):
+            async with ClientSession(timeout=ClientTimeout(total=25)) as session:
+                async def read(path):
+                    async with session.get(base + "/" + path, headers=headers) as response:
+                        if response.status != 200:
+                            raise RuntimeError(f"Firestore read failed: {response.status}")
+                        doc = await response.json()
+                        if not doc.get("updateTime"):
+                            raise RuntimeError("Firestore revision missing")
+                        return doc
 
-    # Each sheet uses updateTime to avoid overwriting concurrent grants.
-    for sheet in ("fractionrp", "praise"):
-        if not await firebase_client.remove_zero_balance_agent(sheet, nick):
-            raise ValueError("Баланс изменился. Удаление отменено.")
-
-    for uid, _ in matches:
-        users_db.pop(uid, None)
-    if matches:
-        save_json(USERS_FILE, users_db)
-        await sync_state_to_cloud()
-    return True
+                paths = ("config/bot_state", "sheets/fractionrp", "sheets/praise")
+                records = await asyncio.gather(*(read(path) for path in paths))
+                docs = dict(zip(paths, records))
+                raw = docs["config/bot_state"].get("fields", {}).get(
+                    "data", {}).get("stringValue", "")
+                state = json.loads(raw)
+                users = state.get("users")
+                cloud_admins = state.get("admins", [])
+                cloud_roles = state.get("admin_roles", {})
+                if not isinstance(users, dict) or not isinstance(cloud_admins, list) or not isinstance(cloud_roles, dict):
+                    raise RuntimeError("Invalid cloud state")
+                stored_acl = str(state.get("admin_acl_signature") or "")
+                if ((cloud_admins and not stored_acl) or
+                        (stored_acl and not hmac.compare_digest(
+                            stored_acl, sign_admin_permissions(cloud_admins, cloud_roles)))):
+                    raise RuntimeError("Unverified cloud administrator ACL")
+                cloud_permissions = normalize_overrides(
+                    state.get("permission_overrides", {}))
+                stored_perm_sig = str(state.get("permission_overrides_signature") or "")
+                if ((cloud_permissions and not stored_perm_sig) or
+                        (stored_perm_sig and not hmac.compare_digest(
+                            stored_perm_sig,
+                            sign_overrides(cloud_permissions, permission_secret())))):
+                    raise RuntimeError("Unverified cloud permission overrides")
+                matches = [(uid, profile) for uid, profile in users.items()
+                           if isinstance(profile, dict)
+                           and str(profile.get("nick") or "").casefold() == nick.casefold()]
+                protected = OWNER_TELEGRAM_IDS | set(admins_db)
+                protected.update(uid for uid in cloud_admins if type(uid) is int and uid > 0)
+                if any(str(uid).isdecimal() and int(uid) in protected for uid, _ in matches):
+                    raise ValueError("Нельзя удалять руководство через очистку агентов.")
+                sheet_updates = {}
+                for sheet in ("fractionrp", "praise"):
+                    doc = docs["sheets/" + sheet]
+                    rows = firebase_client._parse_firestore_rows(
+                        doc.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                    target_rows = [row for row in rows
+                                   if str(row.get("nick") or "").casefold() == nick.casefold()]
+                    if any(int(row.get("qty") or 0) != 0 for row in target_rows):
+                        raise ValueError("У агента есть ненулевой баланс. Очистка отменена.")
+                    sheet_updates[sheet] = [row for row in rows if row not in target_rows]
+                if not matches and all(len(sheet_updates[sheet]) ==
+                                       len(firebase_client._parse_firestore_rows(
+                                           docs["sheets/" + sheet].get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", [])))
+                                       for sheet in ("fractionrp", "praise")):
+                    return True
+                for uid, _ in matches:
+                    users.pop(uid, None)
+                    # Revocation is included in the SAME atomic operation.
+                    cloud_permissions.pop(str(uid), None)
+                state["users"] = users
+                state["permission_overrides"] = cloud_permissions
+                state["permission_overrides_signature"] = sign_overrides(
+                    cloud_permissions, permission_secret())
+                now = datetime.now(timezone.utc).isoformat()
+                writes = []
+                for sheet in ("fractionrp", "praise"):
+                    path = "sheets/" + sheet
+                    writes.append({
+                        "update": {
+                            "name": f"projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/{path}",
+                            "fields": {
+                                "rows": {"arrayValue": {"values": [
+                                    firebase_client._row_to_firestore(row) for row in sheet_updates[sheet]
+                                ]}},
+                                "updatedAt": {"timestampValue": now}
+                            }
+                        },
+                        "updateMask": {"fieldPaths": ["rows", "updatedAt"]},
+                        "currentDocument": {"updateTime": docs[path]["updateTime"]}
+                    })
+                writes.append({
+                    "update": {
+                        "name": f"projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state",
+                        "fields": {
+                            "data": {"stringValue": json.dumps(state, ensure_ascii=False)},
+                            "updatedAt": {"timestampValue": now}
+                        }
+                    },
+                    "updateMask": {"fieldPaths": ["data", "updatedAt"]},
+                    "currentDocument": {"updateTime": docs["config/bot_state"]["updateTime"]}
+                })
+                async with session.post(base + ":commit", headers=headers,
+                                        json={"writes": writes}) as response:
+                    if response.status == 200:
+                        users_db.clear()
+                        users_db.update(users)
+                        permission_overrides.clear()
+                        permission_overrides.update(cloud_permissions)
+                        save_json(USERS_FILE, users_db)
+                        return True
+                    if response.status not in (409, 412):
+                        raise RuntimeError(
+                            f"Firestore atomic removal rejected: HTTP {response.status}")
+            await asyncio.sleep(0.12 * (retry + 1))
+    raise RuntimeError("Concurrent changes prevented atomic deletion")
 
 
 def agent_hash(nick: str) -> str:
@@ -3438,13 +3577,170 @@ async def agent_panel_detail(message: types.Message, key: str, page: int):
         await message.edit_text("⚠️ Агент больше не найден. Откройте список снова.")
         return
     text, kb = agent_detail_markup(agent, page)
+    uid = agent.get("uid")
+    if uid and isinstance(users_db.get(str(uid)), dict):
+        details = personnel_details(users_db[str(uid)], requests_db, uid)
+        text = text.replace("<i>Выберите действие.", details + "\n\n<i>Выберите действие.")
     await edit_fbi_card(message, text, reply_markup=with_home_button(kb))
+
+
+
+
+@dp.message(Command("permissions"))
+async def cmd_permissions(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
+    """Owner-only capabilities; never replace existing Telegram role assignments."""
+    if not is_owner(message.from_user.id):
+        await message.answer("⛔ Настраивать права может только владелец.")
+        return
+    if not _cloud_state_hydrated:
+        await message.answer("Firebase ещё не подтвердил состояние прав.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) == 1:
+        await message.answer(
+            "🔐 Права фракции:\n" + "\n".join("• " + p for p in PERMISSIONS) +
+            "\n\nИзменить: /permissions TelegramID permission allow|deny|clear\n"
+            "Пример: /permissions 123456789 points.debit allow\n"
+            "Без явного разрешения обычные агенты не могут списывать баллы."
+        )
+        return
+    if len(parts) != 4 or not parts[1].isdigit() or parts[2] not in PERMISSIONS or parts[3] not in ("allow", "deny", "clear"):
+        await message.answer("Неверные параметры. Используйте /permissions для справки.")
+        return
+    uid, capability, mode = parts[1], parts[2], parts[3]
+    if (uid not in users_db and int(uid) not in admins_db
+            and int(uid) not in OWNER_TELEGRAM_IDS):
+        await message.answer("Telegram ID не принадлежит зарегистрированному сотруднику.")
+        return
+    if int(uid) in OWNER_TELEGRAM_IDS:
+        await message.answer("Права владельца не изменяются.")
+        return
+    if int(uid) not in admins_db and capability not in AGENT_DELEGATABLE:
+        await message.answer("Обычным агентам можно отдельно разрешать только points.debit.")
+        return
+    previous = {key: dict(value) for key, value in permission_overrides.items()}
+    if mode == "clear":
+        if uid in permission_overrides:
+            permission_overrides[uid].pop(capability, None)
+            if not permission_overrides[uid]:
+                permission_overrides.pop(uid)
+    else:
+        permission_overrides.setdefault(uid, {})[capability] = (mode == "allow")
+    if not await sync_state_to_cloud():
+        permission_overrides.clear()
+        permission_overrides.update(previous)
+        await message.answer("Firebase не подтвердила изменение прав.")
+        return
+    await record_admin_activity("permission_changed", message.from_user.id,
+                                f"Telegram ID {uid}: {capability} -> {mode}")
+    await message.answer(f"✅ Право {capability}: {mode}. Прежние роли сохранены.")
+
+
+@dp.message(Command("profile"))
+async def cmd_employee_profile(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
+    """Private self-service card; never show another user's Telegram profile."""
+    profile = get_verified_agent(message.from_user.id)
+    if not profile:
+        await message.answer("Для просмотра карточки подтвердите свой ник через /start.")
+        return
+    try:
+        roster = await fetch_agent_directory()
+    except Exception as exc:
+        logger.warning("Personnel roster unavailable: %s", type(exc).__name__)
+        await message.answer("Не удалось получить актуальные балансы Firebase.")
+        return
+    matching = next((agent for agent in roster
+                     if agent.get("uid") == str(message.from_user.id)), None)
+    if matching is None:
+        await message.answer("Карточка пока не найдена в реестре.")
+        return
+    details = personnel_details(profile, requests_db, message.from_user.id)
+    await send_fbi_card(
+        message, f"👤 <b>FBI · Карточка сотрудника</b>\n\n"
+        f"<b>{html.escape(str(profile['nick']))}</b> · ранг "
+        f"{html.escape(str(profile.get('rank') or '?'))}\n"
+        f"🎖️ FRP: <b>{matching['frp']}</b> · "
+        f"🌟 Похвалы: <b>{matching['praise']}</b>\n\n" + details
+    )
+
+
+@dp.message(Command("stats"))
+async def cmd_activity_stats(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
+    """Leadership only; figures are Telegram report activity, not online time."""
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "stats.view"):
+        await message.answer("⛔ Статистика сотрудников доступна руководству.")
+        return
+    weekly = ranked_reporters(requests_db, users_db, days=7, limit=10)
+    monthly = ranked_reporters(requests_db, users_db, days=30, limit=10)
+    def render(rows):
+        return "\n".join(
+            f"{i}. <code>{html.escape(item['nick'])}</code> "
+            f"({html.escape(item['rank'])}) — ✅ {item['approved']}, "
+            f"всего {item['total']}"
+            for i, item in enumerate(rows, 1)
+            if item["total"] > 0
+        ) or "Нет отчётов за период."
+    await send_fbi_card(
+        message, "📊 <b>FBI · Активность по отчётам</b>\n\n"
+        "🗓 <b>За последние 7 дней</b>\n" + render(weekly) +
+        "\n\n🗓 <b>За последние 30 дней</b>\n" + render(monthly) +
+        "\n\n<i>Статистика учитывает только поданные отчёты в боте, "
+        "а не игровое время или все виды деятельности.</i>"
+    )
+
+
+@dp.message(Command("department"))
+async def cmd_set_department(message: types.Message):
+    if not _agent_private(message):
+        await message.answer("Откройте эту команду в личном чате бота.")
+        return
+    """Leader-managed optional department, without presuming server departments."""
+    if not has_permission(message.from_user.id, "department.manage"):
+        await message.answer("⛔ Назначение отделов доступно владельцу и лидеру.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Формат: /department Nick_Name Название отдела")
+        return
+    nick, department = parts[1].strip(), parts[2].strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", nick) or not 2 <= len(department) <= 60:
+        await message.answer("Некорректный ник или название отдела (2–60 символов).")
+        return
+    if any(ord(char) < 32 or char in "<>" for char in department):
+        await message.answer("Название содержит недопустимые символы.")
+        return
+    matches = [(uid, p) for uid, p in users_db.items()
+               if isinstance(p, dict) and str(p.get("nick") or "").casefold() == nick.casefold()]
+    if len(matches) != 1:
+        await message.answer("Не найден однозначно зарегистрированный агент.")
+        return
+    uid, profile = matches[0]
+    before = dict(profile)
+    profile["department"] = department
+    if not await sync_state_to_cloud():
+        users_db[uid] = before
+        await message.answer("Firebase не подтвердила изменение отдела.")
+        return
+    save_json(USERS_FILE, users_db)
+    await record_admin_activity("department_changed", message.from_user.id,
+                                f"{nick}: отдел {department}")
+    await message.answer(f"✅ Отдел агента {html.escape(nick)} изменён: "
+                         f"{html.escape(department)}", parse_mode="HTML")
 
 
 @dp.message(Command("agents"))
 @dp.message(F.text == "🧑‍💼 Управление агентами")
 async def cmd_agent_panel(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("⛔ Панель доступна только руководству.")
         return
     await state.clear()
@@ -3458,7 +3754,7 @@ async def cmd_agent_panel(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("agpage:") | (F.data == "agreset"))
 async def agent_page(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
     if callback.data == "agreset":
@@ -3485,7 +3781,7 @@ async def agent_noop(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "agsearch")
 async def agent_search(callback: types.CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AgentPanelStates.waiting_for_search)
@@ -3495,7 +3791,7 @@ async def agent_search(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AgentPanelStates.waiting_for_search)
 async def agent_search_term(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await state.clear()
         return
     value = (message.text or "").strip().casefold()
@@ -3513,7 +3809,7 @@ async def agent_search_term(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("agview:"))
 async def agent_view(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3526,8 +3822,8 @@ async def agent_view(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("agask:"))
-async def agent_ask_action(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+async def agent_ask_action(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3537,11 +3833,25 @@ async def agent_ask_action(callback: types.CallbackQuery):
             raise ValueError("Invalid action")
         if kind == "d" and qty != 1:
             raise ValueError("Invalid debit")
+        action_permission = "points.grant" if kind == "g" else "points.debit"
+        if not has_permission(callback.from_user.id, action_permission):
+            await callback.answer("Нет права на эту операцию.", show_alert=True)
+            return
         agents = await fetch_agent_directory()
         agent = next((item for item in agents if agent_hash(item["nick"]) == key), None)
         if not agent:
             await callback.answer("Агент не найден", show_alert=True)
             return
+        target_snapshot = None
+        if kind == "d":
+            sheet = "fractionrp" if which == "f" else "praise"
+            rows = await firebase_client.get_sheet(sheet)
+            candidates = [r for r in rows
+                          if str(r.get("nick") or "").casefold() == agent["nick"].casefold()]
+            if len(candidates) != 1 or int(candidates[0].get("qty") or 0) < 1:
+                await callback.answer("Не найдена запись с доступным балансом.", show_alert=True)
+                return
+            target_snapshot = _agent_key_row(candidates[0])
         now = datetime.now(timezone.utc).timestamp()
         for token, task in list(agent_action_tokens.items()):
             if now - task["created"] > 600:
@@ -3551,8 +3861,25 @@ async def agent_ask_action(callback: types.CallbackQuery):
             "uid": callback.from_user.id, "chat_id": callback.message.chat.id,
             "nick": agent["nick"], "rank": agent["rank"],
             "kind": kind, "which": which, "qty": qty, "page": page,
-            "key": key, "created": now, "status": "new"
+            "key": key, "created": now, "status": "new",
+            "target": target_snapshot, "reason": "",
+            "op_id": "agent-" + uuid.uuid4().hex
         }
+        if kind == "d":
+            if callback.message.chat.type != "private":
+                await callback.answer("Списание с причиной доступно только в личном чате.", show_alert=True)
+                agent_action_tokens.pop(token, None)
+                return
+            await state.update_data(agent_panel_debit_token=token)
+            await state.set_state(AgentPanelStates.waiting_for_reason)
+            await callback.message.answer(
+                f"📝 Причина списания 1 {'FRP' if which == 'f' else 'похвалы'} "
+                f"для <code>{html.escape(agent['nick'])}</code>:\n"
+                "Введите текст причины (5–200 символов). Для отмены /cancel.",
+                parse_mode="HTML"
+            )
+            await callback.answer()
+            return
         operation = f"+{qty}" if kind == "g" else "−1"
         type_name = "FRP" if which == "f" else "похвалы"
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3572,15 +3899,63 @@ async def agent_ask_action(callback: types.CallbackQuery):
         await callback.answer("Не удалось подготовить действие", show_alert=True)
 
 
+
+
+@dp.message(AgentPanelStates.waiting_for_reason)
+async def agent_panel_debit_reason(message: types.Message, state: FSMContext):
+    if not _agent_private(message):
+        await message.answer("Введите причину в личном чате с ботом.")
+        return
+    data = await state.get_data()
+    token = data.get("agent_panel_debit_token")
+    action = agent_action_tokens.get(token)
+    if not action or action["uid"] != message.from_user.id or action["status"] != "new":
+        await state.clear()
+        await message.answer("Заявка устарела, начните списание заново через /agents.")
+        return
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "points.debit"):
+        await state.clear()
+        await message.answer("Право списания отозвано.")
+        return
+    reason = (message.text or "").strip()
+    if not 5 <= len(reason) <= 200 or reason.startswith("/"):
+        await message.answer("Введите понятную причину длиной 5–200 символов или /cancel.")
+        return
+    action["reason"] = reason
+    await state.clear()
+    label = "FRP" if action["which"] == "f" else "похвалы"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(style="success", text="✅ Подтвердить списание",
+                              callback_data=f"agdo:{token}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"agview:{action['key']}:{action['page']}")]
+    ])
+    await message.answer(
+        f"⚠️ <b>Списание 1 {label}</b>\n\n"
+        f"👤 <code>{html.escape(action['nick'])}</code>\n"
+        f"📋 Причина: {html.escape(reason)}\n\n"
+        "Перед подтверждением бот повторно проверит право и баланс.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
 @dp.callback_query(F.data.startswith("agdo:"))
 async def agent_do_action(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "agents.view"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     token = callback.data.removeprefix("agdo:")
     action = agent_action_tokens.get(token)
     if not action or action["uid"] != callback.from_user.id or action["chat_id"] != callback.message.chat.id:
         await callback.answer("Это действие уже недоступно. Откройте панель заново.", show_alert=True)
+        return
+    required = "points.grant" if action["kind"] == "g" else "points.debit"
+    if not has_permission(callback.from_user.id, required):
+        await callback.answer("Право на операцию отозвано.", show_alert=True)
+        return
+    if action["kind"] == "d" and (
+            not 5 <= len(action.get("reason", "")) <= 200
+            or not isinstance(action.get("target"), dict)):
+        await callback.answer("Сначала укажите причину списания.", show_alert=True)
         return
     if action["status"] != "new" or datetime.now(timezone.utc).timestamp() - action["created"] > 600:
         await callback.answer("Действие уже обработано или устарело.", show_alert=True)
@@ -3596,12 +3971,18 @@ async def agent_do_action(callback: types.CallbackQuery):
                 "", "panel-" + token, quantity=action["qty"]
             )
         else:
-            await firebase_client.debit_one(sheet, action["nick"])
+            await commit_agent_debit(
+                firebase_client, ClientSession, op_id=action["op_id"],
+                actor_id=callback.from_user.id,
+                actor_nick=str(users_db.get(str(callback.from_user.id), {}).get("nick") or "Руководство"),
+                sheet=sheet, target=action["target"], amount=1,
+                reason=action["reason"], raw=action["nick"]
+            )
         action["status"] = "done"
         activity = "panel_grant" if action["kind"] == "g" else "panel_debit"
         amount = "+" + str(action["qty"]) if action["kind"] == "g" else "-1"
         asyncio.create_task(record_admin_activity(activity, callback.from_user.id,
-            f"{action['nick']}: {amount}", sheet))
+            f"{action['nick']}: {amount}; причина: {action['reason']}" if action["kind"] == "d" else f"{action['nick']}: {amount}", sheet))
     except Exception as exc:
         # No blind retry after a possibly successful but timed-out write.
         action["status"] = "uncertain"
@@ -3673,7 +4054,7 @@ async def agent_delete_confirm(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agranks:"))
 async def agent_rank_menu(callback: types.CallbackQuery):
-    if not is_leader(callback.from_user.id):
+    if not has_permission(callback.from_user.id, "agents.rank"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3701,7 +4082,7 @@ async def agent_rank_menu(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("agrank:"))
 async def agent_set_rank(callback: types.CallbackQuery):
-    if not is_leader(callback.from_user.id):
+    if not has_permission(callback.from_user.id, "agents.rank"):
         await callback.answer("Нет доступа", show_alert=True)
         return
     try:
@@ -3714,9 +4095,22 @@ async def agent_set_rank(callback: types.CallbackQuery):
         if not agent or agent["uid"] is None or agent["uid"] not in users_db:
             await callback.answer("Агент не найден", show_alert=True)
             return
-        users_db[agent["uid"]]["rank"] = "X" if rank == 10 else str(rank)
+        profile = users_db[agent["uid"]]
+        previous = dict(profile)
+        new_rank = "X" if rank == 10 else str(rank)
+        old_rank = str(profile.get("rank") or "?")
+        profile["rank"] = new_rank
+        if old_rank != new_rank:
+            history = profile.get("rank_history", [])
+            history = list(history) if isinstance(history, list) else []
+            profile["rank_history"] = (history + [{"from": old_rank, "to": new_rank,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "actor_id": str(callback.from_user.id)}])[-50:]
+        if not await sync_state_to_cloud():
+            users_db[agent["uid"]] = previous
+            await callback.answer("Firebase не подтвердила изменение.", show_alert=True)
+            return
         save_json(USERS_FILE, users_db)
-        await sync_state_to_cloud()
         asyncio.create_task(record_admin_activity("rank_changed", callback.from_user.id,
             f"{agent['nick']}: новый ранг {rank}"))
         await callback.answer("✅ Ранг обновлён")
@@ -3751,7 +4145,7 @@ def render_queue(rows: List[Dict[str, Any]]):
 @dp.message(F.text == "📋 Очередь на выдачу (Админ)")
 @dp.message(Command("queue"))
 async def cmd_queue(message: types.Message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("Доступно только руководству.")
         return
     try:
@@ -3765,7 +4159,7 @@ async def cmd_queue(message: types.Message):
 
 @dp.callback_query(F.data.startswith("issue_1_"))
 async def process_issue_one(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    if not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "points.debit"):
         await callback.answer("У вас нет прав!", show_alert=True)
         return
     nick = callback.data[len("issue_1_"):]
@@ -4115,6 +4509,8 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⛔ ИИ-команды доступны только руководству в личном чате.")
         return
     raw = raw.strip()
+    command_text, delimiter, debit_reason = raw.partition("|")
+    debit_reason = debit_reason.strip()
     if not raw:
         await message.answer("Напишите команду, например: <code>норто, гоммез -3 фрп</code>",
                              parse_mode="HTML")
@@ -4128,7 +4524,7 @@ async def handle_natural_command(message: types.Message, raw: str):
     recent.append(now)
     _AI_LIMIT[uid] = recent
     try:
-        plan, origin = await interpret_natural(raw, GEMINI_API_KEY, gemini_json_request)
+        plan, origin = await interpret_natural(command_text.strip(), GEMINI_API_KEY, gemini_json_request)
     except ParseError as exc:
         await message.answer("⚠️ " + html.escape(str(exc)))
         return
@@ -4136,6 +4532,17 @@ async def handle_natural_command(message: types.Message, raw: str):
         logger.warning("Gemini parsing request failed: %s", type(exc).__name__)
         await message.answer("⚠️ Не удалось получить ответ Gemini. Попробуйте ещё раз.")
         return
+    capability = "points.grant" if plan["action"] == "credit" else "points.debit"
+    if not has_permission(uid, capability):
+        await message.answer("⛔ Нет разрешения на эту операцию.")
+        return
+    if plan["action"] == "debit":
+        if not delimiter or not 5 <= len(debit_reason) <= 200:
+            await message.answer("⚠️ Укажите причину списания после | (5–200 символов).")
+            return
+        if plan["amount"] > debit_limit(uid):
+            await message.answer(f"⛔ Лимит списания для вашей роли: {debit_limit(uid)}.")
+            return
     try:
         # Memory is never sent to Gemini. Each operation uses the current sheet
         # AND persisted aliases from both sheets to revalidate identity.
@@ -4180,7 +4587,8 @@ async def handle_natural_command(message: types.Message, raw: str):
         "uid": uid, "chat_id": message.chat.id,
         "created": now, "status": "new",
         "plan": plan, "targets": targets,
-        "raw": raw,
+        "raw": command_text.strip(),
+        "reason": debit_reason if plan["action"] == "debit" else "",
         "operation_id": "ai-" + uuid.uuid4().hex
     }
     sheet_label = "FRP" if plan["sheet"] == "fractionrp" else "похвал"
@@ -4202,6 +4610,7 @@ async def handle_natural_command(message: types.Message, raw: str):
     await message.answer(
         "🤖 <b>FBI · Проверка ИИ-команды</b>\n\n" +
         summary +
+        (("\n📋 Причина: " + html.escape(debit_reason)) if plan["action"] == "debit" else "") +
         f"\n\n<blockquote>Агентов: <b>{len(targets)}</b>\n"
         f"Источник разбора: {source}</blockquote>\n"
         "<i>Firebase изменится только после нажатия «Подтвердить».</i>",
@@ -4261,6 +4670,16 @@ async def confirm_natural_command(callback: types.CallbackQuery):
         await callback.answer("Некорректное действие.", show_alert=True)
         return
 
+    plan = task["plan"]
+    capability = "points.grant" if plan["action"] == "credit" else "points.debit"
+    if not has_permission(callback.from_user.id, capability):
+        await callback.answer("Право на операцию отозвано.", show_alert=True)
+        return
+    if plan["action"] == "debit" and (
+            not 5 <= len(task.get("reason", "")) <= 200 or
+            plan["amount"] > debit_limit(callback.from_user.id)):
+        await callback.answer("Причина или лимит списания не подтверждены.", show_alert=True)
+        return
     # Claim the token before the first network await: double-click safe.
     task["status"] = "processing"
     await callback.answer("Проверяю Firebase и выполняю операцию...")
@@ -4296,7 +4715,8 @@ async def confirm_natural_command(callback: types.CallbackQuery):
         asyncio.create_task(record_admin_activity(
             "ai_grant" if plan["action"] == "credit" else "ai_debit",
             callback.from_user.id,
-            f"{target['nick']}: {sign}{plan['amount']}; op={task['operation_id']}",
+            f"{target['nick']}: {sign}{plan['amount']}; op={task['operation_id']}" +
+            (f"; причина: {task['reason']}" if plan["action"] == "debit" else ""),
             plan["sheet"]
         ))
     try:
@@ -4435,9 +4855,14 @@ async def agent_operation_from_text(message: types.Message, raw: str,
         await message.answer("⏳ Не более 5 новых операций в минуту.")
         return
     _AGENT_LIMIT[uid] = [*recent, now]
+    command_text, separator, debit_reason = raw.partition("|")
+    debit_reason = debit_reason.strip()
+    if forced_action == "debit" and not has_permission(uid, "points.debit"):
+        await message.answer("⛔ Списание доступно руководству или агентам с отдельным разрешением.")
+        return
     try:
         plan, target, alias, guessed, origin = await _agent_parse_and_resolve(
-            raw, forced_action=forced_action
+            command_text.strip(), forced_action=forced_action
         )
     except (ParseError, AgentOperationError) as exc:
         await message.answer("⚠️ " + html.escape(str(exc)))
@@ -4449,6 +4874,16 @@ async def agent_operation_from_text(message: types.Message, raw: str,
             "Балансы не изменились."
         )
         return
+    if plan["action"] == "debit":
+        if not has_permission(uid, "points.debit"):
+            await message.answer("⛔ Для списания нужно разрешение руководства.")
+            return
+        if not separator or not 5 <= len(debit_reason) <= 200:
+            await message.answer("⚠️ Для списания укажите причину после | (5–200 символов).")
+            return
+        if plan["amount"] > debit_limit(uid):
+            await message.answer(f"⚠️ Максимум за операцию для вашей роли: {debit_limit(uid)}.")
+            return
     if plan["action"] == "debit" and target["qty"] < plan["amount"]:
         await message.answer(
             "⚠️ Недостаточно баллов: сейчас " + str(target["qty"])
@@ -4458,7 +4893,8 @@ async def agent_operation_from_text(message: types.Message, raw: str,
     AGENT_CONFIRMATIONS[token] = {
         "uid": uid, "chat_id": message.chat.id, "created": now, "status": "new",
         "plan": plan, "target": target, "alias": alias,
-        "guessed": guessed, "raw": raw,
+        "guessed": guessed, "raw": command_text.strip(),
+        "reason": debit_reason if plan["action"] == "debit" else "",
         "op_id": "agent-" + uuid.uuid4().hex
     }
     for old_token, value in list(AGENT_CONFIRMATIONS.items()):
@@ -4473,6 +4909,8 @@ async def agent_operation_from_text(message: types.Message, raw: str,
                               callback_data=f"agentop:cancel:{token}")]
     ])
     text = _format_agent_operation(plan, target, alias, guessed)
+    if plan["action"] == "debit":
+        text += "\n📋 Причина: " + html.escape(debit_reason) + "\n"
     text += (
         "\n<i>После подтверждения баллы спишутся без решения руководства.</i>"
         if plan["action"] == "debit"
@@ -4513,13 +4951,16 @@ async def cmd_agent_min_plus(message: types.Message, state: FSMContext):
     if not remainder:
         await message.answer(
             f"📝 <b>FBI · {'Списание' if kind == 'min' else 'Запрос начисления'}</b>\n\n"
-            f"<code>/{kind} frp Gomez_Addams {'-2' if kind == 'min' else '+2'}</code>\n"
-            f"<code>/{kind} praise Gomez_Addams {'-1' if kind == 'min' else '+1'}</code>",
+            f"<code>/{kind} frp Gomez_Addams {'-2' if kind == 'min' else '+2'}{' | причина' if kind == 'min' else ''}</code>\n"
+            f"<code>/{kind} praise Gomez_Addams {'-1' if kind == 'min' else '+1'}{' | причина' if kind == 'min' else ''}</code>",
             parse_mode="HTML"
         )
         return
     try:
-        raw = parse_agent_slash(remainder[0], "debit" if kind == "min" else "credit")
+        command_text, delimiter, reason = remainder[0].partition("|")
+        raw = parse_agent_slash(command_text, "debit" if kind == "min" else "credit")
+        if delimiter:
+            raw += " | " + reason.strip()
     except AgentOperationError as exc:
         await message.answer("⚠️ " + html.escape(str(exc)))
         return
@@ -4562,9 +5003,15 @@ async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMConte
         if not profile:
             await callback.answer("Профиль ожидает подтверждения.", show_alert=True)
             return
+        plan = item["plan"]
+        if plan["action"] == "debit" and (
+                not has_permission(uid, "points.debit")
+                or plan["amount"] > debit_limit(uid)
+                or not 5 <= len(item.get("reason", "")) <= 200):
+            await callback.answer("Право, лимит или причина списания не подтверждены.", show_alert=True)
+            return
         item["status"] = "processing"
         await callback.answer("Проверяю данные Firebase...")
-        plan = item["plan"]
         if plan["action"] == "credit":
             await state.update_data(agent_add={
                 "plan": plan, "target": item["target"], "alias": item["alias"],
@@ -4591,7 +5038,8 @@ async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMConte
                 op_id=item["op_id"], actor_id=uid,
                 actor_nick=profile["nick"],
                 sheet=plan["sheet"], target=item["target"],
-                amount=plan["amount"], alias=item["alias"], raw=item["raw"]
+                amount=plan["amount"], alias=item["alias"], raw=item["raw"],
+                reason=item["reason"]
             )
             item["status"] = "done"
         except AgentOperationError as exc:
@@ -4613,7 +5061,8 @@ async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMConte
             "✅ <b>FBI · Агентское списание</b>\n\n"
             f"🎮 <code>{html.escape(item['target']['nick'])}</code>\n"
             f"🧮 −{plan['amount']} {'FRP' if plan['sheet'] == 'fractionrp' else 'похвал'}\n"
-            f"📊 Было: {audit['before']} · Стало: {audit['after']}\n\n"
+            f"📊 Было: {audit['before']} · Стало: {audit['after']}\n"
+            f"📋 Причина: {html.escape(item['reason'])}\n\n"
             "📜 Действие сохранено в отдельном журнале агентов.",
             parse_mode="HTML"
         )
@@ -4787,7 +5236,7 @@ async def notify_agent_request_reviewers(req):
 
 @dp.message(Command("agentpending"))
 async def cmd_agent_pending(message: types.Message):
-    if not _agent_private(message) or not is_admin(message.from_user.id):
+    if not _agent_private(message) or not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "reports.review"):
         await message.answer("⛔ Доступно только руководству в личном чате.")
         return
     try:
@@ -4818,7 +5267,7 @@ async def review_agent_add_request(callback: types.CallbackQuery):
     if (not isinstance(callback.message, types.Message)
             or callback.message.chat.type != "private"
             or callback.message.chat.id != callback.from_user.id
-            or not is_admin(callback.from_user.id)):
+            or not is_admin(callback.from_user.id) or not has_permission(callback.from_user.id, "reports.review")):
         await callback.answer("Нет прав руководства.", show_alert=True)
         return
     parts = (callback.data or "").split(":")
@@ -4882,7 +5331,7 @@ async def review_agent_add_request(callback: types.CallbackQuery):
 
 @dp.message(Command("agentlogs"))
 async def cmd_agent_logs(message: types.Message):
-    if not _agent_private(message) or not is_admin(message.from_user.id):
+    if not _agent_private(message) or not is_admin(message.from_user.id) or not has_permission(message.from_user.id, "agents.view"):
         await message.answer("⛔ Журнал действий доступен только руководству.")
         return
     try:
@@ -4955,7 +5404,7 @@ def _news_message(title, category, message):
 
 @dp.message(Command("news"))
 async def cmd_news(message: types.Message, state: FSMContext):
-    if not _agent_private(message) or not is_leader(message.from_user.id):
+    if not _agent_private(message) or not is_leader(message.from_user.id) or not has_permission(message.from_user.id, "news.publish"):
         await message.answer(
             "⛔ Публикация новостей доступна только владельцу и действующему лидеру."
         )
@@ -5063,7 +5512,7 @@ async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext)
     if (not isinstance(callback.message, types.Message)
             or callback.message.chat.type != "private"
             or callback.message.chat.id != callback.from_user.id
-            or not is_leader(callback.from_user.id)):
+            or not is_leader(callback.from_user.id) or not has_permission(callback.from_user.id, "news.publish")):
         await callback.answer("Недостаточно прав для рассылки.", show_alert=True)
         return
     uid = callback.from_user.id

@@ -82,6 +82,7 @@ def load_functions(names, extra=None):
         "types": types.SimpleNamespace(CallbackQuery=Callback, Message=Message),
         "InlineKeyboardButton": Button, "InlineKeyboardMarkup": Markup,
         "logger": Logger(), "is_admin": lambda uid: uid == 6060562962,
+        "has_permission": lambda uid, capability: uid == 6060562962,
     }
     if extra:
         env.update(extra)
