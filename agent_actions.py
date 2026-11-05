@@ -238,7 +238,7 @@ async def commit_agent_debit(client, session_factory, *,
 async def create_add_request(client, session_factory, *,
                              actor_id, actor_nick, sheet, target, amount,
                              reason="", evidence_kind="", evidence_id="",
-                             evidence_caption="", raw=""):
+                             evidence_caption="", raw="", target_alias=""):
     """Persist pending request and its agent log, with NO balance update."""
     _valid_sheet(sheet, amount)
     if not reason and not evidence_kind:
@@ -258,7 +258,8 @@ async def create_add_request(client, session_factory, *,
         "target": target, "amount": amount, "reason": reason,
         "evidence_kind": evidence_kind, "evidence_id": evidence_id,
         "evidence_caption": evidence_caption,
-        "raw": raw[:400], "created_at": now
+        "raw": raw[:400], "target_alias": str(target_alias)[:60],
+        "created_at": now
     }
     log = _log(op_id=event_id, action="credit_requested",
                actor_id=actor_id, actor_nick=actor_nick,
@@ -266,10 +267,12 @@ async def create_add_request(client, session_factory, *,
                request_id=request_id, reason=reason)
     headers = await _token(client)
     async with session_factory() as session:
-        await _commit(session, client, headers, [
+        status = await _commit(session, client, headers, [
             _create(client, f"{COLLECTION_REQUESTS}/{request_id}", req, now),
             _create(client, f"{COLLECTION_ACTIONS}/{event_id}", log, now)
         ])
+    if status != "applied":
+        raise AgentOperationError("Конфликт сохранения заявки. Повторите.")
     return req
 
 
