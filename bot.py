@@ -1753,7 +1753,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             return
         await callback.answer()
         await callback.message.answer(
-            "➖ <b>Списание</b>: <code>/min frp Gomez_Addams -2</code>\n"
+            "➖ <b>Списание</b>: <code>/min frp Gomez_Addams -2 | причина</code>\n"
             "➕ <b>Начисление</b>: <code>/plus praise Gomez_Addams +1</code>\n\n"
             "Можно также написать обычную фразу, например "
             "<code>Гомер -2 фрп</code>.\n"
@@ -4638,9 +4638,14 @@ async def agent_operation_from_text(message: types.Message, raw: str,
         await message.answer("⏳ Не более 5 новых операций в минуту.")
         return
     _AGENT_LIMIT[uid] = [*recent, now]
+    command_text, separator, debit_reason = raw.partition("|")
+    debit_reason = debit_reason.strip()
+    if forced_action == "debit" and not has_permission(uid, "points.debit"):
+        await message.answer("⛔ Списание доступно руководству или агентам с отдельным разрешением.")
+        return
     try:
         plan, target, alias, guessed, origin = await _agent_parse_and_resolve(
-            raw, forced_action=forced_action
+            command_text.strip(), forced_action=forced_action
         )
     except (ParseError, AgentOperationError) as exc:
         await message.answer("⚠️ " + html.escape(str(exc)))
@@ -4652,6 +4657,16 @@ async def agent_operation_from_text(message: types.Message, raw: str,
             "Балансы не изменились."
         )
         return
+    if plan["action"] == "debit":
+        if not has_permission(uid, "points.debit"):
+            await message.answer("⛔ Для списания нужно разрешение руководства.")
+            return
+        if not separator or not 5 <= len(debit_reason) <= 200:
+            await message.answer("⚠️ Для списания укажите причину после | (5–200 символов).")
+            return
+        if plan["amount"] > debit_limit(uid):
+            await message.answer(f"⚠️ Максимум за операцию для вашей роли: {debit_limit(uid)}.")
+            return
     if plan["action"] == "debit" and target["qty"] < plan["amount"]:
         await message.answer(
             "⚠️ Недостаточно баллов: сейчас " + str(target["qty"])
@@ -4661,7 +4676,8 @@ async def agent_operation_from_text(message: types.Message, raw: str,
     AGENT_CONFIRMATIONS[token] = {
         "uid": uid, "chat_id": message.chat.id, "created": now, "status": "new",
         "plan": plan, "target": target, "alias": alias,
-        "guessed": guessed, "raw": raw,
+        "guessed": guessed, "raw": command_text.strip(),
+        "reason": debit_reason if plan["action"] == "debit" else "",
         "op_id": "agent-" + uuid.uuid4().hex
     }
     for old_token, value in list(AGENT_CONFIRMATIONS.items()):
@@ -4676,6 +4692,8 @@ async def agent_operation_from_text(message: types.Message, raw: str,
                               callback_data=f"agentop:cancel:{token}")]
     ])
     text = _format_agent_operation(plan, target, alias, guessed)
+    if plan["action"] == "debit":
+        text += "\n📋 Причина: " + html.escape(debit_reason) + "\n"
     text += (
         "\n<i>После подтверждения баллы спишутся без решения руководства.</i>"
         if plan["action"] == "debit"
@@ -4716,13 +4734,16 @@ async def cmd_agent_min_plus(message: types.Message, state: FSMContext):
     if not remainder:
         await message.answer(
             f"📝 <b>FBI · {'Списание' if kind == 'min' else 'Запрос начисления'}</b>\n\n"
-            f"<code>/{kind} frp Gomez_Addams {'-2' if kind == 'min' else '+2'}</code>\n"
-            f"<code>/{kind} praise Gomez_Addams {'-1' if kind == 'min' else '+1'}</code>",
+            f"<code>/{kind} frp Gomez_Addams {'-2' if kind == 'min' else '+2'}{' | причина' if kind == 'min' else ''}</code>\n"
+            f"<code>/{kind} praise Gomez_Addams {'-1' if kind == 'min' else '+1'}{' | причина' if kind == 'min' else ''}</code>",
             parse_mode="HTML"
         )
         return
     try:
-        raw = parse_agent_slash(remainder[0], "debit" if kind == "min" else "credit")
+        command_text, delimiter, reason = remainder[0].partition("|")
+        raw = parse_agent_slash(command_text, "debit" if kind == "min" else "credit")
+        if delimiter:
+            raw += " | " + reason.strip()
     except AgentOperationError as exc:
         await message.answer("⚠️ " + html.escape(str(exc)))
         return
@@ -4765,9 +4786,15 @@ async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMConte
         if not profile:
             await callback.answer("Профиль ожидает подтверждения.", show_alert=True)
             return
+        plan = item["plan"]
+        if plan["action"] == "debit" and (
+                not has_permission(uid, "points.debit")
+                or plan["amount"] > debit_limit(uid)
+                or not 5 <= len(item.get("reason", "")) <= 200):
+            await callback.answer("Право, лимит или причина списания не подтверждены.", show_alert=True)
+            return
         item["status"] = "processing"
         await callback.answer("Проверяю данные Firebase...")
-        plan = item["plan"]
         if plan["action"] == "credit":
             await state.update_data(agent_add={
                 "plan": plan, "target": item["target"], "alias": item["alias"],
@@ -4794,7 +4821,8 @@ async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMConte
                 op_id=item["op_id"], actor_id=uid,
                 actor_nick=profile["nick"],
                 sheet=plan["sheet"], target=item["target"],
-                amount=plan["amount"], alias=item["alias"], raw=item["raw"]
+                amount=plan["amount"], alias=item["alias"], raw=item["raw"],
+                reason=item["reason"]
             )
             item["status"] = "done"
         except AgentOperationError as exc:
@@ -4816,7 +4844,8 @@ async def agent_operation_confirm(callback: types.CallbackQuery, state: FSMConte
             "✅ <b>FBI · Агентское списание</b>\n\n"
             f"🎮 <code>{html.escape(item['target']['nick'])}</code>\n"
             f"🧮 −{plan['amount']} {'FRP' if plan['sheet'] == 'fractionrp' else 'похвал'}\n"
-            f"📊 Было: {audit['before']} · Стало: {audit['after']}\n\n"
+            f"📊 Было: {audit['before']} · Стало: {audit['after']}\n"
+            f"📋 Причина: {html.escape(item['reason'])}\n\n"
             "📜 Действие сохранено в отдельном журнале агентов.",
             parse_mode="HTML"
         )
