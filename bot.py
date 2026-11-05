@@ -24,8 +24,9 @@ from agent_actions import (
     AgentOperationError, commit_agent_debit, create_add_request, get_add_request,
     decide_add_request, list_collection, create_announcement, finish_announcement
 )
-from telegram_design import (send_fbi_card, edit_fbi_card,
-                             hide_old_reply_keyboard, with_home_button)
+from telegram_design import (send_fbi_card, send_home_banner_card,
+                             edit_fbi_card, hide_old_reply_keyboard,
+                             with_home_button)
 
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command, CommandStart
@@ -1366,7 +1367,7 @@ async def cmd_menu(message: types.Message, state: FSMContext):
         await cmd_start(message, state)
         return
     await sync_user_command_scope(user_id)
-    await send_fbi_card(
+    await send_home_banner_card(
         message, home_card_text(profile, user_id),
         reply_markup=get_main_menu(user_id), lea=True
     )
@@ -1471,7 +1472,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         await state.set_state(RegistrationStates.waiting_for_nick)
     else:
-        await send_fbi_card(
+        await send_home_banner_card(
             message,
             home_card_text(user_data, message.from_user.id),
             reply_markup=get_main_menu(message.from_user.id),
@@ -1555,7 +1556,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("Для начала регистрации используйте /start.", show_alert=True)
             return
         await state.clear()
-        await send_fbi_card(
+        await send_home_banner_card(
             callback.message, home_card_text(profile, uid),
             reply_markup=get_main_menu(uid), lea=True
         )
@@ -1631,7 +1632,7 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
         if not isinstance(profile, dict) or not profile.get("nick"):
             await callback.answer("Сначала зарегистрируйтесь через /start.", show_alert=True)
             return
-        await send_fbi_card(
+        await send_home_banner_card(
             callback.message, home_card_text(profile, uid),
             reply_markup=get_main_menu(uid), lea=True
         )
