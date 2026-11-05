@@ -363,7 +363,8 @@ async def list_collection(client, session_factory, collection, *, limit=40):
     headers = await _token(client)
     url = _url(client, collection)
     async with session_factory() as session:
-        async with session.get(url, headers=headers, params={"pageSize": min(limit, 100)}) as response:
+        async with session.get(url, headers=headers, params={"pageSize": min(limit, 100),
+                                                         "orderBy": "createdAt desc"}) as response:
             if response.status == 404:
                 return []
             if response.status != 200:
