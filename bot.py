@@ -3323,37 +3323,115 @@ class AgentPanelStates(StatesGroup):
 
 
 async def remove_agent_everywhere(nick: str) -> bool:
-    """Remove an unneeded agent only when its two outstanding balances are zero."""
+    """Atomically remove zero-balance rows AND the cloud Telegram profile.
+
+    A single Firestore commit covers both sheets and config/bot_state. On any
+    conflict all changes are rejected, not half-applied.
+    """
     if not _cloud_state_hydrated:
         raise RuntimeError("Cannot delete agents before cloud state is loaded")
     if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", nick):
         raise ValueError("Invalid agent nickname")
-    matches = [(uid, entry) for uid, entry in users_db.items()
-               if isinstance(entry, dict)
-               and str(entry.get("nick", "")).casefold() == nick.casefold()]
-    if any(uid.isdecimal() and (int(uid) in OWNER_TELEGRAM_IDS or int(uid) in admins_db)
-           for uid, _ in matches):
-        raise ValueError("Нельзя удалить руководство через очистку агентов.")
-    # Verify balances before touching any persistent data.
-    rows_by_sheet = await asyncio.gather(
-        firebase_client.get_sheet("fractionrp"), firebase_client.get_sheet("praise")
-    )
-    for rows in rows_by_sheet:
-        if any(str(row.get("nick", "")).casefold() == nick.casefold() and
-               int(row.get("qty") or 0) != 0 for row in rows):
-            raise ValueError("У агента есть ненулевой баланс. Очистка отменена.")
+    base = (f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}"
+            "/databases/(default)/documents")
+    async with _state_sync_lock:
+        token = await firebase_client.get_token()
+        if not token:
+            raise RuntimeError("Firebase authentication unavailable")
+        headers = {"Authorization": f"Bearer {token}",
+                   "Content-Type": "application/json"}
+        for retry in range(5):
+            async with ClientSession(timeout=ClientTimeout(total=25)) as session:
+                async def read(path):
+                    async with session.get(base + "/" + path, headers=headers) as response:
+                        if response.status != 200:
+                            raise RuntimeError(f"Firestore read failed: {response.status}")
+                        doc = await response.json()
+                        if not doc.get("updateTime"):
+                            raise RuntimeError("Firestore revision missing")
+                        return doc
 
-    # Each sheet uses updateTime to avoid overwriting concurrent grants.
-    for sheet in ("fractionrp", "praise"):
-        if not await firebase_client.remove_zero_balance_agent(sheet, nick):
-            raise ValueError("Баланс изменился. Удаление отменено.")
-
-    for uid, _ in matches:
-        users_db.pop(uid, None)
-    if matches:
-        save_json(USERS_FILE, users_db)
-        await sync_state_to_cloud()
-    return True
+                paths = ("config/bot_state", "sheets/fractionrp", "sheets/praise")
+                records = await asyncio.gather(*(read(path) for path in paths))
+                docs = dict(zip(paths, records))
+                raw = docs["config/bot_state"].get("fields", {}).get(
+                    "data", {}).get("stringValue", "")
+                state = json.loads(raw)
+                users = state.get("users")
+                cloud_admins = state.get("admins", [])
+                cloud_roles = state.get("admin_roles", {})
+                if not isinstance(users, dict) or not isinstance(cloud_admins, list) or not isinstance(cloud_roles, dict):
+                    raise RuntimeError("Invalid cloud state")
+                if not hmac.compare_digest(
+                    str(state.get("admin_acl_signature") or ""),
+                    sign_admin_permissions(cloud_admins, cloud_roles)
+                ):
+                    raise RuntimeError("Unverified cloud administrator ACL")
+                matches = [(uid, profile) for uid, profile in users.items()
+                           if isinstance(profile, dict)
+                           and str(profile.get("nick") or "").casefold() == nick.casefold()]
+                protected = OWNER_TELEGRAM_IDS | set(admins_db)
+                protected.update(uid for uid in cloud_admins if type(uid) is int and uid > 0)
+                if any(str(uid).isdecimal() and int(uid) in protected for uid, _ in matches):
+                    raise ValueError("Нельзя удалять руководство через очистку агентов.")
+                sheet_updates = {}
+                for sheet in ("fractionrp", "praise"):
+                    doc = docs["sheets/" + sheet]
+                    rows = firebase_client._parse_firestore_rows(
+                        doc.get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", []))
+                    target_rows = [row for row in rows
+                                   if str(row.get("nick") or "").casefold() == nick.casefold()]
+                    if any(int(row.get("qty") or 0) != 0 for row in target_rows):
+                        raise ValueError("У агента есть ненулевой баланс. Очистка отменена.")
+                    sheet_updates[sheet] = [row for row in rows if row not in target_rows]
+                if not matches and all(len(sheet_updates[sheet]) ==
+                                       len(firebase_client._parse_firestore_rows(
+                                           docs["sheets/" + sheet].get("fields", {}).get("rows", {}).get("arrayValue", {}).get("values", [])))
+                                       for sheet in ("fractionrp", "praise")):
+                    return True
+                for uid, _ in matches:
+                    users.pop(uid, None)
+                state["users"] = users
+                now = datetime.now(timezone.utc).isoformat()
+                writes = []
+                for sheet in ("fractionrp", "praise"):
+                    path = "sheets/" + sheet
+                    writes.append({
+                        "update": {
+                            "name": f"projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/{path}",
+                            "fields": {
+                                "rows": {"arrayValue": {"values": [
+                                    firebase_client._row_to_firestore(row) for row in sheet_updates[sheet]
+                                ]}},
+                                "updatedAt": {"timestampValue": now}
+                            }
+                        },
+                        "updateMask": {"fieldPaths": ["rows", "updatedAt"]},
+                        "currentDocument": {"updateTime": docs[path]["updateTime"]}
+                    })
+                writes.append({
+                    "update": {
+                        "name": f"projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/config/bot_state",
+                        "fields": {
+                            "data": {"stringValue": json.dumps(state, ensure_ascii=False)},
+                            "updatedAt": {"timestampValue": now}
+                        }
+                    },
+                    "updateMask": {"fieldPaths": ["data", "updatedAt"]},
+                    "currentDocument": {"updateTime": docs["config/bot_state"]["updateTime"]}
+                })
+                async with session.post(base + ":commit", headers=headers,
+                                        json={"writes": writes}) as response:
+                    if response.status == 200:
+                        users_db.clear()
+                        users_db.update(users)
+                        save_json(USERS_FILE, users_db)
+                        return True
+                    if response.status not in (409, 412):
+                        raise RuntimeError(
+                            f"Firestore atomic removal rejected: HTTP {response.status}")
+            await asyncio.sleep(0.12 * (retry + 1))
+    raise RuntimeError("Concurrent changes prevented atomic deletion")
 
 
 def agent_hash(nick: str) -> str:
