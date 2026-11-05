@@ -4961,19 +4961,36 @@ async def confirm_news_publish(callback: types.CallbackQuery, state: FSMContext)
         if callback.data != f"newspublish:{data['nonce']}":
             await callback.answer("Кнопка устарела.", show_alert=True)
             return
-        await state.clear()
         recipients = [int(x) for x in data["recipients"] if int(x) > 0]
         try:
             news = await create_announcement(
                 firebase_client, ClientSession, actor_id=uid,
                 title=data["title"], category=data["category"],
-                message=data["message"], recipients=len(recipients)
+                message=data["message"], recipients=len(recipients),
+                news_id="news-" + data["nonce"]
             )
-        except Exception as exc:
-            logger.warning("News persistence failed: %s", type(exc).__name__)
-            await callback.answer("Не удалось сохранить рассылку. Проверьте /newslog.",
-                                  show_alert=True)
+        except AgentOperationError as exc:
+            # Keep the preview/confirmation state intact on a failed write,
+            # so the owner can publish the right Firestore Rules and retry.
+            # No recipients were contacted and no balance state was changed.
+            logger.warning("News persistence blocked: %s", exc)
+            reason = str(exc)
+            await callback.answer(
+                ("⚠️ Новость не отправлена. " + reason)[:195],
+                show_alert=True
+            )
             return
+        except Exception as exc:
+            logger.warning("News persistence exception: %s", type(exc).__name__)
+            await callback.answer(
+                "⚠️ Firebase не подтвердила запись. "
+                "Новость не рассылалась; проверьте /newslog.",
+                show_alert=True
+            )
+            return
+        # Only clear draft after the durable journal is confirmed.
+        # With the same nonce, a retry cannot generate another journal record.
+        await state.clear()
         await callback.answer("Рассылка сохранена, начинаю отправку.")
         await callback.message.edit_text(
             "📣 <b>Рассылка началась</b>\n\n"
