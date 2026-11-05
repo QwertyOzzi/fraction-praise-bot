@@ -33,9 +33,19 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _base(client):
-    return (f"https://firestore.googleapis.com/v1/projects/{client.project_id}"
+def _resource_name(client, path=""):
+    """Firestore document resource name, without HTTP origin or API version.
+
+    Used INSIDE Write.update.name, never as a network request URL.
+    """
+    name = (f"projects/{client.project_id}"
             "/databases/(default)/documents")
+    return name + ("/" + path if path else "")
+
+
+def _base(client):
+    """HTTP endpoint prefix, used only for REST requests."""
+    return "https://firestore.googleapis.com/v1/" + _resource_name(client)
 
 
 def _url(client, path):
@@ -94,7 +104,7 @@ def _decode(doc):
 def _create(client, path, payload, when=None):
     return {
         "update": {
-            "name": f"{_base(client)}/{path}",
+            "name": _resource_name(client, path),
             "fields": _doc_fields(payload, when)
         },
         "currentDocument": {"exists": False}
@@ -104,7 +114,7 @@ def _create(client, path, payload, when=None):
 def _replace(client, path, revision, payload):
     return {
         "update": {
-            "name": f"{_base(client)}/{path}",
+            "name": _resource_name(client, path),
             "fields": {
                 "payload": {"stringValue": json.dumps(payload, ensure_ascii=False)},
                 "updatedAt": {"timestampValue": timestamp()}
@@ -127,7 +137,7 @@ def _sheet_update(client, sheet, revision, rows, *, aliases=None):
         fields[MEMORY_FIELD] = {"stringValue": encode_alias_book(aliases)}
         mask.append(MEMORY_FIELD)
     return {
-        "update": {"name": f"{_base(client)}/sheets/{sheet}", "fields": fields},
+        "update": {"name": _resource_name(client, f"sheets/{sheet}"), "fields": fields},
         "updateMask": {"fieldPaths": mask},
         "currentDocument": {"updateTime": revision}
     }
