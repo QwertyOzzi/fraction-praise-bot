@@ -5,7 +5,7 @@ import unittest
 
 from natural_commands import (
     MODEL, ParseError, interpret, looks_like_operation, resolve_names,
-    simple_parse, validate_plan
+    simple_parse, split_operation_reason, natural_phrase_parse, validate_plan
 )
 
 
@@ -39,6 +39,39 @@ class TestFastParser(unittest.IsolatedAsyncioTestCase):
             "action": "credit", "sheet": "fractionrp", "amount": 1,
             "names": ["нортон", "гоммез", "кударов"]
         })
+
+    async def test_inline_debit_reason_works_offline(self):
+        async def must_not_call_gemini(*args):
+            raise AssertionError("Screenshot input should not need Gemini")
+        command_text, reason, has_reason = split_operation_reason(
+            "кудак -1 фрп выдал в игре"
+        )
+        self.assertTrue(has_reason)
+        self.assertEqual(reason, "выдал в игре")
+        plan, origin = await interpret(command_text, "", must_not_call_gemini)
+        self.assertEqual(origin, "local")
+        self.assertEqual(plan["action"], "debit")
+        self.assertEqual(plan["amount"], 1)
+        self.assertEqual(plan["names"], ["кудак"])
+
+    def test_explicit_and_reversed_reason_formats(self):
+        for raw in (
+            "кудак -1 фрп | выдал в игре",
+            "кудак фрп -1 выдал в игре",
+            "сними у кудака один фрп выдал в игре",
+        ):
+            command, reason, has_reason = split_operation_reason(raw)
+            self.assertTrue(has_reason, raw)
+            self.assertEqual(reason, "выдал в игре")
+            self.assertIsNotNone(simple_parse(command) or natural_phrase_parse(command))
+
+    def test_ambiguous_command_does_not_extract_reason(self):
+        command, reason, has_reason = split_operation_reason(
+            "кудак -1 фрп и гоммез -2 фрп выдал в игре"
+        )
+        self.assertFalse(has_reason)
+        self.assertEqual(reason, "")
+        self.assertIn("гоммез", command)
 
     def test_reverse_order_with_minus_and_praise(self):
         result = simple_parse("Samuel_Norton; Gomez_Addams похвалы −2")
@@ -161,9 +194,10 @@ class TestGeminiFallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn(MODEL, called[0][0])
         self.assertEqual(
             called[0][2]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "low"
+            "high"
         )
-        self.assertGreaterEqual(called[0][2]["generationConfig"]["maxOutputTokens"], 1000)
+        self.assertGreaterEqual(called[0][2]["generationConfig"]["maxOutputTokens"], 8192)
+        self.assertNotIn("temperature", called[0][2]["generationConfig"])
         self.assertEqual(called[0][1]["x-goog-api-key"], "mock-key")
         self.assertNotIn("Telegram ID", called[0][2]["contents"][0]["parts"][0]["text"])
 
