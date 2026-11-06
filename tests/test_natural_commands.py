@@ -264,6 +264,55 @@ class TestNickResolver(unittest.TestCase):
         self.assertFalse(matched)
         self.assertTrue(errors)
 
+    def test_russian_clyde_carbon_pronunciation_matches_latin(self):
+        rows = [
+            {"id": "c1", "nick": "Clyde_Carbon", "profileId": "person-clyde",
+             "rank": "8", "qty": 3},
+            {"id": "g1", "nick": "Gomez_Addams", "profileId": "person-gomez",
+             "rank": "8", "qty": 5},
+        ]
+        for alias in ("Клайд Карбон", "клайду карбону",
+                      "Клайду_Карбону", "клайд", "карбон",
+                      "Clyde_Carbon", "Клайд_Carbon"):
+            matches, errors = resolve_names([alias], rows)
+            self.assertEqual(errors, [], alias)
+            self.assertEqual(matches[0]["nick"], "Clyde_Carbon", alias)
+
+    def test_full_phonetic_name_is_more_specific_than_first_name(self):
+        rows = [
+            {"id": "c1", "nick": "Clyde_Carbon", "qty": 4},
+            {"id": "c2", "nick": "Clyde_Smith", "qty": 5},
+        ]
+        matches, errors = resolve_names(["Клайду Карбону"], rows)
+        self.assertEqual(errors, [])
+        self.assertEqual(matches[0]["id"], "c1")
+        matches, errors = resolve_names(["клайду"], rows)
+        self.assertEqual(matches, [])
+        self.assertTrue(any("несколько" in err for err in errors))
+
+    def test_full_name_is_not_guessed_from_only_one_matching_token(self):
+        rows = [{"id": "c1", "nick": "Clyde_Carbon", "qty": 4}]
+        for alias in ("клайду соснову", "незнакомый карбону",
+                      "клайду карбону неизвестный"):
+            matches, errors = resolve_names([alias], rows)
+            self.assertEqual(matches, [], alias)
+            self.assertTrue(errors, alias)
+
+    async def test_screenshot_input_with_reason_no_api(self):
+        async def no_gemini(*args):
+            raise AssertionError("Name spelling and reason do not require Gemini")
+        for raw in ("клайду +1 фрп проверка",
+                    "клайду карбону +1 фрп причина тест",
+                    "Клайд_Карбон +1 фрп причина тест",
+                    "Clyde_Carbon +1 фрп причина тест"):
+            command, reason, delimiter = split_operation_reason(raw)
+            self.assertTrue(delimiter, raw)
+            self.assertTrue(reason, raw)
+            plan, origin = await interpret(command, "", no_gemini)
+            self.assertEqual(plan["sheet"], "fractionrp")
+            self.assertEqual(plan["amount"], 1)
+            self.assertEqual(origin, "local")
+
     def test_duplicate_nick_in_sheet_is_unsafe(self):
         rows = self.rows + [{"nick": "Gomez_Addams", "id": "copy", "qty": 5}]
         matched, errors = resolve_names(["гоммез"], rows)
