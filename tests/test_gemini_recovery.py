@@ -98,7 +98,7 @@ class TestGeminiRecovery(unittest.IsolatedAsyncioTestCase):
 
     async def test_permanent_overload_fails_readably(self):
         self.responses[:] = [503, 500, 503]
-        with self.assertRaisesRegex(ParseError, "повторные попытки"):
+        with self.assertRaisesRegex(ParseError, "Повторные попытки"):
             await self.request()
         self.assertEqual(len(self.calls), 3)
 
