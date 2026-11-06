@@ -6,10 +6,14 @@ fresh authoritative Firestore rows before an operation can be proposed.
 """
 import difflib
 import json
+import os
 import re
 from typing import Any
 
 MODEL = "gemini-3.8-flash"
+THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "high").strip().lower()
+if THINKING_LEVEL not in ("low", "medium", "high"):
+    THINKING_LEVEL = "high"
 MAX_TEXT = 400
 MAX_NAMES = 10
 MAX_AMOUNT = 20
@@ -57,6 +61,36 @@ def _plain_minus(text: str) -> str:
     return text.replace("−", "-").replace("–", "-")
 
 
+def split_operation_reason(raw: str) -> tuple[str, str, bool]:
+    """Separate a free-text reason from a valid balance command.
+
+    Also supports: "Кудак -1 фрп выдал в игре" (without the | separator).
+    Unknown or ambiguous text is left for the ordinary interpreter.
+    """
+    raw = (raw or "").strip()
+    command, separator, reason = raw.partition("|")
+    if separator:
+        return command.strip(), reason.strip(), True
+    if not raw or len(raw) > MAX_TEXT:
+        return raw, "", False
+    for ending in (
+        rf"{_KIND_PATTERN}\s*[+-]\s*\d{{1,2}}",
+        _KIND_PATTERN,
+    ):
+        match = re.fullmatch(
+            rf"(?P<command>.+?{ending})[ \t]+(?P<reason>[^|\n]{{5,200}})",
+            _plain_minus(raw), re.I,
+        )
+        if not match:
+            continue
+        candidate = match["command"].strip()
+        trailing = match["reason"].strip()
+        if (5 <= len(trailing) <= 200 and not looks_like_operation(trailing)
+                and (simple_parse(candidate) or natural_phrase_parse(candidate))):
+            return candidate, trailing, True
+    return raw, "", False
+
+
 def looks_like_operation(text: str) -> bool:
     """Intercept plausible balance commands, not ordinary bot conversation."""
     if not text or text.lstrip().startswith("/") or len(text) > MAX_TEXT:
@@ -82,8 +116,8 @@ def simple_parse(text: str) -> dict[str, Any] | None:
     if match is None:
         return None
     name_segment = match["names"].strip()
-    if _VERB.match(name_segment):
-        # Conversational instructions are not nicknames; send to Gemini.
+    if _VERB.match(name_segment) or looks_like_operation(name_segment):
+        # A nickname must not contain a second embedded balance command.
         return None
     names = [name.strip() for name in re.split(r"[,;]", name_segment) if name.strip()]
     if not names:
@@ -206,9 +240,8 @@ async def interpret(text: str, api_key: str, request):
         "systemInstruction": {"parts": [{"text": prompt}]},
         "contents": [{"role": "user", "parts": [{"text": text}]}],
         "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": 1024,
-            "thinkingConfig": {"thinkingLevel": "low"},
+            "maxOutputTokens": 8192,
+            "thinkingConfig": {"thinkingLevel": THINKING_LEVEL},
             "responseMimeType": "application/json",
             "responseSchema": {
                 "type": "OBJECT",
@@ -231,6 +264,7 @@ async def interpret(text: str, api_key: str, request):
         text_json = "".join(
             part.get("text", "")
             for part in api_response["candidates"][0]["content"]["parts"]
+            if isinstance(part, dict) and not part.get("thought")
         )
         if not text_json or len(text_json) > MAX_RESPONSE:
             raise ValueError("bad output size")
