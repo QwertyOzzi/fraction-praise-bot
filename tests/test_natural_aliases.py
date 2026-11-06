@@ -35,6 +35,28 @@ class TestAliases(unittest.TestCase):
         self.assertEqual([r["nick"] for r in matches],
                          ["Samuel_Norton", "Gomez_Addams"])
 
+    def test_unlearned_cyrillic_full_name_matches_unique_live_record(self):
+        rows = [{"nick": "Clyde_Carbon", "profileId": "c" * 32,
+                 "id": "row-clyde", "qty": 2, "rank": "8"}]
+        matches, errors = resolve_with_memory(
+            ["клайду карбону"], rows, {}, "fractionrp"
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(matches[0]["nick"], "Clyde_Carbon")
+
+    def test_ambiguous_cyrillic_alias_does_not_override_memory_policy(self):
+        rows = [
+            {"nick": "Clyde_Carbon", "profileId": "c" * 32,
+             "id": "row-clyde", "qty": 2},
+            {"nick": "Clyde_Smith", "profileId": "s" * 32,
+             "id": "row-smith", "qty": 3}
+        ]
+        matches, errors = resolve_with_memory(
+            ["клайду"], rows, {}, "fractionrp"
+        )
+        self.assertFalse(matches)
+        self.assertTrue(errors)
+
     def test_other_sheet_can_reuse_verified_profile_id(self):
         saved = learn()
         praise_rows = [
