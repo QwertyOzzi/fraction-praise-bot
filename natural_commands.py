@@ -274,48 +274,103 @@ async def interpret(text: str, api_key: str, request):
     return validate_plan(obj, original=text), "gemini"
 
 
-def _candidate_score(alias: str, nick: str) -> tuple[int, float] | None:
-    """Only exact, distinctive prefix or a single typo may match a player."""
-    key = simplified(alias)
-    if len(key) < 4:
+def _phonetic_word(word: str) -> str:
+    """Conservative English/Russian nickname equivalences, not a broad guess.
+
+    For example, Clyde = Клайд and Carbon = Карбон. Applied to individual
+    name tokens only, so a first name cannot accidentally absorb a surname.
+    """
+    value = simplified(word)
+    value = re.sub(r"^c(?=[aoulyr])", "k", value)
+    value = re.sub(r"y(?=de$)", "ay", value)
+    value = re.sub(r"ayde$", "ayd", value)
+    return value
+
+
+def _alias_forms(word: str) -> list[str]:
+    """Generate inflected Russian-name variants alongside the literal form."""
+    word = word.casefold()
+    forms = [simplified(word)]
+    if re.fullmatch(r"[а-яё]{5,40}", word):
+        if word.endswith(("ом", "ем")) and len(word) >= 7:
+            forms.append(simplified(word[:-2]))
+        if word.endswith(("а", "у", "е", "ы", "ю", "я")) and len(word) >= 5:
+            forms.append(simplified(word[:-1]))
+    return list(dict.fromkeys(forms))
+
+
+def _token_score(alias_token: str, nick_token: str) -> tuple[int, float] | None:
+    """Score a single name component, rejecting short or weak guesses."""
+    real = simplified(nick_token)
+    if not real:
         return None
-    full = simplified(nick)
-    tokens = [simplified(p) for p in re.split(r"[_\s]+", nick)]
-    # Typical Russian grammatical forms ("гоммезу", "нортона") can be
-    # recognized locally. Exact names always outrank inflected forms.
-    variants = [key]
-    if re.fullmatch(r"[а-яё]{5,40}", alias.casefold()):
-        stem = alias.casefold()
-        if stem.endswith(("ом", "ем")) and len(stem) >= 7:
-            variants.append(simplified(stem[:-2]))
-        elif stem.endswith(("а", "у", "е", "ы", "ю", "я")) and len(stem) >= 6:
-            variants.append(simplified(stem[:-1]))
     best = None
-    for form in variants:
-        if form == full:
-            candidate = (4 if form == key else 2, 1.0)
-        elif form in tokens:
-            candidate = (3 if form == key else 2, 1.0)
-        elif len(form) >= 4 and any(
-                t.startswith(form) and len(form) >= len(t) - 2
-                for t in tokens):
+    for form in _alias_forms(alias_token):
+        if len(form) < 4:
+            continue
+        if form == real:
+            candidate = (4, 1.0)
+        elif _phonetic_word(form) == _phonetic_word(real):
+            candidate = (3, 1.0)
+        elif real.startswith(form) and len(form) >= len(real) - 2:
             candidate = (2, 1.0)
+        elif len(form) >= 5 and abs(len(form) - len(real)) <= 1:
+            similarity = difflib.SequenceMatcher(None, form, real).ratio()
+            candidate = (1, similarity) if similarity >= 0.82 else None
         else:
             candidate = None
-            if len(form) >= 5:
-                for token in tokens:
-                    if abs(len(form) - len(token)) <= 1:
-                        similarity = difflib.SequenceMatcher(
-                            None, form, token
-                        ).ratio()
-                        if similarity >= 0.82:
-                            score = (1, similarity)
-                            if candidate is None or score > candidate:
-                                candidate = score
-        if candidate is not None and (best is None or candidate > best):
+        if candidate and (best is None or candidate > best):
             best = candidate
     return best
 
+
+def _candidate_score(alias: str, nick: str) -> tuple[int, float] | None:
+    """Match exact, phonetic and inflected nicknames, always resolving uniquely.
+
+    A full first + last name must match BOTH distinct tokens. Single-word
+    aliases are permitted only if the entire active sheet has one best match.
+    """
+    key = simplified(alias)
+    if len(key) < 4:
+        return None
+    if key == simplified(nick):
+        return (6, 1.0)
+    alias_tokens = [x for x in re.split(r"[_\s]+", alias.strip()) if x]
+    nick_tokens = [x for x in re.split(r"[_\s]+", nick.strip()) if x]
+    if not alias_tokens or len(alias_tokens) > 3:
+        return None
+    if len(alias_tokens) == 1:
+        return max(
+            (score for token in nick_tokens
+             if (score := _token_score(alias_tokens[0], token)) is not None),
+            default=None,
+        )
+    if len(alias_tokens) > len(nick_tokens):
+        return None
+
+    # Search for a distinct target token for each supplied name part.
+    def match_all(index: int, used: frozenset[int], weakest: int) -> int:
+        if index == len(alias_tokens):
+            return weakest
+        best = 0
+        for j, token in enumerate(nick_tokens):
+            if j in used:
+                continue
+            score = _token_score(alias_tokens[index], token)
+            if score is not None:
+                best = max(best, match_all(
+                    index + 1, used | {j}, min(weakest, score[0])
+                ))
+        return best
+
+    lowest = match_all(0, frozenset(), 4)
+    if lowest >= 3:
+        return (5, 1.0)  # Every supplied name component matched strongly.
+    if lowest == 2:
+        return (3, 1.0)  # Full name with a minor abbreviation.
+    if lowest == 1:
+        return (1, 1.0)  # A typo in a complete name; still must be unique.
+    return None
 
 def resolve_names(names: list[str], available_rows: list[dict]) -> tuple[list[dict], list[str]]:
     """Resolve ONLY against the selected Firestore sheet; no invented agents."""
