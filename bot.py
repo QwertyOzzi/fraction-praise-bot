@@ -11,12 +11,13 @@ import difflib
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import web, ClientSession, ClientTimeout, ClientError
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile, resolve_nickname_claim
 from natural_commands import (interpret as interpret_natural, resolve_names,
-                              looks_like_operation, simple_parse, ParseError, MODEL)
+                              looks_like_operation, simple_parse, split_operation_reason,
+                              ParseError, MODEL)
 from natural_balance import apply_batch, BalanceConflict
 from natural_aliases import load_alias_memory, resolve_with_memory, AliasMemoryError
 from natural_commands import simplified
@@ -4545,36 +4546,83 @@ AI_CONFIRM_TTL = 5 * 60
 
 
 async def gemini_json_request(url: str, headers: dict, body: dict) -> dict:
-    """Call Gemini with a bounded timeout and safe, actionable error messages."""
+    """Retry transient Google API failures with a second stable Flash model.
+
+    No balance changes happen here. Never log request headers, text, or secrets.
+    """
+    fallback = url.replace(
+        f"/models/{MODEL}:generateContent",
+        "/models/gemini-3.7-flash:generateContent",
+    )
+    attempts = [url, url]
+    if fallback != url:
+        attempts.append(fallback)
     async with _AI_SEMAPHORE:
         try:
-            # Gemini 3.8 can spend time on internal reasoning; thinkingLevel=low
-            # reduces latency. Keep a finite read timeout so polling stays live.
-            async with ClientSession(
-                timeout=ClientTimeout(total=45, connect=10, sock_read=40)
-            ) as session:
-                async with session.post(url, headers=headers, json=body) as response:
-                    if response.status == 429:
-                        raise ParseError("Лимит Gemini исчерпан. Попробуйте позже.")
-                    if response.status in (401, 403):
-                        raise ParseError("Gemini API-ключ недействителен или недоступен модели.")
-                    if response.status == 404:
-                        raise ParseError(f"Модель {MODEL} недоступна для этого API-ключа.")
-                    if response.status == 400:
-                        logger.warning("Gemini rejected request with HTTP 400; check model request schema")
-                        raise ParseError("Gemini отклонил формат запроса. Обратитесь к владельцу бота.")
-                    if response.status >= 500:
-                        raise ParseError("Сервис Gemini временно недоступен. Попробуйте позже.")
-                    if response.status != 200:
-                        raise ParseError("Gemini не принял запрос. Проверьте доступ и лимиты API.")
-                    return await response.json()
+            # Bound total wait even when Google repeatedly times out.
+            async with asyncio.timeout(105):
+                for index, attempt_url in enumerate(attempts):
+                    try:
+                        async with ClientSession(
+                            timeout=ClientTimeout(total=48, connect=10, sock_read=43)
+                        ) as session:
+                            async with session.post(
+                                attempt_url, headers=headers, json=body
+                            ) as response:
+                                status = response.status
+                                if status == 200:
+                                    return await response.json()
+                                if status == 429:
+                                    raise ParseError(
+                                        "Превышены лимиты или квота Gemini API. "
+                                        "Проверьте квоты Google AI Studio."
+                                    )
+                                if status in (401, 403):
+                                    raise ParseError(
+                                        "Нет доступа к Gemini API. Проверьте ключ "
+                                        "GEMINI_API_KEY и разрешения модели."
+                                    )
+                                if status == 400:
+                                    logger.warning("Gemini rejected request: HTTP 400")
+                                    raise ParseError(
+                                        "Gemini отклонил параметры запроса (HTTP 400). "
+                                        "Проверьте конфигурацию модели в Render."
+                                    )
+                                if status not in (404, 500, 502, 503, 504):
+                                    raise ParseError(
+                                        f"Gemini отклонил запрос (HTTP {status})."
+                                    )
+                                logger.warning(
+                                    "Gemini API transient response: HTTP %s, attempt %s/%s",
+                                    status, index + 1, len(attempts),
+                                )
+                                if index == len(attempts) - 1:
+                                    if status == 404:
+                                        raise ParseError(
+                                            "Модели Gemini недоступны для этого ключа. "
+                                            "Проверьте доступ в Google AI Studio."
+                                        )
+                                    raise ParseError(
+                                        "Gemini временно перегружен (HTTP 5xx). "
+                                        "Повторные попытки не помогли; попробуйте позже."
+                                    )
+                    except (asyncio.TimeoutError, ClientError) as exc:
+                        logger.warning(
+                            "Gemini network failure (%s), attempt %s/%s",
+                            type(exc).__name__, index + 1, len(attempts),
+                        )
+                        if index == len(attempts) - 1:
+                            raise ParseError(
+                                "Не удалось связаться с Gemini после повторных "
+                                "попыток. Балансы не изменились."
+                            ) from exc
+                    # 404, 5xx or network timeout: retry after a short backoff.
+                    await asyncio.sleep(min(1.2 * (index + 1), 3))
         except asyncio.TimeoutError as exc:
-            logger.warning("Gemini request timed out after 45 seconds")
             raise ParseError(
-                "Gemini слишком долго отвечает. Балансы не менялись. "
-                "Попробуйте ещё раз или используйте формат: нортон,гоммез фрп +1."
+                "Gemini слишком долго отвечает. Балансы не изменились. "
+                "Для простых команд используйте: кудак -1 фрп | выдал в игре."
             ) from exc
-
 
 async def handle_natural_command(message: types.Message, raw: str):
     uid = message.from_user.id
@@ -4583,8 +4631,7 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⛔ ИИ-команды доступны только руководству в личном чате.")
         return
     raw = raw.strip()
-    command_text, delimiter, debit_reason = raw.partition("|")
-    debit_reason = debit_reason.strip()
+    command_text, has_reason, debit_reason = split_operation_reason(raw)
     if not raw:
         await message.answer("Напишите команду, например: <code>норто, гоммез -3 фрп</code>",
                              parse_mode="HTML")
@@ -4611,7 +4658,7 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⛔ Нет разрешения на эту операцию.")
         return
     if plan["action"] == "debit":
-        if not delimiter or not 5 <= len(debit_reason) <= 200:
+        if not has_reason or not 5 <= len(debit_reason) <= 200:
             await message.answer("⚠️ Укажите причину списания после | (5–200 символов).")
             return
         if plan["amount"] > debit_limit(uid):
@@ -4673,7 +4720,7 @@ async def handle_natural_command(message: types.Message, raw: str):
         f"(сейчас {t['qty']})"
         for t in targets
     )
-    source = "правила" if origin == "local" else "Gemini 3.8 Flash"
+    source = "правила" if origin == "local" else "Gemini AI"
     buttons = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Подтвердить для всех", callback_data=f"aiconfirm:{token}",
@@ -4706,7 +4753,7 @@ async def cmd_ai(message: types.Message, state: FSMContext):
     await state.set_state(AiStates.waiting_for_text)
     await message.answer(
         "🤖 <b>FBI · ИИ-команды</b>\n\n"
-        "Напишите: <code>норто, гоммез -3 фрп</code> "
+        "Напишите: <code>норто, гоммез -3 фрп | выдал в игре</code> "
         "или <code>дай гоммезу 2 похвалы</code>.\n\n"
         "<i>Команда будет показана для подтверждения. /cancel — отменить.</i>",
         parse_mode="HTML"
@@ -4929,8 +4976,7 @@ async def agent_operation_from_text(message: types.Message, raw: str,
         await message.answer("⏳ Не более 5 новых операций в минуту.")
         return
     _AGENT_LIMIT[uid] = [*recent, now]
-    command_text, separator, debit_reason = raw.partition("|")
-    debit_reason = debit_reason.strip()
+    command_text, separator, debit_reason = split_operation_reason(raw)
     if forced_action == "debit" and not has_permission(uid, "points.debit"):
         await message.answer("⛔ Списание доступно руководству или агентам с отдельным разрешением.")
         return
