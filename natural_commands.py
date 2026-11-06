@@ -116,8 +116,8 @@ def simple_parse(text: str) -> dict[str, Any] | None:
     if match is None:
         return None
     name_segment = match["names"].strip()
-    if _VERB.match(name_segment):
-        # Conversational instructions are not nicknames; send to Gemini.
+    if _VERB.match(name_segment) or looks_like_operation(name_segment):
+        # A nickname must not contain a second embedded balance command.
         return None
     names = [name.strip() for name in re.split(r"[,;]", name_segment) if name.strip()]
     if not names:
