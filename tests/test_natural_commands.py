@@ -208,7 +208,7 @@ class TestGeminiFallback(unittest.IsolatedAsyncioTestCase):
                                     "amount": 3, "names": ["норто"]})
             }]}}]}
         with self.assertRaises(ParseError):
-            await interpret("сними у норто -3 фрп", "mock-key", bad_response)
+            await interpret("пожалуйста, оформи у норто -3 фрп", "mock-key", bad_response)
 
     def test_wrong_coin_type_rejected(self):
         with self.assertRaises(ParseError):
