@@ -8,6 +8,7 @@ import difflib
 import json
 import os
 import re
+from tiny_neural_ai import parse as neural_parse
 from typing import Any
 
 MODEL = "gemini-3.8-flash"
@@ -102,7 +103,9 @@ def looks_like_operation(text: str) -> bool:
             rf"{_KIND_PATTERN}\s*[+-]\s*\d{{1,2}})", text, re.I
         )
         or re.search(
-            r"(?:сним|спиш|вычт|добав|начисл|дай|выдай)\w*.*"
+            r"(?:сним|снят|спиш|спис|вычт|вычес|добав|начисл|дай|выдай|" 
+            r"зачисл|наки|прибав|постав|присво|подкин|убер|отним|забер|" 
+            r"уменьш|сниз|сократ|оштраф)\w*.*"
             r"(?:фрп|frp|отмет|похвал|praise)", text, re.I
         )
     )
@@ -225,8 +228,15 @@ async def interpret(text: str, api_key: str, request):
     result = simple_parse(text) or natural_phrase_parse(text)
     if result:
         return result, "local"
+    if os.getenv("LOCAL_NEURAL_AI_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no"):
+        try:
+            result = neural_parse(text)
+        except Exception:
+            result = None  # malformed weights must never break existing Gemini path
+        if result:
+            return validate_plan(result, original=text), "neural"
     if not api_key:
-        raise ParseError("Gemini пока не подключён. Укажите GEMINI_API_KEY в Render.")
+        raise ParseError("Локальный ИИ не распознал команду, а Gemini недоступен. Уточните действие, ник и количество.")
     prompt = (
         "Ты только разбираешь текстовые команды администраторов игрового FBI. "
         "Верни JSON с полями action (credit или debit), sheet (fractionrp или praise), "
