@@ -1,5 +1,9 @@
 """Offline regression for tiny neural fallback; no API keys or Firebase needed."""
+import os
 import unittest
+from unittest.mock import patch
+
+from natural_commands import interpret, ParseError, looks_like_operation
 from tiny_neural_ai import parse, predict
 
 
@@ -39,6 +43,26 @@ class TinyNeuralTests(unittest.TestCase):
     def test_no_permissions_or_db_side_effects(self):
         result = parse("Нортону добавь 1 фрп")
         self.assertEqual(set(result), {"action", "sheet", "amount", "names"})
+
+
+
+class TestNeuralRouting(unittest.IsolatedAsyncioTestCase):
+    async def test_interpret_neural_before_gemini(self):
+        async def unexpected_api(*args):
+            raise AssertionError("Gemini must not be called")
+        phrase = "Гоммезу добавь 2 похвалы"
+        self.assertTrue(looks_like_operation(phrase))
+        plan, source = await interpret(phrase, "", unexpected_api)
+        self.assertEqual(source, "neural")
+        self.assertEqual(plan["names"], ["Гоммезу"])
+        self.assertEqual(plan["action"], "credit")
+
+    async def test_can_disable_neural_on_render(self):
+        async def unexpected_api(*args):
+            raise AssertionError("Gemini must not be called")
+        with patch.dict(os.environ, {"LOCAL_NEURAL_AI_ENABLED": "0"}):
+            with self.assertRaises(ParseError):
+                await interpret("Гоммезу добавь 2 похвалы", "", unexpected_api)
 
 
 if __name__ == "__main__":
