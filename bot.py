@@ -4665,8 +4665,8 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⚠️ " + html.escape(str(exc)))
         return
     except Exception as exc:
-        logger.warning("Gemini parsing request failed: %s", type(exc).__name__)
-        await message.answer("⚠️ Не удалось получить ответ Gemini. Попробуйте ещё раз.")
+        logger.warning("Natural AI parsing request failed: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось разобрать ИИ-команду. Попробуйте уточнить текст.")
         return
     capability = "points.grant" if plan["action"] == "credit" else "points.debit"
     if not has_permission(uid, capability):
@@ -4735,7 +4735,8 @@ async def handle_natural_command(message: types.Message, raw: str):
         f"(сейчас {t['qty']})"
         for t in targets
     )
-    source = "правила" if origin == "local" else "Gemini AI"
+    source = {"local": "правила", "neural": "локальная нейросеть",
+              "gemini": "Gemini AI"}.get(origin, "локальный ИИ")
     buttons = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Подтвердить для всех", callback_data=f"aiconfirm:{token}",
@@ -5005,7 +5006,7 @@ async def agent_operation_from_text(message: types.Message, raw: str,
     except Exception as exc:
         logger.warning("Agent command resolution failed: %s", type(exc).__name__)
         await message.answer(
-            "⚠️ Не удалось проверить запрос в Firebase или Gemini. "
+            "⚠️ Не удалось проверить запрос в Firebase или ИИ. "
             "Балансы не изменились."
         )
         return
