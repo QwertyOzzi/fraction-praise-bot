@@ -15,6 +15,7 @@ from aiohttp import web, ClientSession, ClientTimeout, ClientError
 from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from profile_sheets import register_profile, resolve_nickname_claim
+from rank_sync import update_rank_across_firestore, RankSyncError
 from natural_commands import (interpret as interpret_natural, resolve_names,
                               looks_like_operation, simple_parse, split_operation_reason,
                               ParseError, MODEL)
@@ -4160,6 +4161,13 @@ async def agent_set_rank(callback: types.CallbackQuery):
     if not has_permission(callback.from_user.id, "agents.rank"):
         await callback.answer("Нет доступа", show_alert=True)
         return
+    if (callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Изменять ранг можно только в личном чате.", show_alert=True)
+        return
+    if not _cloud_state_hydrated:
+        await callback.answer("Данные Firebase ещё не загружены.", show_alert=True)
+        return
     try:
         _, key, rank_raw, page_raw = callback.data.split(":")
         rank = int(rank_raw)
@@ -4171,28 +4179,35 @@ async def agent_set_rank(callback: types.CallbackQuery):
             await callback.answer("Агент не найден", show_alert=True)
             return
         profile = users_db[agent["uid"]]
-        previous = dict(profile)
         new_rank = "X" if rank == 10 else str(rank)
         old_rank = str(profile.get("rank") or "?")
-        profile["rank"] = new_rank
-        if old_rank != new_rank:
-            history = profile.get("rank_history", [])
-            history = list(history) if isinstance(history, list) else []
-            profile["rank_history"] = (history + [{"from": old_rank, "to": new_rank,
-                "at": datetime.now(timezone.utc).isoformat(),
-                "actor_id": str(callback.from_user.id)}])[-50:]
-        if not await sync_state_to_cloud():
-            users_db[agent["uid"]] = previous
-            await callback.answer("Firebase не подтвердила изменение.", show_alert=True)
-            return
+
+        # Commit Telegram profile and BOTH Firestore sheet rows together.
+        # Rechoosing the current rank also heals previously stale website rows.
+        # No local success is shown until Firebase confirms the transaction.
+        updated = await update_rank_across_firestore(
+            firebase_client, FIREBASE_PROJECT_ID, agent["uid"], agent["nick"],
+            old_rank, new_rank, callback.from_user.id, sign_admin_permissions,
+            _state_sync_lock, ClientSession
+        )
+        users_db[agent["uid"]] = updated
         save_json(USERS_FILE, users_db)
-        asyncio.create_task(record_admin_activity("rank_changed", callback.from_user.id,
-            f"{agent['nick']}: новый ранг {rank}"))
-        await callback.answer("✅ Ранг обновлён")
+        if old_rank != new_rank:
+            asyncio.create_task(record_admin_activity("rank_changed", callback.from_user.id,
+                f"{agent['nick']}: {old_rank} → {new_rank}"))
+        else:
+            asyncio.create_task(record_admin_activity(
+                "rank_resynced", callback.from_user.id,
+                f"{agent['nick']}: таблицы сверены с рангом {new_rank}"
+            ))
+        await callback.answer("✅ Ранг обновлён в профиле и таблицах")
         await agent_panel_detail(callback.message, key, int(page_raw))
+    except RankSyncError as exc:
+        logger.warning("Atomic rank synchronization rejected: %s", type(exc).__name__)
+        await callback.answer(str(exc)[:200], show_alert=True)
     except Exception as exc:
-        logger.warning(f"Rank change failed: {exc}")
-        await callback.answer("⚠️ Не удалось обновить ранг", show_alert=True)
+        logger.warning("Atomic rank synchronization failed: %s", type(exc).__name__)
+        await callback.answer("⚠️ Не удалось обновить ранг в Firebase", show_alert=True)
 
 
 # Очередь на выдачу
