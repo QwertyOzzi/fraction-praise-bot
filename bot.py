@@ -793,6 +793,7 @@ class GrantStates(StatesGroup):
 
 class AiStates(StatesGroup):
     waiting_for_text = State()
+    waiting_for_debit_reason = State()
 
 
 class AgentActionStates(StatesGroup):
@@ -4639,7 +4640,7 @@ async def gemini_json_request(url: str, headers: dict, body: dict) -> dict:
                 "Для простых команд используйте: кудак -1 фрп | выдал в игре."
             ) from exc
 
-async def handle_natural_command(message: types.Message, raw: str):
+async def handle_natural_command(message: types.Message, raw: str, state=None, *, reason_reply=False):
     uid = message.from_user.id
     if (not is_admin(uid) or message.chat.type != "private"
             or message.chat.id != uid):
@@ -4651,14 +4652,16 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("Напишите команду, например: <code>норто, гоммез -3 фрп</code>",
                              parse_mode="HTML")
         return
-    # Avoid unexpected API usage on an unbounded message flood.
+    # Reason replies reuse a previously checked command and do not spend an
+    # additional parse quota. All new commands still have the normal limit.
     now = datetime.now(timezone.utc).timestamp()
-    recent = [t for t in _AI_LIMIT.get(uid, []) if now - t < 60]
-    if len(recent) >= 6:
-        await message.answer("⏳ Максимум 6 разборов в минуту. Повторите позже.")
-        return
-    recent.append(now)
-    _AI_LIMIT[uid] = recent
+    if not reason_reply:
+        recent = [t for t in _AI_LIMIT.get(uid, []) if now - t < 60]
+        if len(recent) >= 6:
+            await message.answer("⏳ Максимум 6 разборов в минуту. Повторите позже.")
+            return
+        recent.append(now)
+        _AI_LIMIT[uid] = recent
     try:
         plan, origin = await interpret_natural(command_text.strip(), GEMINI_API_KEY, gemini_json_request)
     except ParseError as exc:
@@ -4673,11 +4676,28 @@ async def handle_natural_command(message: types.Message, raw: str):
         await message.answer("⛔ Нет разрешения на эту операцию.")
         return
     if plan["action"] == "debit":
-        if not has_reason or not 5 <= len(debit_reason) <= 200:
-            await message.answer("⚠️ Укажите причину списания после | (5–200 символов).")
-            return
         if plan["amount"] > debit_limit(uid):
             await message.answer(f"⛔ Лимит списания для вашей роли: {debit_limit(uid)}.")
+            return
+        if not has_reason or not 5 <= len(debit_reason) <= 200:
+            if state is not None:
+                # Save only the command, never an unapproved operation. The
+                # actual Firebase rows/permissions are rechecked after reply.
+                await state.update_data(ai_debit_command=command_text.strip())
+                await state.set_state(AiStates.waiting_for_debit_reason)
+                await message.answer(
+                    "📝 <b>Укажите причину списания</b> следующим сообщением "
+                    "(5–200 символов).\n\n"
+                    "Можно также отправить полную команду с причиной через "
+                    "<code>|</code>. Для отмены: /cancel.\n\n"
+                    "<i>Пока ничего не списано.</i>", parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    "⚠️ Причина списания обязательна. Пример: "
+                    "<code>гомез -1 фрп | выдали в игре</code>",
+                    parse_mode="HTML"
+                )
             return
     try:
         # Memory is never sent to Gemini. Each operation uses the current sheet
@@ -4764,7 +4784,7 @@ async def cmd_ai(message: types.Message, state: FSMContext):
     text = (message.text or "").split(maxsplit=1)
     await state.clear()
     if len(text) > 1:
-        await handle_natural_command(message, text[1])
+        await handle_natural_command(message, text[1], state)
         return
     await state.set_state(AiStates.waiting_for_text)
     await message.answer(
@@ -4779,7 +4799,49 @@ async def cmd_ai(message: types.Message, state: FSMContext):
 @dp.message(AiStates.waiting_for_text)
 async def receive_ai_command(message: types.Message, state: FSMContext):
     await state.clear()
-    await handle_natural_command(message, message.text or "")
+    await handle_natural_command(message, message.text or "", state)
+
+
+@dp.message(AiStates.waiting_for_debit_reason)
+async def receive_ai_debit_reason(message: types.Message, state: FSMContext):
+    """Continue a debit only after the operator supplied a reason.
+    
+    Full-command replacement is supported, to avoid trapping the admin in a
+    pending wizard. The old command is never applied without confirmation.
+    """
+    if (not message.from_user or not is_admin(message.from_user.id)
+            or message.chat.type != "private"
+            or message.chat.id != message.from_user.id):
+        await state.clear()
+        return
+    answer = (message.text or "").strip()
+    if answer.startswith("/"):
+        await message.answer("Отправьте причину или используйте /cancel.")
+        return
+    if looks_like_operation(answer):
+        # A user may submit a corrected full command instead of just a reason.
+        await state.clear()
+        await handle_natural_command(message, answer, state)
+        return
+    if not 5 <= len(answer) <= 200 or "|" in answer:
+        await message.answer(
+            "⚠️ Причина должна содержать 5–200 символов и не содержать |. "
+            "Отправьте причину или /cancel."
+        )
+        return
+    data = await state.get_data()
+    command = data.get("ai_debit_command")
+    await state.clear()
+    if not isinstance(command, str) or not command:
+        await message.answer(
+            "⚠️ Предыдущая команда устарела. Отправьте списание заново."
+        )
+        return
+    # The same secure parser, permissions, fresh Firebase rows and confirmation
+    # are used as for an inline reason. No direct balance write occurs here.
+    await handle_natural_command(
+        message, command + " | " + answer, state, reason_reply=True
+    )
 
 
 @dp.callback_query(F.data.startswith("aiconfirm:") | F.data.startswith("aicancel:"))
@@ -6283,7 +6345,7 @@ async def conversational_admin_command(message: types.Message, state: FSMContext
     if not looks_like_operation(message.text or ""):
         return
     if is_admin(message.from_user.id):
-        await handle_natural_command(message, message.text)
+        await handle_natural_command(message, message.text, state)
     elif get_verified_agent(message.from_user.id):
         # Agent text is never routed to the unmoderated administrator credit path.
         await agent_operation_from_text(message, message.text)
