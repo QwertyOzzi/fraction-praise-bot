@@ -68,7 +68,7 @@ def isolate(names, env):
 class TestNaturalOnlyWhenIdle(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.commands = []
-        async def handle(message, text):
+        async def handle(message, text, state=None):
             self.commands.append(text)
         self.env = isolate({"conversational_admin_command"}, {
             "is_admin": lambda uid: uid == 101,
