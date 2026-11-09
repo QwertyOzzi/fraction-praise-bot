@@ -4,6 +4,7 @@ The Telegram profile and existing FRP / Praise rows must agree. The transaction
 does not create, delete, award or deduct any sheet row or modify privileges.
 """
 import asyncio
+import copy
 import hmac
 import json
 from datetime import datetime, timezone
@@ -75,34 +76,45 @@ def prepare_rank_sync(state, sheets, *, uid, nick, expected_rank, new_rank,
     next_users[uid] = updated
     next_state["users"] = next_users
 
+    def row_fields(row):
+        """Return raw Firestore fields; leave unrelated values untouched."""
+        if not isinstance(row, dict):
+            raise RankSyncError("Некорректная строка Firestore.")
+        fields = row.get("mapValue", {}).get("fields")
+        if not isinstance(fields, dict):
+            raise RankSyncError("Некорректные поля строки Firestore.")
+        return fields
+
+    def read_field(fields, key):
+        value = fields.get(key, {})
+        return str(value.get("stringValue") or "") if isinstance(value, dict) else ""
+
     next_sheets = {}
     for sheet in SHEETS:
         rows = sheets.get(sheet)
         if not isinstance(rows, list):
             raise RankSyncError("Неверный формат таблицы Firebase.")
-        targets = [row for row in rows
-                   if isinstance(row, dict)
-                   and str(row.get("nick") or "").casefold() == nick.casefold()]
-        if len(targets) > 1:
+        matches = []
+        for index, row in enumerate(rows):
+            fields = row_fields(row)
+            row_nick = read_field(fields, "nick")
+            row_binding = read_field(fields, "profileId")
+            if binding and row_binding == binding and row_nick.casefold() != nick.casefold():
+                raise RankSyncError(f"Конфликт привязки в /{sheet}.")
+            if row_nick.casefold() == nick.casefold():
+                matches.append((index, row_binding))
+        if len(matches) > 1:
             raise RankSyncError(f"Дубли ника в /{sheet}. Нужна ручная проверка.")
-        # A row bound to this profile under another nickname is a stale binding.
-        if binding and any(
-                isinstance(row, dict) and str(row.get("profileId") or "") == binding
-                and str(row.get("nick") or "").casefold() != nick.casefold()
-                for row in rows):
-            raise RankSyncError(f"Конфликт привязки в /{sheet}.")
-        if targets:
-            row = targets[0]
-            row_binding = str(row.get("profileId") or "")
+        if matches:
+            index, row_binding = matches[0]
             if row_binding and row_binding != binding:
                 raise RankSyncError(f"Другая привязка ника в /{sheet}.")
-            changed = []
-            for item in rows:
-                if item is row:
-                    changed.append({**item, "rank": new_rank,
-                                    "fullName": f"{nick} ({new_rank})"})
-                else:
-                    changed.append(item)
+            # Preserve the ORIGINAL Firestore row, including all unknown fields,
+            # array types, proof links and IDs. Change ONLY two string fields.
+            changed = copy.deepcopy(rows)
+            fields = changed[index]["mapValue"]["fields"]
+            fields["rank"] = {"stringValue": new_rank}
+            fields["fullName"] = {"stringValue": f"{nick} ({new_rank})"}
             next_sheets[sheet] = changed
     return next_state, next_sheets, updated
 
@@ -152,7 +164,7 @@ async def update_rank_across_firestore(
                 for sheet in SHEETS:
                     field = docs["sheets/" + sheet].get("fields", {}).get("rows", {})
                     values = field.get("arrayValue", {}).get("values", [])
-                    rows[sheet] = client._parse_firestore_rows(values)
+                    rows[sheet] = values
 
                 now = datetime.now(timezone.utc).isoformat()
                 next_state, sheet_updates, updated = prepare_rank_sync(
@@ -168,7 +180,7 @@ async def update_rank_across_firestore(
                             "name": f"projects/{project_id}/databases/(default)/documents/{path}",
                             "fields": {
                                 "rows": {"arrayValue": {"values": [
-                                    client._row_to_firestore(row) for row in new_rows
+                                    row for row in new_rows
                                 ]}},
                                 "updatedAt": {"timestampValue": now}
                             }
