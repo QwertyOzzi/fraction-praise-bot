@@ -4193,10 +4193,8 @@ async def agent_set_rank(callback: types.CallbackQuery):
         users_db[agent["uid"]] = updated
         save_json(USERS_FILE, users_db)
         if old_rank != new_rank:
-            asyncio.create_task(record_admin_activity(
-                "rank_changed", callback.from_user.id,
-                f"{agent['nick']}: {old_rank} → {new_rank}"
-            ))
+            asyncio.create_task(record_admin_activity("rank_changed", callback.from_user.id,
+                f"{agent['nick']}: {old_rank} → {new_rank}"))
         else:
             asyncio.create_task(record_admin_activity(
                 "rank_resynced", callback.from_user.id,
