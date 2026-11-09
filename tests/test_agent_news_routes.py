@@ -113,7 +113,7 @@ class TestAgentParser(unittest.TestCase):
 class TestIdleNaturalRoute(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.actions = []
-        async def admin(message, text):
+        async def admin(message, text, state=None):
             self.actions.append(("admin", text))
         async def agent(message, text):
             self.actions.append(("agent", text))
