@@ -223,7 +223,7 @@ class Client:
 
 
 class TestAtomicCommit(unittest.IsolatedAsyncioTestCase):
-    async def setUp(self):
+    async def asyncSetUp(self):
         self.store = FakeFirestore([200])
         self.lock = asyncio.Lock()
 
