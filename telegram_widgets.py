@@ -10,7 +10,6 @@ overwriting roles, agent settings, or the owner's signed access rules.
 import asyncio
 import json
 import logging
-import os
 import re
 import zlib
 from datetime import datetime, timezone
@@ -279,16 +278,24 @@ async def list_refs(client):
 async def open_profile_widget(client, bot_token, uid):
     """Refresh the current widget if known; otherwise create one."""
     roster = await read_roster(client)
-    state = _state_data(profile_snapshot(roster, uid))
-    ref = await read_ref(client, uid)
+    snapshot = profile_snapshot(roster, uid)
+    if snapshot["status"] == "Доступ не подтверждён":
+        raise WidgetUnavailable("Agent registration is not verified")
+    state = _state_data(snapshot)
+    try:
+        ref = await read_ref(client, uid)
+    except WidgetUnavailable:
+        # The widget can still be used manually before Firestore rules deploy.
+        ref = None
+        logger.warning("Widget registry unreadable for user %s", uid)
     if ref:
+        # Avoid duplicate widget messages if an edit failed transiently.
+        await update_profile_widget(bot_token, uid, ref["message_id"], state)
         try:
-            await update_profile_widget(bot_token, uid, ref["message_id"], state)
             await save_ref(client, uid, ref["message_id"], state)
-            return "updated"
         except WidgetUnavailable:
-            # It may have been deleted. A new widget is safe to send.
-            logger.info("Existing widget unavailable for user %s", uid)
+            return "untracked"
+        return "updated"
     msg_id = await send_profile_widget(bot_token, uid, state)
     try:
         await save_ref(client, uid, msg_id, state)
