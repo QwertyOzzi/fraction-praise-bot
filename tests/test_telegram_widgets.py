@@ -166,7 +166,8 @@ class WidgetOperationsTests(unittest.IsolatedAsyncioTestCase):
                   "message_id": 77, "last_data": "{}", "kind": "text"
               })),
               patch.object(w, "edit_fallback_card", AsyncMock()) as edit,
-              patch.object(w, "update_profile_widget", AsyncMock()) as widget):
+              patch.object(w, "update_profile_widget", AsyncMock()) as widget,
+              patch.object(w, "save_ref", AsyncMock())):
             await w.refresh_profile_widget(object(), "fake_token", 123, 77)
             edit.assert_awaited_once()
             widget.assert_not_awaited()
