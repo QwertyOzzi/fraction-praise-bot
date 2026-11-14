@@ -45,6 +45,8 @@ from access_control import (PERMISSIONS, AGENT_DELEGATABLE,
 from telegram_design import (send_fbi_card, send_home_banner_card,
                              edit_fbi_card, hide_old_reply_keyboard,
                              with_home_button)
+from telegram_widgets import (WidgetUnavailable, open_profile_widget,
+                              refresh_profile_widget, widget_refresh_loop)
 
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command, CommandStart
@@ -866,7 +868,8 @@ def get_main_menu(user_id: int, *, admin_panel: bool = False) -> InlineKeyboardM
              InlineKeyboardButton(text="📊 Мой статус", callback_data="main:status", style="primary")],
             [InlineKeyboardButton(text="⚙️ Никнейм", callback_data="main:nick"),
              InlineKeyboardButton(text="🎖️ Ранг", callback_data="main:rank")],
-            [InlineKeyboardButton(text="👤 Моя карточка", callback_data="main:profile")],
+            [InlineKeyboardButton(text="👤 Моя карточка", callback_data="main:profile"),
+             InlineKeyboardButton(text="✨ Виджет", callback_data="main:widget")],
             [InlineKeyboardButton(text="📅 Мероприятия FBI", callback_data="main:events")],
             [InlineKeyboardButton(text="➖ Списать FRP / похвалу", callback_data="main:min")],
             [InlineKeyboardButton(text="➕ Запросить начисление", callback_data="main:plus")],
@@ -929,6 +932,7 @@ PUBLIC_BOT_COMMANDS = [
     BotCommand(command="report", description="Подать отчёт FRP / похвала"),
     BotCommand(command="status", description="Мои FRP и похвалы"),
     BotCommand(command="profile", description="Полная карточка сотрудника"),
+    BotCommand(command="widget", description="Живая карточка FBI (Bot API 10.4)"),
     BotCommand(command="events", description="Предстоящие мероприятия FBI"),
     BotCommand(command="eventnotify", description="Вкл/выкл уведомления о МП"),
     BotCommand(command="nick", description="Изменить игровой ник"),
@@ -1747,6 +1751,26 @@ async def main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     if action in MAIN_MENU_ADMIN_ACTIONS and not is_admin(uid):
         await callback.answer("Доступно только руководству.", show_alert=True)
+        return
+
+    if action == "widget":
+        if not get_verified_agent(uid):
+            await callback.answer("Сначала подтвердите регистрацию.", show_alert=True)
+            return
+        try:
+            result = await asyncio.wait_for(
+                open_profile_widget(firebase_client, BOT_TOKEN, uid), timeout=27
+            )
+        except (WidgetUnavailable, asyncio.TimeoutError) as exc:
+            logger.warning("FBI widget unavailable: %s", type(exc).__name__)
+            await callback.answer("Виджет пока недоступен. Попробуйте позже.", show_alert=True)
+            return
+        await callback.answer("Карточка обновлена!" if result == "updated" else "Карточка создана!")
+        if result == "untracked":
+            await callback.message.answer(
+                "⚠️ Карточка создана, но автообновление не включилось: "
+                "проверьте правила Firestore для fbi_profile_widgets."
+            )
         return
 
     if action == "events":
@@ -3714,6 +3738,52 @@ async def cmd_permissions(message: types.Message):
     await record_admin_activity("permission_changed", message.from_user.id,
                                 f"Telegram ID {uid}: {capability} -> {mode}")
     await message.answer(f"✅ Право {capability}: {mode}. Прежние роли сохранены.")
+
+
+@dp.message(Command("widget"))
+async def cmd_fbi_widget(message: types.Message):
+    """Read-only HTML card, available only to the confirmed owner of the profile."""
+    if not _agent_private(message):
+        await message.answer("Виджет доступен только в личном чате с ботом.")
+        return
+    uid = message.from_user.id
+    if not get_verified_agent(uid):
+        await message.answer("Сначала подтвердите регистрацию через /start.")
+        return
+    try:
+        result = await asyncio.wait_for(
+            open_profile_widget(firebase_client, BOT_TOKEN, uid), timeout=27
+        )
+    except (WidgetUnavailable, asyncio.TimeoutError) as exc:
+        logger.warning("FBI widget unavailable: %s", type(exc).__name__)
+        await message.answer("⚠️ Не удалось загрузить данные или отправить виджет.")
+        return
+    if result == "updated":
+        await message.answer("✅ Живая карточка обновлена в прежнем сообщении.")
+    elif result == "untracked":
+        await message.answer("⚠️ Виджет отправлен, но автообновление пока недоступно: "
+                             "нужно применить правила Firestore для fbi_profile_widgets.")
+
+
+@dp.callback_query(F.data == "fbiwidget:refresh")
+async def callback_fbi_widget_refresh(callback: types.CallbackQuery):
+    """Telegram inline button attached to a private widget message."""
+    if (not isinstance(callback.message, types.Message)
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id):
+        await callback.answer("Недоступно вне личного чата.", show_alert=True)
+        return
+    try:
+        await asyncio.wait_for(
+            refresh_profile_widget(firebase_client, BOT_TOKEN,
+                                   callback.from_user.id, callback.message.message_id),
+            timeout=25,
+        )
+    except (WidgetUnavailable, asyncio.TimeoutError) as exc:
+        logger.warning("Widget refresh failed: %s", type(exc).__name__)
+        await callback.answer("Не удалось получить свежие данные.", show_alert=True)
+        return
+    await callback.answer("Данные обновлены из Firebase!")
 
 
 @dp.message(Command("profile"))
@@ -6397,12 +6467,22 @@ async def main():
                     logger.warning("Schedule cycle failed: %s", type(exc).__name__)
             await asyncio.sleep(30)
     schedule_task = asyncio.create_task(schedule_poller(), name="fbi-scheduler")
+    widget_task = None
+    if os.getenv("FBI_WIDGET_AUTO_REFRESH", "1").strip() != "0":
+        widget_task = asyncio.create_task(
+            widget_refresh_loop(firebase_client, BOT_TOKEN), name="fbi-widget-refresh"
+        )
     try:
         logger.info("Bot polling starting...")
         await dp.start_polling(bot)
     finally:
         schedule_task.cancel()
-        await asyncio.gather(schedule_task, return_exceptions=True)
+        if widget_task is not None:
+            widget_task.cancel()
+        await asyncio.gather(
+            schedule_task, *((widget_task,) if widget_task is not None else ()),
+            return_exceptions=True
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())
