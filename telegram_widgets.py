@@ -183,10 +183,10 @@ def safe_telegram_description(parsed):
         return "no Telegram error details"
     # Bot API error descriptions are generally short and ASCII. Drop any
     # unexpected content and redact numeric identifiers, never leak a URL/token.
-    if len(description) > 240 or re.search(r"https?://|api\\.telegram|bot\\d+:", description, re.I):
+    if len(description) > 240 or re.search(r"https?://|api\.telegram|bot\d+:", description, re.I):
         return "Telegram rejected the request"
     safe = re.sub(r"[^a-zA-Z0-9 _.,:()'/-]", "", description).strip()
-    safe = re.sub(r"\\d{6,}", "[id]", safe)
+    safe = re.sub(r"\d{6,}", "[id]", safe)
     return safe[:140] or "Telegram rejected the request"
 
 
