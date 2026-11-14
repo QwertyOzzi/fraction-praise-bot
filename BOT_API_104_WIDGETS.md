@@ -5,13 +5,17 @@ transactions, security roles and AI commands are unchanged.
 
 ## Implemented
 
-- Private HTML card in a Telegram message, sent via Bot API sendWidget.
+- Private HTML card, attempted via Bot API sendWidget; if Telegram restricts it with
+  INPUT_MEDIA_WIDGET_NOT_ALLOWED, the bot creates an ordinary protected HTML
+  message with the same balances and buttons. This is a normal Telegram text
+  card, **not** a true HTML Widget.
 - /widget and «✨ Виджет» in the regular agent menu.
 - «🔄 Обновить карточку» below the widget: reads fresh Firestore data and
-  changes the existing message via editMessageWidgetData.
+  changes the existing message via editMessageWidgetData (widget) or
+  editMessageText (fallback).
 - Background comparison every 90 seconds: edit only when an agent's nickname,
-  rank, access status, FRP or Praise changed. This is a private static widget
-  with editable chat_data, not a public shared widget.
+  rank, access status, FRP or Praise changed. The server changes
+  chat_data in HTML Widgets or edits the ordinary message in fallback mode.
 - One active message pointer per agent in a new Firestore collection, preserved
   across Render restarts.
 - Firestore failures do not show false zeroes. Missing or duplicate rows show
@@ -27,8 +31,10 @@ transactions, security roles and AI commands are unchanged.
    **Important:** merging rules on GitHub does not deploy them to Firebase.
    Apply them in the Firebase console or with your normal Firebase CLI process.
 2. Deploy the bot branch after these rules are active. No new secrets needed.
-3. Use a Telegram client that supports HTML Widgets. Older clients show the
-   widget caption. Bot API 10.4 production supports widgets in private chats.
+3. Telegram restricted HTML Widgets for general production bots on
+   November 13, 2026. The bot will automatically show a native text card
+   until Telegram grants access. No client update or token change bypasses
+   this server-side restriction.
 4. In a private chat with the bot, send /widget, or open /start -> ✨ Виджет.
    Tap «🔄 Обновить карточку» below the card to refresh.
 5. Change FRP/Praise or rank using the existing approved workflows; the card
@@ -60,9 +66,25 @@ continues to work. Do not add a separate getUpdates/polling process.
   nickname, rank and FRP/Praise display values.
 - The bot checks the current owner-only Firebase bot_state and two sheets.
   No widget operation can assign roles or change game balances.
-- Registry records contain only a Telegram message ID and the last card state.
+- Registry records contain the Telegram message ID, card kind, and last
+  displayed state. The bot can resume editing the same card after Render restarts.
   They are accessible only to the Firebase owner.
 
 References:
 https://core.telegram.org/bots/widgets
 https://core.telegram.org/bots/api-changelog#november-9-2026
+
+## Telegram rollout restriction (November 14, 2026)
+
+On November 13, Telegram Bot API contributor `levlam` confirmed that
+ordinary bots cannot currently send HTML Widgets even in private chats:
+https://github.com/tdlib/telegram-bot-api/issues/947
+
+Calling /widget now falls back only for the exact server error
+INPUT_MEDIA_WIDGET_NOT_ALLOWED. It does not conceal other failures, bypass
+Telegram permissions, or create new routes for points and roles.
+
+The existing text fallback stays active for that user's stored card so
+subsequent /widget commands and scheduled 90-second checks edit it in
+place rather than creating duplicate messages. When the rollout opens,
+the native HTML widget path is still available for new cards.

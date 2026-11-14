@@ -8,6 +8,7 @@ Registry documents are stored separately from config/bot_state to avoid
 overwriting roles, agent settings, or the owner's signed access rules.
 """
 import asyncio
+import html
 import json
 import logging
 import re
@@ -205,13 +206,64 @@ async def telegram_api(token, method, payload):
                                         (method, response.status)) from None
             if response.status != 200 or not isinstance(parsed, dict) or not parsed.get("ok"):
                 description = safe_telegram_description(parsed)
-                if method == "editMessageWidgetData" and "message is not modified" in description.lower():
+                if method in {"editMessageWidgetData", "editMessageText"} and "message is not modified" in description.lower():
                     return True
                 code = parsed.get("error_code", response.status) if isinstance(parsed, dict) else response.status
                 raise WidgetUnavailable(
                     "Telegram %s: %s (HTTP/API %s)" % (method, description, code)
                 )
             return parsed.get("result")
+
+
+def is_widget_blocked(error):
+    """Telegram currently restricts HTML widget delivery for ordinary bots."""
+    return isinstance(error, WidgetUnavailable) and (
+        "INPUT_MEDIA_WIDGET_NOT_ALLOWED" in str(error)
+    )
+
+
+def fallback_card_html(state):
+    """Accessible native message card using the same verified Firestore snapshot."""
+    values = json.loads(state)
+    def safe(key):
+        return html.escape(str(values.get(key, "—")), quote=True)
+
+    return (
+        "🛡️ <b>FBI · Карточка сотрудника</b>\n\n"
+        f"👤 <b>Агент:</b> <code>{safe('nick')}</code>\n"
+        f"🎖️ <b>Ранг:</b> {safe('rank')}\n"
+        f"🔐 <b>Статус:</b> {safe('status')}\n\n"
+        f"🏅 <b>FRP:</b> {safe('frp')}\n"
+        f"🌟 <b>Похвалы:</b> {safe('praise')}\n\n"
+        f"🕒 Данные Firebase: {safe('updated')}\n\n"
+        "<i>HTML Widgets временно ограничены Telegram. "
+        "Эта карточка обновляется автоматически и по кнопке ниже.</i>"
+    )
+
+
+async def send_fallback_card(token, uid, state):
+    """Native text message used only when Telegram rejects HTML widgets."""
+    result = await telegram_api(token, "sendMessage", {
+        "chat_id": int(uid),
+        "text": fallback_card_html(state),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "protect_content": True,
+        "reply_markup": refresh_keyboard(),
+    })
+    msg_id = result.get("message_id") if isinstance(result, dict) else None
+    if type(msg_id) is not int or msg_id < 1:
+        raise WidgetUnavailable("Telegram did not return a fallback message ID")
+    return msg_id
+
+
+async def edit_fallback_card(token, uid, msg_id, state):
+    return await telegram_api(token, "editMessageText", {
+        "chat_id": int(uid), "message_id": int(msg_id),
+        "text": fallback_card_html(state), "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "reply_markup": refresh_keyboard(),
+    })
 
 
 def refresh_keyboard():
@@ -250,7 +302,9 @@ def _decode_ref(doc):
     try:
         item = json.loads(doc["fields"]["payload"]["stringValue"])
         if (type(item.get("message_id")) is int and item["message_id"] > 0
-                and isinstance(item.get("last_data"), str)):
+                and isinstance(item.get("last_data"), str)
+                and item.get("kind", "widget") in ("widget", "text")):
+            item["kind"] = item.get("kind", "widget")
             return item
     except (KeyError, ValueError, TypeError):
         pass
@@ -264,10 +318,12 @@ async def read_ref(client, uid):
     return _decode_ref(doc)
 
 
-async def save_ref(client, uid, msg_id, last_data):
+async def save_ref(client, uid, msg_id, last_data, kind="widget"):
+    if kind not in ("widget", "text"):
+        raise ValueError("Unsupported card kind")
     headers = await _auth(client)
     body = {"fields": {"payload": {"stringValue": json.dumps({
-        "message_id": msg_id, "last_data": last_data
+        "message_id": msg_id, "last_data": last_data, "kind": kind
     }, ensure_ascii=False, separators=(",", ":"))}}}
     async with ClientSession(timeout=ClientTimeout(total=10)) as session:
         async with session.patch(_registry_url(client, uid), json=body, headers=headers) as response:
@@ -305,7 +361,7 @@ async def list_refs(client):
 
 
 async def open_profile_widget(client, bot_token, uid):
-    """Refresh the current widget if known; otherwise create one."""
+    """Prefer HTML Widgets; use a live native card if Telegram disallows them."""
     roster = await read_roster(client)
     snapshot = profile_snapshot(roster, uid)
     if snapshot["status"] == "Доступ не подтверждён":
@@ -314,37 +370,66 @@ async def open_profile_widget(client, bot_token, uid):
     try:
         ref = await read_ref(client, uid)
     except WidgetUnavailable:
-        # The widget can still be used manually before Firestore rules deploy.
+        # The card can still be sent manually if the registry is unavailable.
         ref = None
         logger.warning("Widget registry unreadable for user %s", uid)
+
+    kind = ref.get("kind", "widget") if ref else "widget"
+    msg_id = ref["message_id"] if ref else None
     if ref:
-        # Avoid duplicate widget messages if an edit failed transiently.
-        await update_profile_widget(bot_token, uid, ref["message_id"], state)
         try:
-            await save_ref(client, uid, ref["message_id"], state)
-        except WidgetUnavailable:
-            return "untracked"
-        return "updated"
-    msg_id = await send_profile_widget(bot_token, uid, state)
+            if kind == "text":
+                await edit_fallback_card(bot_token, uid, msg_id, state)
+            else:
+                await update_profile_widget(bot_token, uid, msg_id, state)
+        except WidgetUnavailable as exc:
+            if not (kind == "widget" and is_widget_blocked(exc)):
+                # Avoid duplicate cards on transient network errors.
+                raise
+            # Existing HTML widget can no longer be edited. Start one text card.
+            msg_id = await send_fallback_card(bot_token, uid, state)
+            kind = "text"
+    else:
+        try:
+            msg_id = await send_profile_widget(bot_token, uid, state)
+        except WidgetUnavailable as exc:
+            if not is_widget_blocked(exc):
+                raise
+            logger.info("Telegram HTML Widgets unavailable; using native private card")
+            msg_id = await send_fallback_card(bot_token, uid, state)
+            kind = "text"
+
     try:
-        await save_ref(client, uid, msg_id, state)
+        await save_ref(client, uid, msg_id, state, kind=kind)
     except WidgetUnavailable:
         logger.warning("Widget registry unavailable for user %s", uid)
         return "untracked"
-    return "created"
+
+    if not ref:
+        return "fallback" if kind == "text" else "created"
+    return "updated"
 
 
 async def refresh_profile_widget(client, bot_token, uid, msg_id):
     roster = await read_roster(client)
     state = _state_data(profile_snapshot(roster, uid))
-    await update_profile_widget(bot_token, uid, msg_id, state)
     try:
         ref = await read_ref(client, uid)
-        # Do not restore references to old cards when a newer one exists.
-        if ref and ref["message_id"] == msg_id:
-            await save_ref(client, uid, msg_id, state)
     except WidgetUnavailable:
-        logger.warning("Widget registry unavailable for user %s", uid)
+        ref = None
+    # Do not modify a widget from a different user/chat or an obsolete message.
+    if ref and ref["message_id"] != msg_id:
+        raise WidgetUnavailable("This card is outdated. Open /widget again")
+    kind = ref.get("kind", "widget") if ref else "widget"
+    if kind == "text":
+        await edit_fallback_card(bot_token, uid, msg_id, state)
+    else:
+        await update_profile_widget(bot_token, uid, msg_id, state)
+    if ref:
+        try:
+            await save_ref(client, uid, msg_id, state, kind=kind)
+        except WidgetUnavailable:
+            logger.warning("Widget registry unavailable for user %s", uid)
 
 
 async def widget_refresh_loop(client, bot_token):
@@ -365,8 +450,12 @@ async def widget_refresh_loop(client, bot_token):
                     current.pop("updated", None)
                     if _stable_data(previous) == _stable_data(current):
                         continue
-                    await update_profile_widget(bot_token, uid, ref["message_id"], state)
-                    await save_ref(client, uid, ref["message_id"], state)
+                    kind = ref.get("kind", "widget")
+                    if kind == "text":
+                        await edit_fallback_card(bot_token, uid, ref["message_id"], state)
+                    else:
+                        await update_profile_widget(bot_token, uid, ref["message_id"], state)
+                    await save_ref(client, uid, ref["message_id"], state, kind=kind)
                 except (WidgetUnavailable, ValueError, TypeError) as exc:
                     logger.warning("Could not update profile widget for %s: %s",
                                    uid, type(exc).__name__)
