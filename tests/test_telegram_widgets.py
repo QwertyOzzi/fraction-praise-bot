@@ -78,6 +78,19 @@ class WidgetDataTests(unittest.TestCase):
         self.assertEqual(snap["praise"], "—")
         self.assertIn("Конфликт", snap["status"])
 
+    def test_native_html_fallback_escapes_profile_fields(self):
+        data = roster({
+            "nick": "Agent_Test",
+            "rank": "<script>",
+            "verification_status": "verified"
+        })
+        state = w._state_data(w.profile_snapshot(data, 123))
+        rendered = w.fallback_card_html(state)
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertIn("FRP", rendered)
+        self.assertIn("Обновить", str(w.refresh_keyboard()))
+
     def test_state_fits_size_and_does_not_include_secrets(self):
         data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified",
                        "telegram_username": "private", "auth_token": "do_not_expose"})
@@ -112,6 +125,63 @@ class WidgetOperationsTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(w, "ClientSession", return_value=Session()):
             done = await w.telegram_api("fake_token", "editMessageWidgetData", {})
         self.assertTrue(done)
+
+    async def test_denied_widget_becomes_native_auto_updated_card(self):
+        data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
+        with (patch.object(w, "read_roster", AsyncMock(return_value=data)),
+              patch.object(w, "read_ref", AsyncMock(return_value=None)),
+              patch.object(w, "send_profile_widget",
+                           AsyncMock(side_effect=w.WidgetUnavailable(
+                               "Telegram sendWidget: Bad Request: INPUT_MEDIA_WIDGET_NOT_ALLOWED"
+                           ))),
+              patch.object(w, "send_fallback_card", AsyncMock(return_value=77)) as send,
+              patch.object(w, "save_ref", AsyncMock()) as save):
+            result = await w.open_profile_widget(object(), "fake_token", 123)
+            self.assertEqual(result, "fallback")
+            send.assert_awaited_once()
+            self.assertEqual(save.await_args.kwargs["kind"], "text")
+            self.assertEqual(save.await_args.args[2], 77)
+
+    async def test_existing_native_card_is_edited_in_place(self):
+        data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
+        with (patch.object(w, "read_roster", AsyncMock(return_value=data)),
+              patch.object(w, "read_ref", AsyncMock(return_value={
+                  "message_id": 77, "last_data": "{}", "kind": "text"
+              })),
+              patch.object(w, "edit_fallback_card", AsyncMock()) as edit,
+              patch.object(w, "send_profile_widget", AsyncMock()) as html_send,
+              patch.object(w, "send_fallback_card", AsyncMock()) as text_send,
+              patch.object(w, "save_ref", AsyncMock()) as save):
+            result = await w.open_profile_widget(object(), "fake_token", 123)
+            self.assertEqual(result, "updated")
+            self.assertEqual(edit.await_args.args[2], 77)
+            self.assertEqual(save.await_args.kwargs["kind"], "text")
+            html_send.assert_not_awaited()
+            text_send.assert_not_awaited()
+
+    async def test_native_manual_refresh_uses_text_edit(self):
+        data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
+        with (patch.object(w, "read_roster", AsyncMock(return_value=data)),
+              patch.object(w, "read_ref", AsyncMock(return_value={
+                  "message_id": 77, "last_data": "{}", "kind": "text"
+              })),
+              patch.object(w, "edit_fallback_card", AsyncMock()) as edit,
+              patch.object(w, "update_profile_widget", AsyncMock()) as widget):
+            await w.refresh_profile_widget(object(), "fake_token", 123, 77)
+            edit.assert_awaited_once()
+            widget.assert_not_awaited()
+
+    async def test_other_widget_errors_do_not_trigger_fallback(self):
+        data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
+        with (patch.object(w, "read_roster", AsyncMock(return_value=data)),
+              patch.object(w, "read_ref", AsyncMock(return_value=None)),
+              patch.object(w, "send_profile_widget", AsyncMock(
+                  side_effect=w.WidgetUnavailable("Telegram sendWidget: HTML_INVALID")
+              )),
+              patch.object(w, "send_fallback_card", AsyncMock()) as fallback):
+            with self.assertRaises(w.WidgetUnavailable):
+                await w.open_profile_widget(object(), "fake_token", 123)
+            fallback.assert_not_awaited()
 
     async def test_no_duplicate_if_existing_widget_edit_fails(self):
         data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
