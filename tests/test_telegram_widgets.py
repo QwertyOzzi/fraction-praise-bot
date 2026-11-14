@@ -1,8 +1,16 @@
 """Tests for the isolated Bot API 10.4 widget implementation."""
 import json
+import sys
 import unittest
 import zlib
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# CI intentionally runs dependency-free tests without installing aiohttp.
+# Mock only the external networking module; widget logic stays real.
+try:
+    import aiohttp  # noqa: F401
+except ImportError:
+    sys.modules["aiohttp"] = MagicMock()
 
 import telegram_widgets as w
 
