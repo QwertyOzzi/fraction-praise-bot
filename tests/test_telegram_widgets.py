@@ -87,7 +87,7 @@ class WidgetOperationsTests(unittest.IsolatedAsyncioTestCase):
               patch.object(w, "update_profile_widget", AsyncMock()) as edit):
             await w.refresh_profile_widget(object(), "fake_token", 123, 789)
             edit.assert_awaited_once()
-            self.assertEqual(edit.await_args.args[2:4], (123, 789))
+            self.assertEqual(edit.await_args.args[1:3], (123, 789))
 
     async def test_registry_downtime_still_allows_a_manual_card(self):
         data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
