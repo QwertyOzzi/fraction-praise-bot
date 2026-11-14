@@ -105,7 +105,11 @@ async def _get_json(session, url, headers, *, missing_ok=False):
         if response.status == 404 and missing_ok:
             return None
         if response.status != 200:
-            raise WidgetUnavailable("Firebase read failed (%s)" % response.status)
+            # Approved document kinds only; never log URLs or auth headers.
+            name = url.rsplit("/", 1)[-1]
+            label = name if name in {"bot_state", "fractionrp", "praise"} else "document"
+            raise WidgetUnavailable("Firebase %s read failed (HTTP %s)" %
+                                    (label, response.status))
         return await response.json()
 
 
@@ -170,6 +174,22 @@ def _state_data(snapshot):
     return data
 
 
+def safe_telegram_description(parsed):
+    """Return only a short diagnostic, never chat IDs, URLs or API credentials."""
+    if not isinstance(parsed, dict):
+        return "non-JSON Telegram response"
+    description = parsed.get("description")
+    if not isinstance(description, str):
+        return "no Telegram error details"
+    # Bot API error descriptions are generally short and ASCII. Drop any
+    # unexpected content and redact numeric identifiers, never leak a URL/token.
+    if len(description) > 240 or re.search(r"https?://|api\.telegram|bot\d+:", description, re.I):
+        return "Telegram rejected the request"
+    safe = re.sub(r"[^a-zA-Z0-9 _.,:()'/-]", "", description).strip()
+    safe = re.sub(r"\d{6,}", "[id]", safe)
+    return safe[:140] or "Telegram rejected the request"
+
+
 async def telegram_api(token, method, payload):
     """Small Bot API 10.4 bridge until aiogram supports this release.
 
@@ -178,10 +198,19 @@ async def telegram_api(token, method, payload):
     url = "https://api.telegram.org/bot" + token + "/" + method
     async with ClientSession(timeout=ClientTimeout(total=12)) as session:
         async with session.post(url, json=payload) as response:
-            parsed = await response.json(content_type=None)
+            try:
+                parsed = await response.json(content_type=None)
+            except (ValueError, TypeError):
+                raise WidgetUnavailable("Telegram %s: malformed API response (HTTP %s)" %
+                                        (method, response.status)) from None
             if response.status != 200 or not isinstance(parsed, dict) or not parsed.get("ok"):
+                description = safe_telegram_description(parsed)
+                if method == "editMessageWidgetData" and "message is not modified" in description.lower():
+                    return True
                 code = parsed.get("error_code", response.status) if isinstance(parsed, dict) else response.status
-                raise WidgetUnavailable("Telegram %s failed (HTTP/API %s)" % (method, code))
+                raise WidgetUnavailable(
+                    "Telegram %s: %s (HTTP/API %s)" % (method, description, code)
+                )
             return parsed.get("result")
 
 

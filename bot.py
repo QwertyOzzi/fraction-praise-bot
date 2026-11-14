@@ -3755,8 +3755,17 @@ async def cmd_fbi_widget(message: types.Message):
             open_profile_widget(firebase_client, BOT_TOKEN, uid), timeout=27
         )
     except (WidgetUnavailable, asyncio.TimeoutError) as exc:
-        logger.warning("FBI widget unavailable: %s", type(exc).__name__)
-        await message.answer("⚠️ Не удалось загрузить данные или отправить виджет.")
+        detail = str(exc) if isinstance(exc, WidgetUnavailable) else "Превышено время ожидания"
+        logger.warning("FBI widget unavailable: %s", detail)
+        if is_owner(uid):
+            # Owner-only, sanitized diagnostics. Never display tokens or raw HTTP bodies.
+            await message.answer(
+                "⚠️ Виджет не открылся.\n"
+                f"Причина: <code>{html.escape(detail[:200])}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer("⚠️ Не удалось загрузить данные или отправить виджет.")
         return
     if result == "updated":
         await message.answer("✅ Живая карточка обновлена в прежнем сообщении.")

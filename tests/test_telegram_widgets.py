@@ -26,6 +26,21 @@ def roster(profile=None, frp=None, praise=None):
 
 
 class WidgetDataTests(unittest.TestCase):
+    def test_safe_error_details_for_diagnostics(self):
+        self.assertEqual(
+            w.safe_telegram_description({"description": "Bad Request: INPUT_MEDIA_WIDGET_INVALID"}),
+            "Bad Request: INPUT_MEDIA_WIDGET_INVALID"
+        )
+        masked = w.safe_telegram_description({
+            "description": "Bad Request: id 123456789012 unavailable"
+        })
+        self.assertNotIn("123456789012", masked)
+        self.assertIn("[id]", masked)
+        hidden = w.safe_telegram_description({
+            "description": "Bad Request: https://api.telegram.org/bot123:SECRET"
+        })
+        self.assertEqual(hidden, "Telegram rejected the request")
+
     def test_html_stays_within_bot_api_limits(self):
         data = w.PROFILE_WIDGET_HTML.encode("utf-8")
         self.assertLessEqual(len(data), 32768)
@@ -75,6 +90,29 @@ class WidgetDataTests(unittest.TestCase):
 
 
 class WidgetOperationsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unchanged_widget_edit_is_not_a_failure(self):
+        class Response:
+            status = 400
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def json(self, **kwargs):
+                return {"ok": False, "error_code": 400,
+                        "description": "Bad Request: message is not modified"}
+
+        class Session:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            def post(self, url, json):
+                return Response()
+
+        with patch.object(w, "ClientSession", return_value=Session()):
+            done = await w.telegram_api("fake_token", "editMessageWidgetData", {})
+        self.assertTrue(done)
+
     async def test_no_duplicate_if_existing_widget_edit_fails(self):
         data = roster({"nick": "Agent_Test", "rank": "7", "verification_status": "verified"})
         with (patch.object(w, "read_roster", AsyncMock(return_value=data)),
